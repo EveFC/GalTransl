@@ -6,3 +6,4 @@ __pycache__/
 useful_tools/GalTransl_DumpInjector/config.ini
 useful_tools/GalTransl_DumpInjector/VNTextPatch/names.xml
 *.log
+/.idea/*
