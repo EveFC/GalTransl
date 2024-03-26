@@ -340,7 +340,7 @@ class CGPT4Translate:
                         break
                 if self.target_lang != "English":
                     if "can't fullfill" in line_json[key_name]:
-                        error_message = f"-> GPt4拒绝了翻译"
+                        error_message = f"-> GPT4拒绝了翻译"
                         error_flag = True
                         break
 
@@ -350,7 +350,7 @@ class CGPT4Translate:
                 if not proofread:
                     trans_list[i].pre_zh = line_json[key_name]
                     trans_list[i].post_zh = line_json[key_name]
-                    trans_list[i].trans_by = "GPT-4"
+                    trans_list[i].trans_by = self.chatbot.engine
                     if "conf" in line_json:
                         trans_list[i].trans_conf = line_json["conf"]
                     if "doub" in line_json:
@@ -360,7 +360,7 @@ class CGPT4Translate:
                     result_trans_list.append(trans_list[i])
                 else:
                     trans_list[i].proofread_zh = line_json[key_name]
-                    trans_list[i].proofread_by = "GPT-4"
+                    trans_list[i].proofread_by = self.chatbot.engine
                     trans_list[i].post_zh = line_json[key_name]
                     result_trans_list.append(trans_list[i])
 
@@ -374,11 +374,13 @@ class CGPT4Translate:
                         if not proofread:
                             trans_list[i].pre_zh = "Failed translation"
                             trans_list[i].post_zh = "Failed translation"
-                            trans_list[i].trans_by = "GPT-4(Failed)"
+                            trans_list[i].trans_by = f"{self.chatbot.engine}(Failed)"
                         else:
                             trans_list[i].proofread_zh = trans_list[i].pre_zh
                             trans_list[i].post_zh = trans_list[i].pre_zh
-                            trans_list[i].proofread_by = "GPT-4(Failed)"
+                            trans_list[i].proofread_by = (
+                                f"{self.chatbot.engine}(Failed)"
+                            )
                         result_trans_list.append(trans_list[i])
                         i = i + 1
                     return i, result_trans_list
@@ -490,19 +492,21 @@ class CGPT4Translate:
 
     def _del_previous_message(self) -> None:
         """删除历史消息，只保留最后一次的翻译结果，节约tokens"""
-        if self.eng_type != "unoffapi":
-            last_assistant_message = None
-            for message in self.chatbot.conversation["default"]:
-                if message["role"] == "assistant":
-                    last_assistant_message = message
-            system_message = self.chatbot.conversation["default"][0]
-            if last_assistant_message != None:
-                self.chatbot.conversation["default"] = [
-                    system_message,
-                    last_assistant_message,
-                ]
-        elif self.eng_type == "unoffapi":
-            pass
+        last_assistant_message = None
+        last_user_message = None
+        for message in self.chatbot.conversation["default"]:
+            if message["role"] == "assistant":
+                last_assistant_message = message
+        for message in self.chatbot.conversation["default"]:
+            if message["role"] == "user":
+                last_user_message = message
+                last_user_message["content"] = "(History Translation Request)"
+        system_message = self.chatbot.conversation["default"][0]
+        self.chatbot.conversation["default"] = [system_message]
+        if last_user_message:
+            self.chatbot.conversation["default"].append(last_user_message)
+        if last_assistant_message:
+            self.chatbot.conversation["default"].append(last_assistant_message)
 
     def _del_last_answer(self):
         if self.eng_type != "unoffapi":
@@ -570,10 +574,13 @@ class CGPT4Translate:
                 [json.dumps(obj, ensure_ascii=False) for obj in tmp_context]
             )
             self.chatbot.conversation["default"].append(
+                {"role": "user", "content": "(History Translation Request)"}
+            )
+            self.chatbot.conversation["default"].append(
                 {
                     "role": "assistant",
                     "content": f"Transl: \n```jsonline\n{json_lines}\n```",
-                }
+                },
             )
             LOGGER.info("-> 恢复了上下文")
 

@@ -326,7 +326,7 @@ class CGPT35Translate:
                     while i < len(content):
                         content[i].pre_zh = "Failed translation"
                         content[i].post_zh = "Failed translation"
-                        content[i].trans_by = "GPT-3.5(Failed)"
+                        content[i].trans_by = f"{self.chatbot.engine}(Failed)"
                         i = i + 1
                     return len(content), content
 
@@ -366,7 +366,7 @@ class CGPT35Translate:
                     result[key_name] = self.opencc.convert(result[key_name])
                 content[i].pre_zh = result[key_name]
                 content[i].post_zh = result[key_name]
-                content[i].trans_by = "GPT-3.5"
+                content[i].trans_by = self.chatbot.engine
 
             if self.transl_style == "auto" and not warn_flag:
                 self._set_gpt_style("precise")
@@ -383,19 +383,21 @@ class CGPT35Translate:
 
     def _del_previous_message(self) -> None:
         """删除历史消息，只保留最后一次的翻译结果，节约tokens"""
-        if self.eng_type != "unoffapi":
-            last_assistant_message = None
-            for message in self.chatbot.conversation["default"]:
-                if message["role"] == "assistant":
-                    last_assistant_message = message
-            system_message = self.chatbot.conversation["default"][0]
-            if last_assistant_message != None:
-                self.chatbot.conversation["default"] = [
-                    system_message,
-                    last_assistant_message,
-                ]
-        elif self.eng_type == "unoffapi":
-            pass
+        last_assistant_message = None
+        last_user_message = None
+        for message in self.chatbot.conversation["default"]:
+            if message["role"] == "assistant":
+                last_assistant_message = message
+        for message in self.chatbot.conversation["default"]:
+            if message["role"] == "user":
+                last_user_message = message
+                last_user_message["content"] = "(History Translation Request)"
+        system_message = self.chatbot.conversation["default"][0]
+        self.chatbot.conversation["default"] = [system_message]
+        if last_user_message:
+            self.chatbot.conversation["default"].append(last_user_message)
+        if last_assistant_message:
+            self.chatbot.conversation["default"].append(last_assistant_message)
 
     def _del_last_answer(self):
         if self.eng_type != "unoffapi":
@@ -460,6 +462,9 @@ class CGPT35Translate:
                 current_tran = current_tran.prev_tran
 
             tmp_context.reverse()
+            self.chatbot.conversation["default"].append(
+                {"role": "user", "content": "(History Translation Request)"}
+            )
             self.chatbot.conversation["default"].append(
                 {
                     "role": "assistant",
