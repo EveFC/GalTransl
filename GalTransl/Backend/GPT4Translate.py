@@ -12,7 +12,7 @@ from random import choice
 from GalTransl.CSentense import CSentense, CTransList
 from GalTransl.Cache import get_transCache_from_json, save_transCache_to_json
 from GalTransl.Dictionary import CGptDict
-from GalTransl.Utils import extract_code_blocks
+from GalTransl.Utils import extract_code_blocks, fix_quotes
 from GalTransl.Backend.Prompts import (
     GPT4_CONF_PROMPT,
     GPT4_TRANS_PROMPT,
@@ -25,6 +25,7 @@ from GalTransl.Backend.Prompts import (
     GPT4Turbo_TRANS_PROMPT,
     GPT4Turbo_CONF_PROMPT,
     GPT4Turbo_PROOFREAD_PROMPT,
+    H_WORDS_LIST,
 )
 
 
@@ -52,6 +53,11 @@ class CGPT4Translate:
         self.last_file_name = ""
         self.restore_context_mode = config.getKey("gpt.restoreContextMode")
         self.retry_count = 0
+        # 保存间隔
+        if val := config.getKey("save_steps"):
+            self.save_steps = val
+        else:
+            self.save_steps = 1
         # 记录确信度
         if val := config.getKey("gpt.recordConfidence"):
             self.record_confidence = val
@@ -86,6 +92,11 @@ class CGPT4Translate:
             self.skipRetry = val
         else:
             self.skipRetry = False
+        # 跳过h
+        if val := config.getKey("skipH"):
+            self.skipH = val
+        else:
+            self.skipH = False
         # 流式输出模式
         if val := config.getKey("gpt.streamOutputMode"):
             self.streamOutputMode = val
@@ -100,7 +111,7 @@ class CGPT4Translate:
             self.proxyProvider = proxy_pool
         else:
             self.proxyProvider = None
-            LOGGER.warning("不使用代理")
+            
         # 翻译风格
         if val := config.getKey("gpt.translStyle"):
             self.transl_style = val
@@ -147,7 +158,7 @@ class CGPT4Translate:
             from GalTransl.Backend.revChatGPT.V3 import Chatbot as ChatbotV3
 
             self.token = self.tokenProvider.getToken(False, True)
-            eng_name = "gpt-4-0125-preview" if eng_name == "" else eng_name
+            eng_name = "gpt-4-1106-preview" if eng_name == "" else eng_name
             system_prompt = GPT4Turbo_SYSTEM_PROMPT
             self.chatbot = ChatbotV3(
                 api_key=self.token.token,
@@ -227,7 +238,7 @@ class CGPT4Translate:
                 )
                 if self.streamOutputMode:
                     LOGGER.info("->输出：")
-                resp = ""
+                resp, data = "", ""
                 if self.eng_type != "unoffapi":
                     if not self.full_context_mode:
                         self._del_previous_message()
@@ -235,7 +246,6 @@ class CGPT4Translate:
                         if self.streamOutputMode:
                             print(data, end="", flush=True)
                         resp += data
-                    print(data, end="\n")
                 elif self.eng_type == "unoffapi":
                     async for data in self.chatbot.ask_async(prompt_req):
                         if self.streamOutputMode:
@@ -255,38 +265,41 @@ class CGPT4Translate:
                 LOGGER.error(f"-> {str_ex}")
                 if "quota" in str_ex:
                     self.tokenProvider.reportTokenProblem(self.token)
-                    LOGGER.error(f"-> 余额不足： {self.token.maskToken()}")
+                    LOGGER.error(f"-> [请求错误]余额不足： {self.token.maskToken()}")
                     self.token = self.tokenProvider.getToken(False, True)
                     self.chatbot.set_api_key(self.token.token)
+                    self._del_last_answer()
+                    LOGGER.warning(f"-> [请求错误]切换到token {self.token.maskToken()}")
+                    continue
                 elif "try again later" in str_ex or "too many requests" in str_ex:
-                    LOGGER.warning("-> 请求受限，1分钟后继续尝试")
+                    LOGGER.warning("-> [请求错误]请求受限，1分钟后继续尝试")
                     await asyncio.sleep(60)
                     continue
-                elif "expired" in str_ex:
-                    LOGGER.error("-> access_token过期，请更换")
-                    exit()
                 elif "try reload" in str_ex:
                     self.reset_conversation()
-                    LOGGER.error("-> 报错重置会话")
+                    LOGGER.error("-> [请求错误]报错重置会话")
                     continue
-
-                self._del_last_answer()
-                LOGGER.info("-> 报错:%s, 5秒后重试" % ex)
-                await asyncio.sleep(5)
-                continue
+                else:
+                    self._del_last_answer()
+                    LOGGER.info("-> [请求错误]报错:%s, 2秒后重试" % ex)
+                    await asyncio.sleep(2)
+                    continue
 
             result_text = resp
             if "```json" in result_text:
                 lang_list, code_list = extract_code_blocks(result_text)
                 if len(lang_list) > 0 and len(code_list) > 0:
                     result_text = code_list[0]
-            result_text = result_text[result_text.find('{"id') :]
+            if '{"id' in result_text:
+                result_text = result_text[result_text.find('{"id') :]
 
             result_text = (
                 result_text.replace(", doub:", ', "doub":')
                 .replace(", conf:", ', "conf":')
                 .replace(", unkn:", ', "unkn":')
             )
+            result_text = fix_quotes(result_text)
+
             i = -1
             result_trans_list = []
             key_name = "dst" if not proofread else "newdst"
@@ -316,7 +329,7 @@ class CGPT4Translate:
                     break
                 line_id = line_json["id"]
                 if line_id != trans_list[i].index:
-                    error_message = f"-> 输出{line_id}句id未对应"
+                    error_message = f"输出{line_id}句id未对应"
                     error_flag = True
                     break
                 if key_name not in line_json or type(line_json[key_name]) != str:
@@ -325,7 +338,7 @@ class CGPT4Translate:
                     break
                 # 本行输出不应为空
                 if trans_list[i].post_jp != "" and line_json[key_name] == "":
-                    error_message = f"-> 第{line_id}句空白"
+                    error_message = f"第{line_id}句空白"
                     error_flag = True
                     break
                 if "/" in line_json[key_name]:
@@ -334,13 +347,13 @@ class CGPT4Translate:
                         and "/" not in trans_list[i].post_jp
                     ):
                         error_message = (
-                            f"-> 第{line_id}句多余 / 符号：" + line_json[key_name]
+                            f"第{line_id}句多余 / 符号：" + line_json[key_name]
                         )
                         error_flag = True
                         break
                 if self.target_lang != "English":
                     if "can't fullfill" in line_json[key_name]:
-                        error_message = f"-> GPT4拒绝了翻译"
+                        error_message = f"GPT4拒绝了翻译"
                         error_flag = True
                         break
 
@@ -365,10 +378,10 @@ class CGPT4Translate:
                     result_trans_list.append(trans_list[i])
 
             if error_flag:
-                LOGGER.error(f"-> 解析结果出错：{error_message}")
+                LOGGER.error(f"-> [解析错误]解析结果出错：{error_message}")
                 if self.skipRetry:
                     self.reset_conversation()
-                    LOGGER.warning("-> 解析出错但跳过本轮翻译")
+                    LOGGER.warning("-> [解析错误]解析出错但跳过本轮翻译")
                     i = 0 if i < 0 else i
                     while i < len(trans_list):
                         if not proofread:
@@ -434,9 +447,14 @@ class CGPT4Translate:
             retran_key=retran_key,
         )
 
-        # 校对模式多喂上一行
-        # if proofread and trans_list_unhit[0].prev_tran != None:
-        #    trans_list_unhit.insert(0, trans_list_unhit[0].prev_tran)
+        if self.skipH:
+            LOGGER.warning("skipH: 将跳过含有敏感词的句子")
+            trans_list_unhit = [
+                tran
+                for tran in trans_list_unhit
+                if not any(word in tran.post_jp for word in H_WORDS_LIST)
+            ]
+
         if len(trans_list_unhit) == 0:
             return []
         # 新文件重置chatbot
@@ -456,6 +474,7 @@ class CGPT4Translate:
 
         trans_result_list = []
         len_trans_list = len(trans_list_unhit)
+        transl_step_count=0
         while i < len_trans_list:
             await asyncio.sleep(1)
             trans_list_split = (
@@ -477,7 +496,10 @@ class CGPT4Translate:
                 result_output = result_output + repr(trans)
             LOGGER.info(result_output)
             trans_result_list += trans_result
-            save_transCache_to_json(trans_list, cache_file_path)
+            transl_step_count+=1
+            if transl_step_count>=self.save_steps:
+                save_transCache_to_json(trans_list, cache_file_path)
+                transl_step_count=0
             LOGGER.info(
                 f"{filename}: {str(len(trans_result_list))}/{str(len_trans_list)}"
             )
@@ -527,10 +549,6 @@ class CGPT4Translate:
         if self._current_style == style_name:
             return
         self._current_style = style_name
-        if self.transl_style == "auto":
-            LOGGER.info(f"-> 自动切换至{style_name}参数预设")
-        else:
-            LOGGER.info(f"-> 使用{style_name}参数预设")
         # normal default
         temperature, top_p = 1.0, 1.0
         frequency_penalty, presence_penalty = 0.3, 0.0

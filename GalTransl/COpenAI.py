@@ -3,6 +3,7 @@ CloseAI related classes
 """
 
 from httpx import AsyncClient
+import asyncio
 from tqdm.asyncio import tqdm
 from time import time
 from GalTransl import LOGGER
@@ -49,7 +50,7 @@ def initGPTToken(config: CProjectConfig, eng_type: str) -> Optional[list[COpenAI
     if val := config.getKey("gpt.degradeBackend"):
         degradeBackend = val
 
-    defaultEndpoint = config.getBackendConfigSection("GPT35")["defaultEndpoint"]
+    defaultEndpoint = "https://api.openai.com"
     gpt35_tokens = config.getBackendConfigSection("GPT35").get("tokens")
     if "gpt35" in eng_type and gpt35_tokens:
         for tokenEntry in gpt35_tokens:
@@ -66,7 +67,6 @@ def initGPTToken(config: CProjectConfig, eng_type: str) -> Optional[list[COpenAI
         if not degradeBackend:
             return result
 
-    defaultEndpoint = config.getBackendConfigSection("GPT4")["defaultEndpoint"]
     if gpt4_tokens := config.getBackendConfigSection("GPT4").get("tokens"):
         for tokenEntry in gpt4_tokens:
             token = tokenEntry["token"]
@@ -149,6 +149,26 @@ class COpenAITokenPool:
             LOGGER.debug("tested OpenAI token %s in %s", token.maskToken(), et - st)
             pass
 
+    async def _check_token_availability_with_retry(
+        self,
+        token: COpenAIToken,
+        proxy: CProxy = None,
+        eng_type: str = "",
+        max_retries: int = 3,
+    ) -> Tuple[bool, bool, bool, COpenAIToken]:
+        for retry_count in range(max_retries):
+            is_available, is_gpt3_available, is_gpt4_available, token = (
+                await self._isTokenAvailable(token, proxy, eng_type)
+            )
+            if is_available:
+                return is_available, is_gpt3_available, is_gpt4_available, token
+            else:
+                # wait for some time before retrying, you can add some delay here
+                await asyncio.sleep(1)
+
+        # If all retries fail, return the result from the last attempt
+        return is_available, is_gpt3_available, is_gpt4_available, token
+
     async def checkTokenAvailablity(
         self, proxy: CProxy = None, eng_type: str = ""
     ) -> None:
@@ -163,7 +183,11 @@ class COpenAITokenPool:
         LOGGER.info(f"测试key是否能调用{model_name}模型...")
         fs = []
         for _, token in self.tokens:
-            fs.append(self._isTokenAvailable(token, proxy if proxy else None, eng_type))
+            fs.append(
+                self._check_token_availability_with_retry(
+                    token, proxy if proxy else None, eng_type
+                )
+            )
         result: list[tuple[bool, bool, bool, COpenAIToken]] = await tqdm.gather(
             *fs, ncols=80
         )
@@ -175,7 +199,7 @@ class COpenAITokenPool:
                 LOGGER.warning(
                     "%s is not available for %s, will be removed",
                     token.maskToken(),
-                    eng_type,
+                    model_name,
                 )
             else:
                 newList.append((True, token))
@@ -200,7 +224,7 @@ class COpenAITokenPool:
         while True:
             if rounds > 20:
                 raise RuntimeError(
-                    "COpenAITokenPool::getToken: 可用的OpenAI token耗尽！"
+                    "COpenAITokenPool::getToken: 可用的API key耗尽！"
                 )
             try:
                 available, token = choice(self.tokens)
@@ -212,4 +236,4 @@ class COpenAITokenPool:
                     return token
                 rounds += 1
             except IndexError:
-                raise RuntimeError("没有可用的 OpenAI token！")
+                raise RuntimeError("没有可用的 API key！")

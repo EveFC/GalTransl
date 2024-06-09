@@ -2,7 +2,7 @@
 
 ## 插件介绍
 
-插件系统是GalTransl v4在基础功能上又一的微小升级。插件可以分为两种类型：文本插件和文件插件。
+插件系统是GalTransl v4的一项升级。插件可以分为两种类型：文本插件和文件插件。
 - 文本插件可以对文本进行自定义的处理，例如清洁文本、修复文本、修复人名位置等。
 - 文件插件可以使GalTransl支持更多格式的文件，例如字幕文件、文本文件等。
 
@@ -75,16 +75,15 @@ Settings: # 这里存放插件的设置
 - `after_dst_processed(self, tran: CSentense) -> CSentense`: 在目标句子处理之后被调用。返回修改后的`CSentense`。
 
 * 这里的"处理"，是指GalTransl一定会对日文做去掉日文对话框、字典替换，并在译后恢复对话框、译后字典替换。   
-* 所以如果有的引擎的文本在日文对话框左右有多余的字符，可以在`before_src_processed`中进行隐藏处理（挪到tran的left_symbol和right_symbol属性中），恢复对话框时会自动还原。   
-* 有的引擎的文本在日文对话框左边写了人明，可以在`before_src_processed`中进行处理，把人名挪到tran的speaker属性里，再在`after_dst_processed`中把人名还原到对话框左边（先让程序恢复对话框，所以是after）。   
+* 所以当引擎的文本在日文对话框左右有多余的字符，可以在`before_src_processed`中进行隐藏处理（挪到tran的left_symbol和right_symbol属性中），恢复对话框时会自动还原。   
+* 当引擎的文本在日文对话框左边写了人名，可以在`before_src_processed`中进行处理，把人名挪到tran的speaker属性里，再在`after_dst_processed`中把人名还原到对话框左边（先让程序恢复对话框，所以是after）。   
 
 对于处理文件的GFilePlugin插件，**必须**实现以下方法：
 - `load_file(self, file_path: str) -> list`: 加载文件，返回一个包含message和name(可空)的dict list。
 - `save_file(self, file_path: str, transl_json: list)`: 保存文件，transl_json为load_file提供的json在翻译message和name后的结果。
 
-* 在load_file中，可以通过两种方式把与message无关的内容带到结果里
+* 在load_file中，可以通过以下方式把与message无关的内容带到结果里
 1. 直接在每个dict里插其他的信息，save_file里会原样将其他内容送回，然后还原成原文件并保存文件（例如file_subtitle_srt插件）
-2. 先把原文件存在self里，然后在load_file里对结果进行替换并保存文件（例如file_i18n_json）
 ## 3. 注意事项
 
 - 所有的插件方法都应该有适当的错误处理。

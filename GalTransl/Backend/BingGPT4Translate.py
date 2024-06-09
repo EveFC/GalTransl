@@ -21,6 +21,7 @@ from GalTransl.Backend.Prompts import (
     NewBing_NAME_PROMPT3,
     NewBing_PROOFREAD_PROMPT,
     NewBing_TRANS_PROMPT,
+    H_WORDS_LIST
 )
 
 
@@ -31,6 +32,11 @@ class CBingGPT4Translate:
         cookiefile_list: list[str],
         proxyPool: Optional[CProxyPool],
     ):
+        # 保存间隔
+        if val := config.getKey("save_steps"):
+            self.save_steps = val
+        else:
+            self.save_steps = 1
         # 语言设置
         if val := config.getKey("language"):
             sp = val.split("2")
@@ -55,11 +61,16 @@ class CBingGPT4Translate:
             self.proxyProvider = proxyPool
         else:
             self.proxyProvider = None
-            LOGGER.warning("不使用代理")
+            
         if val := config.getKey("gpt.forceNewBingHs"):
             self.force_NewBing_hs_mode = val
         else:
             self.force_NewBing_hs_mode = False
+        # 跳过h
+        if val := config.getKey("skipH"):
+            self.skipH = val
+        else:
+            self.skipH = False
         # 跳过重试
         if val := config.getKey("skipRetry"):
             self.skipRetry = val
@@ -184,7 +195,7 @@ class CBingGPT4Translate:
                 print(ex)
                 traceback.print_exc()
                 if "Request is throttled." in str(ex):
-                    LOGGER.info("->Request is throttled.")
+                    LOGGER.info("-> [请求错误]Request is throttled.")
                     self.throttled_cookie_list.append(self.current_cookie_file)
                     self.cookiefile_list.remove(self.current_cookie_file)
                     self.init_chatbot()
@@ -194,21 +205,21 @@ class CBingGPT4Translate:
                     await self.chatbot.reset()
                     continue
                 elif "CAPTCHA" in str(ex):
-                    LOGGER.warning("-> 验证码拦截，需要去网页Newbing随便问一句，点击验证码，然后重新复制cookie")
+                    LOGGER.warning("-> [请求错误]验证码拦截，需要去网页Newbing随便问一句，点击验证码，然后重新复制cookie")
                 LOGGER.info("Error:%s, Please wait 30 seconds" % ex)
                 traceback.print_exc()
                 await asyncio.sleep(5)
                 continue
 
             if "New topic" in str(resp):
-                LOGGER.info("->Need New topic")
+                LOGGER.info("-> [请求错误]Need New topic")
                 await self.chatbot.reset()
                 continue
             
             try:
-                result_text = resp["item"]["messages"][1]["text"]
+                result_text = resp["item"]["messages"][-1]["text"]
             except:
-                LOGGER.error("-> 没有获取到有效结果，重置会话")
+                LOGGER.error("-> [请求错误]没有获取到有效结果，重置会话")
                 await self.chatbot.reset()
                 continue
 
@@ -216,6 +227,9 @@ class CBingGPT4Translate:
                 LOGGER.info(result_text)
             else:
                 print("")
+
+            if "I'm sorry" in result_text.split("\n")[0]:
+                bing_reject = True
 
             if "```json" in result_text:
                 lang_list, code_list = extract_code_blocks(result_text)
@@ -385,6 +399,14 @@ class CBingGPT4Translate:
             proofread=proofread,
             retran_key=retran_key,
         )
+        if self.skipH:
+            LOGGER.warning("skipH: 将跳过含有敏感词的句子")
+            trans_list_unhit = [
+                tran
+                for tran in trans_list_unhit
+                if not any(word in tran.post_jp for word in H_WORDS_LIST)
+            ]
+            
         if len(trans_list_unhit) == 0:
             return []
         # 新文件重置chatbot
@@ -395,6 +417,7 @@ class CBingGPT4Translate:
         i = 0
         trans_result_list = []
         len_trans_list = len(trans_list_unhit)
+        transl_step_count = 0
         while i < len_trans_list:
             await asyncio.sleep(1)
             trans_list_split = trans_list_unhit[i : i + num_pre_request]
@@ -411,7 +434,10 @@ class CBingGPT4Translate:
 
             i += num if num > 0 else 0
             trans_result_list += trans_result
-            save_transCache_to_json(trans_list, cache_file_path)
+            transl_step_count+=1
+            if transl_step_count>=self.save_steps:
+                save_transCache_to_json(trans_list, cache_file_path)
+                transl_step_count=0
             LOGGER.info("".join([repr(tran) for tran in trans_result]))
             LOGGER.info(
                 f"{filename}：{str(len(trans_result_list))}/{str(len_trans_list)}"

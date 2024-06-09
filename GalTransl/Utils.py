@@ -6,6 +6,7 @@ import codecs
 from typing import Tuple, List
 from collections import Counter
 from re import compile
+import requests
 
 PATTERN_CODE_BLOCK = compile(r"```([\w]*)\n([\s\S]*?)\n```")
 
@@ -96,3 +97,32 @@ def get_file_list(directory: str):
 
 def process_escape(text: str) -> str:
     return codecs.escape_decode(bytes(text, "utf-8"))[0].decode("utf-8")
+
+pattern_fix_quotes = compile(r'"dst": *"(.+?)"}')
+
+def fix_quotes(text):
+    results = pattern_fix_quotes.findall(text)
+    for match in results:
+        new_match = match
+        for i in range(match.count('"')):
+            if i % 2 == 0:
+                new_match = new_match.replace('"', "“", 1).replace(r'\“', "“", 1)
+            else:
+                new_match = new_match.replace('"', "”", 1).replace(r'\”', "”", 1)
+        text = text.replace(match, new_match)
+    return text
+
+
+def check_for_tool_updates(new_version):
+    try:
+        release_api = 'https://api.github.com/repos/xd2333/GalTransl/releases/latest'
+        response = requests.get(
+            release_api, timeout=5).json()
+        latest_release = response['tag_name']
+        new_version.append(latest_release)
+    except Exception:
+        pass
+
+
+if __name__ == '__main__':
+    check_for_tool_updates("4.2.1")
