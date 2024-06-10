@@ -23,7 +23,7 @@ from GalTransl.Dictionary import CGptDict, CNormalDic
 from GalTransl.Problem import find_problems
 from GalTransl.Cache import save_transCache_to_json
 from GalTransl.Name import load_name_table
-from GalTransl.CSerialize import update_json_with_transList, save_json
+from GalTransl.CSerialize import update_json_with_transList, update_json_with_transList_origin, save_json
 from GalTransl.Dictionary import CNormalDic, CGptDict
 from GalTransl.ConfigHelper import CProjectConfig, initDictList, CProxyPool
 from GalTransl.COpenAI import COpenAITokenPool
@@ -209,8 +209,12 @@ async def doLLMTranslateSingleFile(
     else:
         name_dict = {}
 
-    new_json_list = update_json_with_transList(trans_list, json_list, name_dict)
-    save_func(output_file_path, new_json_list)
+    if len(fPlugins) > 0:
+        new_json_list = update_json_with_transList_origin(trans_list, json_list, name_dict)
+        save_func(output_file_path, new_json_list)
+    else:
+        new_json_list = update_json_with_transList(trans_list, json_list, name_dict)
+        save_func(output_file_path, new_json_list)
 
     et = time()
     LOGGER.info(f"文件 {file_name} 翻译完成，用时 {et-st:.3f}s.")

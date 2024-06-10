@@ -66,6 +66,6 @@ def update_json_with_transList(
     return kv
 
 
-def save_json(file_path: str, result_json: dict[string, string]):
+def save_json(file_path: str, result_json: dict[string, string] | list):
     with open(file_path, "w", encoding="utf8", newline="\n") as f:
         json.dump(result_json, f, ensure_ascii=False, indent=4)
