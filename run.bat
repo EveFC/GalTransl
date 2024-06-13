@@ -1,3 +1,3 @@
 CALL venv/Scripts/activate.bat
-python run_GalTransl.py
+python run_GalTransl.py %1
 pause
