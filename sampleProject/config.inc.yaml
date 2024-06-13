@@ -23,6 +23,9 @@ common:
   gpt.transl_dropout: 0 # (Sakura/Galtransl)（实验性）丢弃翻译结果末尾的n行，可能会提高上下文准确性。[0-2]
   # GalTransl
   gpt.transl_style: "流畅" # (GalTransl)翻译风格[流畅/文艺]
+  # DMM game mode
+  # Use Key Value JSON {"こんにちは": "你好"} as output format
+  dmmGameMode: false
 # 插件设置
 plugin:
   filePlugin: file_galtransl_json # 指定文件读取插件，默认使用file_galtransl_json

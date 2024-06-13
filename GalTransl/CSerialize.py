@@ -26,7 +26,7 @@ def save_transList_to_json_cn(trans_list: CTransList, save_path: str, name_dict=
         json.dump(result_list, f, ensure_ascii=False, indent=4)
 
 
-def update_json_with_transList_origin(
+def update_json_with_transList(
     trans_list: CTransList, old_json_list: list, name_dict={}
 ) -> list:
     result_json_list = old_json_list.copy()
@@ -55,10 +55,10 @@ def update_json_with_transList_origin(
     return result_json_list
 
 
-def update_json_with_transList(
+def update_json_with_transList_dmm(
     trans_list: CTransList, old_json_list: list, name_dict={}
 ) -> dict[string, string]:
-    # TSK translation stored in Key Value JSON {"こんにちは": "你好"}
+    # translation stored in Key Value JSON {"こんにちは": "你好"}
     kv = {}
     for tran in trans_list:
         kv[tran.pre_jp] = tran.post_zh
