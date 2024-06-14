@@ -66,6 +66,6 @@ def update_json_with_transList_dmm(
     return kv
 
 
-def save_json(file_path: str, result_json: list):
+def save_json(file_path: str, result_json: list | dict):
     with open(file_path, "wb") as f:
         f.write(orjson.dumps(result_json, option=orjson.OPT_INDENT_2))

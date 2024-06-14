@@ -1,7 +1,7 @@
 """
 GPT3.5 / 4 / New Bing 前端翻译的控制逻辑
 """
-
+import json
 from os import makedirs, sep as os_sep
 from os.path import join as joinpath
 from os.path import exists as isPathExists
@@ -311,3 +311,21 @@ async def doLLMTranslate(
             for name, count in name_dict.items():
                 writer.writerow([name, "", count])
             LOGGER.info(f"name已保存到'人名替换表.csv'（UTF-8编码，用Emeditor编辑），填入CN_Name后可用于后续翻译name字段。")
+
+        # For translation platform
+        name_kv_json = joinpath(proj_dir, basename(proj_dir) + "_name_list.json")
+        name_list = {}
+
+        if isPathExists(name_kv_json):
+            with open(name_kv_json, "r", encoding='utf8') as f:
+                name_list = json.load(f)
+
+        for name, count in name_dict.items():
+            if name in name_list:
+                continue
+            else:
+                name_list[name] = count
+
+        save_json(name_kv_json, name_list)
+
+        LOGGER.info(f"{basename(name_kv_json)} is updated!")
