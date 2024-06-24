@@ -4,7 +4,8 @@ from os import path
 from json import loads
 
 
-def load_transList(json_path_or_list: str | list) -> tuple[CTransList, list]:
+
+def load_transList(json_path_or_list: str | list, use_last_name: bool) -> tuple[CTransList, list]:
     """
     从json文件路径、json字符串、json list中载入待翻译列表
     json格式为[{"name":xx/"names":[],"message/pre_jp":"xx"},...]
@@ -27,6 +28,10 @@ def load_transList(json_path_or_list: str | list) -> tuple[CTransList, list]:
         name = (
             item["name"] if "name" in item else item["names"] if "names" in item else ""
         )
+
+        if isinstance(name, list) and use_last_name:
+            name = name[len(name)-1]
+
         pre_jp = item["message"]
         index = item["index"] if "index" in item else i + 1
         tmp_tran = CSentense(pre_jp, name, index)

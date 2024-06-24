@@ -110,7 +110,7 @@ async def doLLMTranslateSingleFile(
                 save_func = save_json
 
             try:
-                trans_list, json_list = load_transList(origin_input)
+                trans_list, json_list = load_transList(origin_input, projectConfig.getKey('useLastName'))
             except Exception as e:
                 LOGGER.error(f"文件 {file_name} 加载翻译列表失败: {e}")
                 return False

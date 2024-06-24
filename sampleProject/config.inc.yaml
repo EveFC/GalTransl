@@ -26,6 +26,8 @@ common:
   # DMM game mode
   # Use Key Value JSON {"こんにちは": "你好"} as output format
   dmmGameMode: false
+  # Use last name as speaker name if names exists
+  useLastName: false
 # 插件设置
 plugin:
   filePlugin: file_galtransl_json # 指定文件读取插件，默认使用file_galtransl_json
