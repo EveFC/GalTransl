@@ -26,6 +26,11 @@ common:
   # DMM game mode
   # Use Key Value JSON {"こんにちは": "你好"} as output format
   dmmGameMode: false
+  # Remove ruby tag before translate
+  # <ruby=リ・クリエイション>世界の再創生</ruby> → 世界の再創生
+  # default rule for twinkle star knight: <ruby=.{1,10}>(.{1,10})</ruby>
+  removeRubyText: false
+  rubyTextRegex: "<ruby=.{1,10}>(.{1,10})</ruby>"
   # Use last name as speaker name if names exists
   useLastName: false
 # 插件设置

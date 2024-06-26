@@ -2,6 +2,7 @@
 GPT3.5 / 4 / New Bing 前端翻译的控制逻辑
 """
 import json
+import re
 from os import makedirs, sep as os_sep
 from os.path import join as joinpath
 from os.path import exists as isPathExists
@@ -114,7 +115,7 @@ async def doLLMTranslateSingleFile(
             except Exception as e:
                 LOGGER.error(f"文件 {file_name} 加载翻译列表失败: {e}")
                 return False
-            
+
             # 导出人名表功能
             if "dump-name" in eng_type:
                 global name_dict
@@ -138,6 +139,11 @@ async def doLLMTranslateSingleFile(
                 if projectConfig.getDictCfgSection("usePreDictInName"):  # 译前name替换
                     if type(tran.speaker) == type(tran._speaker) == str:
                         tran.speaker = pre_dic.do_replace(tran.speaker, tran)
+                if projectConfig.getKey("removeRubyText"):
+                    match = re.finditer(projectConfig.getKey("rubyTextRegex"), tran.post_jp)
+                    if match:
+                        for x in match:
+                            trans_list[i].post_jp = trans_list[i].post_jp.replace(x.group(), x.groups()[0])
                 for plugin in tlugins:
                     try:
                         tran = plugin.plugin_object.after_src_processed(tran)
@@ -265,7 +271,7 @@ async def doLLMTranslate(
         LOGGER.info(f"当前使用 {workersPerProject} 个Sakura worker引擎")
     else:
         endpoint_queue = None
-    
+
     # 人名表初始化
     if "dump-name" in eng_type:
         global name_dict
