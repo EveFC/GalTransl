@@ -18,25 +18,24 @@
   3. 通过译前、译后字典与条件字典实现灵活的自动化字典系统   
   4. 实时保存缓存、自动断点续翻   
   5. 结合其他项目支持多引擎脚本一键解包与注入，提供完整教程降低上手难度
-  6. 现在也支持直接翻译srt、lrc、vtt字幕文件，mtool json文件，t++ excel文件
+  6. （新）现在也支持直接翻译srt、lrc、vtt字幕文件，mtool json文件，t++ excel文件，epub文件
+  7. （新）🤗 [Galtransl-7B-v1](https://huggingface.co/SakuraLLM/GalTransl-v1)是为视觉小说翻译任务专项优化的本地模型，可在6G VRAM以上显卡部署，由sakuraumi和xd2333共同构建。
 
 <b>❗❗使用本工具翻译并在未做全文校对/润色的前提下发布时，请在最显眼的位置标注"GPT翻译/AI翻译补丁"，而不是"个人汉化"或"AI汉化"补丁。</b>
 
 ## 近期更新
-* 2024.5：更新V5，新增GalTransl-7B-V1模型，新增t++文件支持
-* 2024.4: 支持claude3第三方中转
-* 2024/02/01：更新v4版，支持插件系统  
-* 2024/01/02：提供exe一键包，免安装环境   
-* 2023/12/28：增加设置项，允许通过字典在译前译后替换name，可用于汉化name字段   
-* 2023/12/23：支持Sakura-13B-Galgame离线翻译模型   
-* 2023/12/17：更新v3版，支持基于文件的多线程 by @ryank231231   
+* 2024.5：更新v5，新增GalTransl-7B-V1模型，新增多种文件类型支持   
+* 2024.2：更新v4版，主要支持了插件系统  
+* 2023.12：更新v3版，支持基于文件的多线程 by @ryank231231
+* 2023.7：更新v2版，主要重构了代码 by @ryank231231
+* 2023.6：v1初版发布
 
 ## 导航
 * [环境准备](https://github.com/XD2333/GalTransl#环境准备)：环境与软件的安装   
 * [上手教程](https://github.com/XD2333/GalTransl#上手教程)：全流程介绍如何制作一个机翻补丁，只想看怎么使用本工具的话，可以只看第2章   
 * [配置文件与翻译引擎设置](https://github.com/XD2333/GalTransl#配置文件与翻译引擎设置)：本篇详细介绍各个翻译引擎API的调用与配置方式。   
 * [GalTransl核心功能介绍](https://github.com/XD2333/GalTransl#galtransl核心功能介绍)：介绍GPT字典、缓存、普通字典、找问题等功能。
-* 部分教程已经[转移至Wiki](https://github.com/xd2333/GalTransl/wiki)
+* 后续教程已经[转移至Wiki](https://github.com/xd2333/GalTransl/wiki)
 
 ## 环境准备
   * **免环境版**   
