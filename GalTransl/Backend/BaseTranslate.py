@@ -10,7 +10,7 @@ from GalTransl.ConfigHelper import (
 )
 from random import choice
 from GalTransl.CSentense import CSentense, CTransList
-from GalTransl.Cache import get_transCache_from_json, save_transCache_to_json
+from GalTransl.Cache import get_transCache_from_json_new, save_transCache_to_json
 from GalTransl.Dictionary import CGptDict
 from GalTransl.Utils import extract_code_blocks, fix_quotes
 from GalTransl.Backend.Prompts import (
@@ -41,4 +41,10 @@ class BaseTranslate:
         pass
 
     def init_chatbot(self, eng_type, config):
+        pass
+
+    def clean_up(self):
+        pass
+
+    def translate(self, trans_list: CTransList, gptdict=""):
         pass

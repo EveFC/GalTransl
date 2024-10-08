@@ -50,7 +50,7 @@ PROGRAM_SPLASH4 = r"""
 ALL_BANNERS = [PROGRAM_SPLASH1, PROGRAM_SPLASH2, PROGRAM_SPLASH3, PROGRAM_SPLASH4]
 PROGRAM_SPLASH = ALL_BANNERS[localtime().tm_mday % 4]
 
-GALTRANSL_VERSION = "5.4.1"
+GALTRANSL_VERSION = "5.8.1"
 AUTHOR = "xd2333"
 CONTRIBUTORS = (
     "ryank231231, PiDanShouRouZhouXD, Noriverwater, Isotr0py, adsf0427, pipixia244, gulaodeng"
@@ -61,16 +61,16 @@ INPUT_FOLDERNAME = "gt_input"
 OUTPUT_FOLDERNAME = "gt_output"
 CACHE_FOLDERNAME = "transl_cache"
 TRANSLATOR_SUPPORTED = {
-    "gpt4-turbo": "（兼容Claude-3 haiku-opus中转）GPT-4官方或中转API，默认1106模型。逻辑优秀，犯错少，",
-    "sakura-010": "为翻译轻小说/视觉小说开展大规模训练的本地模型，具有多个型号和大小。适用v0.10版prompt",
-    "galtransl-v1": "为视觉小说翻译任务进一步优化的本地模型，有着平衡的硬件需求、翻译质量与稳定性",
-    "gpt35-1106": "GPT-3.5官方或中转API，默认1106模型。入门模型",
-    "newbing": "模拟网页模式。文风优秀，只能翻译日常文本，速度慢",
-    "sakura-009": "为翻译轻小说/视觉小说开展大规模训练的本地模型。适用v0.9版prompt，不支持GPT字典",
+    "gpt4-turbo": "（兼容Claude-3 haiku/sonnet/opus中转）GPT-4类比较聪明的模型通用，默认GPT4-1106模型",
+    "sakura-v1.0": "（适用v1.0版prompt）为翻译轻小说/视觉小说开展大规模训练的本地模型，具有多个型号和大小",
+    "galtransl-v2.5": "为翻译视觉小说基于Sakura进一步优化的本地小模型，可运行在6G显存的游戏显卡上",
+    "gpt35-1106": "GPT-3.5官方或中转API，默GPT3.5认1106模型。",
+    "sakura-009": "（适用v0.9版prompt，不支持GPT字典）为翻译轻小说/视觉小说开展大规模训练的本地模型。",
+    "newbing": "（将废弃）模拟网页模式。文风优秀，只能翻译日常文本，速度慢",
     "rebuildr": "重建结果 用译前译后字典通过缓存刷写结果json -- 跳过翻译和写缓存",
     "rebuilda": "重建缓存和结果 用译前译后字典刷写缓存+结果json -- 跳过翻译",
     "dump-name": "导出name字段，生成人名替换表，用于翻译name字段",
-    "showplugs": "显示全部插件列表",
+    "show-plugs": "显示全部插件列表",
 }
 LANG_SUPPORTED = {
     "zh-cn": "Simplified_Chinese",
@@ -102,3 +102,6 @@ update_thread = threading.Thread(
     target=check_for_tool_updates, args=(new_version,)
 )
 update_thread.start()
+
+transl_counter={"tran_count":0,"error_count":0}
+

@@ -14,11 +14,12 @@ from GalTransl.ConfigHelper import (
 from GalTransl.COpenAI import COpenAIToken, COpenAITokenPool, initGPTToken
 from GalTransl.ConfigHelper import CProxyPool
 from GalTransl.Dictionary import CGptDict
-from GalTransl.Cache import get_transCache_from_json, save_transCache_to_json
+from GalTransl.Cache import get_transCache_from_json_new, save_transCache_to_json
 from GalTransl.Backend.revChatGPT.typings import APIConnectionError
 from GalTransl.Utils import extract_code_blocks, fix_quotes
 from httpx import ProtocolError
 from GalTransl import LOGGER, LANG_SUPPORTED
+from GalTransl.Backend.BaseTranslate import BaseTranslate
 from GalTransl.Backend.Prompts import (
     GPT35_0613_NAME_PROMPT3,
     GPT35_0613_TRANS_PROMPT,
@@ -30,7 +31,7 @@ from GalTransl.Backend.Prompts import (
 )
 
 
-class CGPT35Translate:
+class CGPT35Translate(BaseTranslate):
     def __init__(
         self,
         config: CProjectConfig,
@@ -46,6 +47,7 @@ class CGPT35Translate:
             self.save_steps = val
         else:
             self.save_steps = 1
+
         # 语言设置
         if val := config.getKey("language"):
             sp = val.split("2")
@@ -65,6 +67,11 @@ class CGPT35Translate:
             raise ValueError("错误的目标语言代码：" + self.target_lang)
         else:
             self.target_lang = LANG_SUPPORTED[self.target_lang]
+        # 429等待时间
+        if val := config.getKey("gpt.tooManyRequestsWaitTime"):
+            self.wait_time = val
+        else:
+            self.wait_time = 60
         # 换行符改善模式
         if val := config.getKey("gpt.lineBreaksImprovementMode"):
             self.line_breaks_improvement_mode = val
@@ -105,13 +112,7 @@ class CGPT35Translate:
         else:
             self.proxyProvider = None
             
-
-        # 翻译风格
-        if val := config.getKey("gpt.translStyle"):
-            self.transl_style = val
-        else:
-            self.transl_style = "auto"
-        self._current_style = ""
+        self._current_temp_type = ""
 
         if self.target_lang == "Simplified_Chinese":
             self.opencc = OpenCC("t2s.json")
@@ -168,10 +169,8 @@ class CGPT35Translate:
                 self.proxyProvider.getProxy().addr if self.proxyProvider else None  # type: ignore
             )
 
-        if self.transl_style == "auto":
-            self._set_gpt_style("precise")
-        else:
-            self._set_gpt_style(self.transl_style)
+        self._set_temp_type("precise")
+
 
     async def asyncTranslate(self, content: CTransList, gptdict="") -> CTransList:
         """
@@ -232,8 +231,8 @@ class CGPT35Translate:
                     self.token = self.tokenProvider.getToken(True, False)
                     self.chatbot.set_api_key(self.token.token)
                 elif "try again later" in str_ex or "too many requests" in str_ex:
-                    LOGGER.warning("-> [请求错误]请求受限，1分钟后继续尝试")
-                    await asyncio.sleep(60)
+                    LOGGER.warning(f"-> [请求错误]请求受限，{self.wait_time}秒后继续尝试")
+                    await asyncio.sleep(self.wait_time)
                     continue
                 elif "try reload" in str_ex:
                     self.reset_conversation()
@@ -328,8 +327,7 @@ class CGPT35Translate:
                 elif self.eng_type == "unoffapi":
                     self.reset_conversation()
                 # 先切换模式
-                if self.transl_style == "auto":
-                    self._set_gpt_style("normal")
+                self._set_temp_type("normal")
                 # 2次重试则对半拆
                 if self.retry_count == 2 and len(content) > 1:
                     self.retry_count -= 1
@@ -359,8 +357,8 @@ class CGPT35Translate:
                 content[i].post_zh = result[key_name]
                 content[i].trans_by = self.chatbot.engine
 
-            if self.transl_style == "auto" and not warn_flag:
-                self._set_gpt_style("precise")
+            if not warn_flag:
+                self._set_temp_type("precise")
             self.retry_count = 0
 
             break  # 输出正确，跳出循环
@@ -403,12 +401,12 @@ class CGPT35Translate:
         elif self.eng_type == "unoffapi":
             pass
 
-    def _set_gpt_style(self, style_name: str):
+    def _set_temp_type(self, style_name: str):
         if self.eng_type == "unoffapi":
             return
-        if self._current_style == style_name:
+        if self._current_temp_type == style_name:
             return
-        self._current_style = style_name
+        self._current_temp_type = style_name
 
         if style_name == "precise":
             temperature, top_p = 1.0, 0.4
@@ -472,7 +470,7 @@ class CGPT35Translate:
         proofread: bool = False,
         retran_key: str = "",
     ) -> CTransList:
-        _, trans_list_unhit = get_transCache_from_json(
+        _, trans_list_unhit = get_transCache_from_json_new(
             trans_list,
             cache_path,
             retry_failed=retry_failed,

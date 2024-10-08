@@ -10,7 +10,7 @@ from GalTransl.ConfigHelper import (
 )
 from random import choice
 from GalTransl.CSentense import CSentense, CTransList
-from GalTransl.Cache import get_transCache_from_json, save_transCache_to_json
+from GalTransl.Cache import get_transCache_from_json_new, save_transCache_to_json
 from GalTransl.Dictionary import CGptDict
 from GalTransl.Utils import extract_code_blocks, fix_quotes
 from GalTransl.Backend.Prompts import (
@@ -20,6 +20,7 @@ from GalTransl.Backend.Prompts import (
     GPT4_PROOFREAD_PROMPT,
     NAME_PROMPT4,
 )
+from GalTransl.Backend.BaseTranslate import BaseTranslate
 from GalTransl.Backend.Prompts import (
     GPT4Turbo_SYSTEM_PROMPT,
     GPT4Turbo_TRANS_PROMPT,
@@ -29,7 +30,7 @@ from GalTransl.Backend.Prompts import (
 )
 
 
-class CGPT4Translate:
+class CGPT4Translate(BaseTranslate):
     # init
     def __init__(
         self,
@@ -82,6 +83,11 @@ class CGPT4Translate:
             raise ValueError("错误的目标语言代码：" + self.target_lang)
         else:
             self.target_lang = LANG_SUPPORTED[self.target_lang]
+        # 429等待时间
+        if val := config.getKey("gpt.tooManyRequestsWaitTime"):
+            self.wait_time = val
+        else:
+            self.wait_time = 60
         # 挥霍token模式
         if val := config.getKey("gpt.fullContextMode"):
             self.full_context_mode = val
@@ -112,19 +118,11 @@ class CGPT4Translate:
         else:
             self.proxyProvider = None
             
-        # 翻译风格
-        if val := config.getKey("gpt.translStyle"):
-            self.transl_style = val
-        else:
-            self.transl_style = "auto"
-        self._current_style = ""
+        self._current_temp_type = ""
 
         self.init_chatbot(eng_type=eng_type, config=config)  # 模型选择
 
-        if self.transl_style == "auto":
-            self._set_gpt_style("precise")
-        else:
-            self._set_gpt_style(self.transl_style)
+        self._set_temp_type("precise")
 
         if self.target_lang == "Simplified_Chinese":
             self.opencc = OpenCC("t2s.json")
@@ -272,8 +270,8 @@ class CGPT4Translate:
                     LOGGER.warning(f"-> [请求错误]切换到token {self.token.maskToken()}")
                     continue
                 elif "try again later" in str_ex or "too many requests" in str_ex:
-                    LOGGER.warning("-> [请求错误]请求受限，1分钟后继续尝试")
-                    await asyncio.sleep(60)
+                    LOGGER.warning(f"-> [请求错误]请求受限，{self.wait_time}秒后继续尝试")
+                    await asyncio.sleep(self.wait_time)
                     continue
                 elif "try reload" in str_ex:
                     self.reset_conversation()
@@ -402,8 +400,7 @@ class CGPT4Translate:
                 self._del_last_answer()
                 self.retry_count += 1
                 # 切换模式
-                if self.transl_style == "auto":
-                    self._set_gpt_style("normal")
+                self._set_temp_type("normal")
                 # 2次重试则对半拆
                 if self.retry_count == 2 and len(trans_list) > 1:
                     self.retry_count -= 1
@@ -422,8 +419,7 @@ class CGPT4Translate:
                 continue
 
             # 翻译完成，收尾
-            if self.transl_style == "auto":
-                self._set_gpt_style("precise")
+            self._set_temp_type("precise")
             self.retry_count = 0
             break
         return i + 1, result_trans_list
@@ -439,7 +435,7 @@ class CGPT4Translate:
         proofread: bool = False,
         retran_key: str = "",
     ) -> CTransList:
-        _, trans_list_unhit = get_transCache_from_json(
+        _, trans_list_unhit = get_transCache_from_json_new(
             trans_list,
             cache_file_path,
             retry_failed=retry_failed,
@@ -543,12 +539,12 @@ class CGPT4Translate:
         elif self.eng_type == "unoffapi":
             pass
 
-    def _set_gpt_style(self, style_name: str):
+    def _set_temp_type(self, style_name: str):
         if self.eng_type == "unoffapi":
             return
-        if self._current_style == style_name:
+        if self._current_temp_type == style_name:
             return
-        self._current_style = style_name
+        self._current_temp_type = style_name
         # normal default
         temperature, top_p = 1.0, 1.0
         frequency_penalty, presence_penalty = 0.3, 0.0

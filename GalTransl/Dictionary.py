@@ -126,7 +126,7 @@ class CNormalDic:
         self.dic_list: List[CBasicDicElement] = []
         for dic_path in dic_list:
             self.load_dic(dic_path)  # 加载字典
-    
+
     def sort_dic(self):
         """
         按字典search_word的长度重排序
@@ -164,7 +164,7 @@ class CNormalDic:
                 continue
             # 处理转义字符
             for i in range(len_sp):
-                sp[i]=process_escape(sp[i])
+                sp[i] = process_escape(sp[i])
 
             is_conditionaDic_line = True if sp[0] in self.conditionaDic_key else False
             is_situationsDic_line = True if sp[0] in self.situationsDic_key else False
@@ -209,11 +209,14 @@ class CNormalDic:
             )
         )
 
-    def do_replace(self, input_text: str, input_tran: CSentense) -> str:
+    def do_replace(
+        self, input_text: str, input_tran: CSentense, full_match: bool = False
+    ) -> str:
         """
         通过这个dic字典来优化一个句子。
         input_text：要被润色的句子
         input_translate：这个句子所在的Translate对象
+        full_match：是否全匹配，默认False，开启后查找词完全等于input_text才替换
         """
         # 遍历每个BasicDicElement做替换
         for dic in self.dic_list:
@@ -301,7 +304,10 @@ class CNormalDic:
             elif dic.onetime_flag:  # onetime情况，只替换一次
                 input_text = input_text.replace(search_word, replace_word, 1)
             else:  # 普通情况
-                input_text = input_text.replace(search_word, replace_word)
+                if not full_match:
+                    input_text = input_text.replace(search_word, replace_word)
+                elif search_word == input_text:
+                    input_text = replace_word
 
         return input_text
 
@@ -311,7 +317,7 @@ class CGptDict:
         self._dic_list: List[CBasicDicElement] = []
         for dic_path in dic_list:
             self.load_dic(dic_path)  # 加载字典
-    
+
     def sort_dic(self):
         """
         按字典search_word的长度重排序
@@ -335,11 +341,12 @@ class CGptDict:
         for line in dic_lines:
             if line.startswith("\n"):
                 continue
-            # elif line.startswith("\\\\") or line.startswith("//"):  # 注释行跳过
-            #     continue
 
-            # 四个空格换成Tab
+            # 兼容四个空格
             line = line.replace("    ", "\t")
+            # 兼容src->dst #note
+            if "->" in line:
+                line = line.replace("->", "\t").replace("#", "\t")
 
             sp = line.rstrip("\r\n").split("\t")  # 去多余换行符，Tab分割
             len_sp = len(sp)
@@ -347,11 +354,25 @@ class CGptDict:
             if len_sp < 2:  # 至少是2个元素
                 continue
 
-            dic = CBasicDicElement(sp[0], sp[1], dic_name=dic_name)
+            search_word = sp[0]
+            replace_word = sp[1]
             if len_sp > 2 and sp[2]:
-                dic.note = sp[2]
+                note = sp[2]
             else:
-                dic.note = ""
+                note = ""
+
+            redundant_flag = False
+            for d in self._dic_list:
+                if d.search_word == search_word and d.replace_word == replace_word:
+                    if d.note and d.note == note:
+                        LOGGER.warning(f"重复的GPT字典词条 {search_word} -> {replace_word} 已忽略")
+                        redundant_flag = True
+                        break
+            if redundant_flag:
+                continue
+
+            dic = CBasicDicElement(search_word, replace_word, dic_name=dic_name)
+            dic.note = note
             self._dic_list.append(dic)
             normalDic_count += 1
         LOGGER.info(

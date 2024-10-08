@@ -19,12 +19,12 @@
   4. 实时保存缓存、自动断点续翻   
   5. 结合其他项目支持多引擎脚本一键解包与注入，提供完整教程降低上手难度
   6. （新）现在也支持直接翻译srt、lrc、vtt字幕文件，mtool json文件，t++ excel文件，epub文件
-  7. （新）🤗 [Galtransl-7B-v1](https://huggingface.co/SakuraLLM/GalTransl-v1)是为视觉小说翻译任务专项优化的本地模型，可在6G VRAM以上显卡部署，由sakuraumi和xd2333共同构建。
+  7. （新）🤗 [Galtransl-7B-v2](https://huggingface.co/SakuraLLM/GalTransl-7B-v2)是为视觉小说翻译任务专项优化的本地模型，可在6G VRAM以上显卡部署，由sakuraumi和xd2333共同构建。
 
 <b>❗❗使用本工具翻译并在未做全文校对/润色的前提下发布时，请在最显眼的位置标注"GPT翻译/AI翻译补丁"，而不是"个人汉化"或"AI汉化"补丁。</b>
 
 ## 近期更新
-* 2024.5：更新v5，新增GalTransl-7B-V1模型，新增多种文件类型支持   
+* 2024.5：更新v5，新增GalTransl-7B模型，新增多种文件类型支持   
 * 2024.2：更新v4版，主要支持了插件系统  
 * 2023.12：更新v3版，支持基于文件的多线程 by @ryank231231
 * 2023.7：更新v2版，主要重构了代码 by @ryank231231
@@ -68,14 +68,15 @@
 ## 实用工具
 | 名称 | 说明 |
 | --- | --- |
-| EmEditor | 文本工具：神一样的文本编辑器。[下载](https://www.ghxi.com/emeditor.html)  |
-| GalTransl_DumpInjector | 脚本工具：[VNTextPatch](https://github.com/arcusmaximus/VNTranslationTools)的图形化界面，综合脚本文本提取导入工具 |
-| [SExtractor](https://github.com/satan53x/SExtractor) | 脚本工具：综合脚本文本提取导入工具 |
-| [DBTXT2Json_jp](https://github.com/XD2333/DBTXT2Json_jp) | 脚本工具：通用双行文本与json_jp互转脚本 |
 | GARbro | 引擎工具：神一样的解包工具。[下载](https://github.com/morkt/GARbro/releases/download/v1.5.44/GARbro-v1.5.44.2904.rar) |
 | [KirikiriTools](https://github.com/arcusmaximus/KirikiriTools) | 引擎工具：Krkr、krkrz 提取、注入工具 |
 | [UniversalInjectorFramework](https://github.com/AtomCrafty/UniversalInjectorFramework) | 引擎工具：sjis隧道、sjis替换模式通用注入框架 |
 | [VNTextProxy](https://github.com/arcusmaximus/VNTranslationTools) | 引擎工具：sjis隧道模式通用注入框架 |
+| GalTransl_DumpInjector | 脚本工具：[VNTextPatch](https://github.com/arcusmaximus/VNTranslationTools)的图形化界面，综合脚本文本提取导入工具 |
+| [SExtractor](https://github.com/satan53x/SExtractor) | 脚本工具：综合脚本文本提取导入工具 |
+| [DBTXT2Json_jp](https://github.com/XD2333/DBTXT2Json_jp) | 脚本工具：通用双行文本与json_jp互转脚本 |
+| EmEditor | 文本工具：神一样的文本编辑器。[下载](https://www.ghxi.com/emeditor.html)  |
+| [KeywordGacha](https://github.com/neavo/KeywordGacha) | 文本工具：使用 OpenAI 兼容接口自动生词语表 |
 
 ## 上手教程
 做一个gal内嵌翻译补丁的大致流程是：   
@@ -158,7 +159,7 @@ backendSpecific:
 &ensp;&ensp;&ensp;&ensp;如果没有api key或魔法上网的话，你还可以使用一些第三方api中转项目，例如：   
 * [GPT-API-free](https://github.com/chatanywhere/GPT_API_free)，免费API中转，提供有请求频率限制的用于测试。   
 * [GPT水龙头](https://faucet.openkey.cloud/)，免费API中转，每24小时可领取一个 $1.00 令牌用于开发测试 AI 产品   
-* 一些收费api转发项目，例如：[Name api](https://29qg.com/register/?aff_code=U7YH)、[happy api](https://ngedlktfticp.cloud.sealos.io/register?aff=QsU0)等等，比官方定价便宜，更多中转可以谷歌，以上只是举例，本项目不担保它们的稳定性及可用性。   
+* 一些收费api转发项目，例如：[MAX-API](https://api.7xnn.cn/register?aff=WF6H)、[happy api](https://ngedlktfticp.cloud.sealos.io/register?aff=ldwV)等等，以上只是举例，更多中转可以谷歌，本项目不担保它们的稳定性及可用性。   
    
 &ensp;&ensp;&ensp;&ensp;但要注意这里获取的key是第三方的key，不能用于官方API端点。如果你使用类似项目的话，做以下额外的修改：   
 ```python
