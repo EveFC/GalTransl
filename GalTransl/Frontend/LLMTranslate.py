@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from time import time
 import asyncio
+import re
 from dataclasses import dataclass
 from GalTransl import LOGGER
 from GalTransl.Backend.GPT3Translate import CGPT35Translate
@@ -189,6 +190,14 @@ async def doLLMTranslSingleChunk(
             if projectConfig.getDictCfgSection("usePreDictInName"):
                 if isinstance(tran.speaker, str) and isinstance(tran._speaker, str):
                     tran.speaker = pre_dic.do_replace(tran.speaker, tran)
+            if projectConfig.getKey("removeRubyText"):
+                match = re.finditer(projectConfig.getKey("rubyTextRegex"), tran.post_jp)
+                if match:
+                    for x in match:
+                        tran.post_jp = tran.post_jp.replace(x.group(), x.groups()[0])
+            if projectConfig.getKey("useLastName"):
+                if isinstance(tran.speaker, list):
+                    tran.speaker = tran.speaker[len(tran.speaker) - 1]
             for plugin in tPlugins:
                 try:
                     tran = plugin.plugin_object.after_src_processed(tran)

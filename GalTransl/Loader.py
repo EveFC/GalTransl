@@ -4,7 +4,8 @@ from os import path
 from json import loads
 from typing import Union, Tuple, List
 
-def load_transList(json_path_or_list: Union[str, list], use_last_name: bool) -> tuple[CTransList, list]:
+
+def load_transList(json_path_or_list: Union[str, list]) -> Tuple[CTransList, list]:
     """
     从json文件路径、json字符串、json list中载入待翻译列表
     json格式为[{"name":xx/"names":[],"message/pre_jp":"xx"},...]
@@ -35,20 +36,16 @@ def load_transList(json_path_or_list: Union[str, list], use_last_name: bool) -> 
 
     for i, item in enumerate(json_list):
         if not isinstance(item, dict):
-            raise ValueError(f"JSON列表中的第{i+1}项不是字典格式")
-        
+            raise ValueError(f"JSON列表中的第{i + 1}项不是字典格式")
+
         if "message" not in item:
-            raise ValueError(f"JSON格式不正确，第{i+1}个item缺少message字段：{item}")
+            raise ValueError(f"JSON格式不正确，第{i + 1}个item缺少message字段：{item}")
 
         name = item.get("name", item.get("names", ""))
-
-        if isinstance(name, list) and use_last_name:
-            name = name[len(name) - 1]
-
         pre_jp = item["message"]
         index = item.get("index", i + 1)
         tmp_tran = CSentense(pre_jp, name, index)
-        
+
         # 链接上下文
         if trans_list:
             tmp_tran.prev_tran = trans_list[-1]
