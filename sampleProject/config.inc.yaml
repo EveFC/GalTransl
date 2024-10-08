@@ -46,7 +46,7 @@ common:
   rubyTextRegex: "<ruby=.*?>(.*?)</ruby>"
   # Use last name as speaker name if names exists
   useLastName: false
-  
+
 # 插件，插件介绍可在启动程序后选择show-plugs查看，或在plugins目录内查看
 plugin:
   filePlugin: file_galtransl_json # 文件插件，用于支持更多格式，file_galtransl_json是本程序的标准格式插件

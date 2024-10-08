@@ -23,7 +23,7 @@ from GalTransl.Dictionary import CGptDict, CNormalDic
 from GalTransl.Problem import find_problems
 from GalTransl.Cache import save_transCache_to_json
 from GalTransl.Name import load_name_table, dump_name_table_from_chunks
-from GalTransl.CSerialize import update_json_with_transList, save_json
+from GalTransl.CSerialize import update_json_with_transList, update_json_with_transList_dmm, save_json
 from GalTransl.Dictionary import CNormalDic, CGptDict
 from GalTransl.ConfigHelper import CProjectConfig, initDictList
 from GalTransl.Utils import get_file_list
@@ -309,9 +309,14 @@ async def postprocess_results(
     save_func = projectConfig.file_save_funcs.get(file_path, save_json)
 
     if all_trans_list and all_json_list:
-        final_result = update_json_with_transList(
-            all_trans_list, all_json_list, name_replaceDict
-        )
+        if projectConfig.getKey("dmmGameMode"):
+            final_result = update_json_with_transList_dmm(
+                all_trans_list, all_json_list, name_replaceDict
+            )
+        else:
+            final_result = update_json_with_transList(
+                all_trans_list, all_json_list, name_replaceDict
+            )
         makedirs(dirname(output_file_path), exist_ok=True)
         save_func(output_file_path, final_result)
         LOGGER.info(f"已保存文件: {output_file_path}")  # 添加保存确认日志
