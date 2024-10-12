@@ -1,7 +1,6 @@
 """
 分析问题
 """
-from opencc import OpenCC
 from GalTransl.CSentense import CTransList
 from GalTransl.ConfigHelper import CProjectConfig, CProblemType
 from GalTransl.Utils import get_most_common_char, contains_japanese, contains_english
@@ -29,8 +28,6 @@ def find_problems(
     if not find_type:
         find_type = projectConfig.getProblemAnalyzeConfig("GPT35")  # 兼容旧版
     lb_symbol = projectConfig.getlbSymbol()
-
-    open_cc = OpenCC("t2s.json")
 
     for tran in trans_list:
         pre_jp = tran.pre_jp
@@ -81,7 +78,7 @@ def find_problems(
                     f"比日文长{round(len(post_zh)/max(len(pre_jp),0.1),1)}倍"
                 )
         if CProblemType.字典使用 in find_type:
-            if val := gpt_dict.check_dic_use(pre_zh, tran, open_cc):
+            if val := gpt_dict.check_dic_use(pre_zh, tran):
                 problem_list.append(val)
         if CProblemType.引入英文 in find_type:
             if not contains_english(post_jp) and contains_english(pre_zh):

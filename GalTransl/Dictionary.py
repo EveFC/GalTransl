@@ -1,6 +1,5 @@
 from typing import List
 from os import path
-from opencc import OpenCC
 from GalTransl.CSentense import CSentense, CTransList
 from GalTransl import LOGGER
 from GalTransl.Utils import process_escape
@@ -414,13 +413,11 @@ class CGptDict:
 
         return promt
 
-    def check_dic_use(self, find_from_str: str, tran: CSentense, open_cc: OpenCC):
+    def check_dic_use(self, find_from_str: str, tran: CSentense):
         problem_list = []
         for dic in self._dic_list:
             if dic.search_word not in tran.post_jp:
                 continue
-
-            dic.replace_word = open_cc.convert(dic.replace_word)
 
             replace_word_list = (
                 dic.replace_word.split("/")
