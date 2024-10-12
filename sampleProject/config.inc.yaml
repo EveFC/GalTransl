@@ -38,7 +38,7 @@ common:
   gpt.transl_dropout: 0 # (Sakura/Galtransl-7b)（实验性）丢弃翻译结果末尾的n行，可能会提高上下文准确性。[0-2]
   # DMM game mode
   # Use Key Value JSON {"こんにちは": "你好"} as output format
-  dmmGameMode: false
+  dmmGameMode: true
   # Remove ruby tag before translate
   # <ruby=リ・クリエイション>世界の再創生</ruby> → 世界の再創生
   # default rule for twinkle star knight: <ruby=.*?>(.*?)</ruby>
