@@ -1,5 +1,6 @@
 from typing import List
 from os import path
+from opencc import OpenCC
 from GalTransl.CSentense import CSentense, CTransList
 from GalTransl import LOGGER
 from GalTransl.Utils import process_escape
@@ -338,6 +339,8 @@ class CGptDict:
         dic_name = path.splitext(dic_name)[0]
         normalDic_count = 0
 
+        open_cc = OpenCC("t2s.json")
+
         for line in dic_lines:
             if line.startswith("\n"):
                 continue
@@ -371,7 +374,7 @@ class CGptDict:
             if redundant_flag:
                 continue
 
-            dic = CBasicDicElement(search_word, replace_word, dic_name=dic_name)
+            dic = CBasicDicElement(search_word, open_cc.convert(replace_word), dic_name=dic_name)
             dic.note = note
             self._dic_list.append(dic)
             normalDic_count += 1
