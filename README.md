@@ -64,6 +64,7 @@ print(text)
 | 遊戲名稱   | 注入工具    | Repo                                                            |
 |--------|---------|-----------------------------------------------------------------|
 | 閃耀之星騎士 | BepInEx | [TSKHook](https://github.com/TSKModding/TSKHook)                |
+| 閃耀之星騎士 | Frida   | [TSKHook-frida](https://github.com/TSKModding/TSKHook-frida)    |
 | 愛麗絲秘跡  | BepInEx | [IMYSHook](https://github.com/IrisMystery/IMYSHook)             |
 | 愛麗絲秘跡  | Frida   | [IMYSHook-Frida](https://github.com/IrisMystery/IMYSHook-frida) |
 | 少女藝術綺譚 | BepInEx | [GCMod](https://github.com/anosu/GCMod)                         |
