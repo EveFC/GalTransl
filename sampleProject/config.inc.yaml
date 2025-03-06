@@ -28,6 +28,7 @@ common:
   gpt.numPerRequestTranslate: 8 # 单次翻译句子数量，推荐值 < 15
   gpt.streamOutputMode: true # 流式输出效果，多线程下无效。[True/False]
   gpt.tooManyRequestsWaitTime: 60 # Too Many Requests 错误等待时间，单位秒
+  gpt.enhance_jailbreak: False # 减少通用模型拒绝翻译
   # NewBing/GPT4
   gpt.enableProofRead: false # (NewBing/GPT4)是否开启译后校润。（不建议使用，很久未维护）[True/False]
   gpt.numPerRequestProofRead: 7 # (NewBing/GPT4)单次校润句子数量，不建议修改
@@ -90,22 +91,11 @@ dictionary:
 
 # 翻译后端相关设置
 backendSpecific:
-  GPT35: # GPT3.5 API
-    tokens:
-      - token: sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-        endpoint: https://api.openai.com # 使用转发或第三方API时修改
-      - token: sk-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-        endpoint: ""
-    rewriteModelName: "" # 使用指定的模型型号替换默认模型
-  GPT4: # GPT4 API/claude-3第三方中转
+  GPT4: # OpenAI API接口通用，GPT4/Claude-3/Deepseek-V3/R1
     tokens:
       - token: sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
         endpoint: https://api.openai.com # 使用转发或第三方API时修改
     rewriteModelName: "" # 使用指定的模型型号替换默认模型
-  bingGPT4: # NewBing API
-    cookiePath:
-      - newbing_cookies/cookie1.json # 你的 cookies 文件，相对于项目目录
-      - newbing_cookies/cookie2.json # 你的 cookies 文件2，会自动切换
   SakuraLLM: # Sakura/Galtransl API
     endpoints:
       - http://127.0.0.1:8080

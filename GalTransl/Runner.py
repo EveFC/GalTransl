@@ -106,7 +106,7 @@ async def run_galtransl(cfg: CProjectConfig, translator: str):
     # 打印插件列表
     if translator == "show-plugs":
         print_plugin_list(plugin_manager)
-        return
+        return None
     new_candidates = []
     for tname in cfg.getTextPluginList():
         info_path = get_pluginInfo_path(tname)
@@ -159,7 +159,7 @@ async def run_galtransl(cfg: CProjectConfig, translator: str):
         LOGGER.warning("不使用代理")
 
     # OpenAITokenPool初始化
-    if "gpt" in translator:
+    if "gpt" in translator or "r1" in translator:
         OpenAITokenPool = COpenAITokenPool(cfg, translator)
         await OpenAITokenPool.checkTokenAvailablity(
             proxyPool.getProxy() if proxyPool else None, translator

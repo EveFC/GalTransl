@@ -108,17 +108,31 @@ async def doLLMTranslate(
         leave=False,
     )
 
-    async def run_task(task):
-        result = await task
-        progress_bar.update(1)
-        # progress_bar.set_postfix(
-        #     file=result[3].split(os_sep)[-1],
-        #     chunk=f"{result[4].start_index}-{result[4].end_index}",
-        # )
-        return result
+    async def run_task(task_func):
+        try:
+            result = await task_func
+            progress_bar.update(1)
+            # progress_bar.set_postfix(
+            #     file=result[3].split(os_sep)[-1],
+            #     chunk=f"{result[4].start_index}-{result[4].end_index}",
+            # )
+            return result
+        except Exception as e:
+            LOGGER.error(f"任务执行失败: {e}")
+            return None
 
+    # 优化任务分配策略，根据chunk大小进行分组处理
     all_tasks = []
-    for i, chunk in enumerate(total_chunks):
+    
+    # 计算每个chunk的复杂度估计值（基于chunk大小和交叉数量）
+    chunk_complexity = [(i, chunk.chunk_size + chunk.cross_num * 0.5) for i, chunk in enumerate(total_chunks)]
+    
+    # 根据复杂度对chunks进行排序（降序），确保复杂任务优先处理
+    chunk_complexity.sort(key=lambda x: x[1], reverse=True)
+    
+    # 创建任务并添加到队列
+    for chunk_idx, _ in chunk_complexity:
+        chunk = total_chunks[chunk_idx]
         task = run_task(
             doLLMTranslSingleChunk(
                 semaphore,
@@ -127,8 +141,28 @@ async def doLLMTranslate(
             )
         )
         all_tasks.append(task)
-
-    results = await asyncio.gather(*all_tasks)
+    
+    # 使用as_completed而不是gather，可以更好地利用资源
+    # 当任务完成时立即处理结果，而不是等待所有任务完成
+    pending = set(asyncio.create_task(task) for task in all_tasks)
+    results = []
+    
+    while pending:
+        # 等待任何一个任务完成
+        done, pending = await asyncio.wait(
+            pending, 
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        
+        # 处理已完成的任务
+        for task in done:
+            try:
+                result = task.result()
+                if result is not None:
+                    results.append(result)
+            except Exception as e:
+                LOGGER.error(f"任务执行失败: {e}")
+    
     progress_bar.close()
 
 
@@ -184,7 +218,7 @@ async def doLLMTranslSingleChunk(
                 except Exception as e:
                     LOGGER.error(f"插件 {plugin.name} 执行失败: {e}")
 
-            if projectConfig.getFilePlugin() == "file_galtransl_json":
+            if projectConfig.getFilePlugin() in ["file_galtransl_json","file_mtbench_chrf"]:
                 tran.analyse_dialogue()
             tran.post_jp = pre_dic.do_replace(tran.post_jp, tran)
             if projectConfig.getDictCfgSection("usePreDictInName"):
@@ -346,7 +380,7 @@ async def init_gptapi(
     match eng_type:
         case "gpt35-0613" | "gpt35-1106" | "gpt35-0125":
             return CGPT35Translate(projectConfig, eng_type, proxyPool, tokenPool)
-        case "gpt4" | "gpt4-turbo":
+        case "gpt4" | "gpt4-turbo" | "r1":
             return CGPT4Translate(projectConfig, eng_type, proxyPool, tokenPool)
         case "newbing":
             cookiePool: list[str] = []

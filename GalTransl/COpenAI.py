@@ -1,7 +1,7 @@
 """
 CloseAI related classes
 """
-
+import os
 from httpx import AsyncClient
 import asyncio
 from tqdm.asyncio import tqdm
@@ -11,6 +11,8 @@ from GalTransl.ConfigHelper import CProjectConfig, CProxy
 from typing import Optional, Tuple
 from random import choice
 from asyncio import Queue
+from openai import OpenAI
+import re
 
 TRANSLATOR_ENGINE = {
     "gpt35": "gpt-3.5-turbo",
@@ -94,10 +96,8 @@ class COpenAITokenPool:
         self.tokens: list[tuple[bool, COpenAIToken]] = []
         for token in initGPTToken(config, eng_type):
             self.tokens.append((False, token))
-        if "gpt35" in eng_type:
-            section = config.getBackendConfigSection("GPT35")
-        elif "gpt4" in eng_type:
-            section = config.getBackendConfigSection("GPT4")
+
+        section = config.getBackendConfigSection("GPT4")
         self.force_eng_name = section.get("rewriteModelName", "")
 
     async def _isTokenAvailable(
@@ -105,42 +105,45 @@ class COpenAITokenPool:
     ) -> Tuple[bool, bool, bool, COpenAIToken]:
         # returns isAvailable,isGPT3Available,isGPT4Available,token
         # todo: do not remove token directly, we can score the token
+        model_name = TRANSLATOR_ENGINE.get(eng_type, "gpt-3.5-turbo")
+        if self.force_eng_name:
+            model_name = self.force_eng_name
+        if not token.domain.endswith("/v1") and not re.search(r"/v\d+$", token.domain):
+            base_url = token.domain + "/v1"
+        else:
+            base_url = token.domain
         try:
             st = time()
-            async with AsyncClient(
-                proxies={"https://": proxy.addr} if proxy else None
-            ) as client:
-                auth = {"Authorization": "Bearer " + token.token}
-                model_name = TRANSLATOR_ENGINE.get(eng_type, "gpt-3.5-turbo")
-                if self.force_eng_name:
-                    model_name = self.force_eng_name
-                # test if have balance
-                chatResponse = await client.post(
-                    token.domain + "/v1/chat/completions",
-                    headers=auth,
-                    json={
-                        "model": model_name,
-                        "messages": [{"role": "user", "content": "Echo OK"}],
-                        "temperature": 0.7,
-                    },
-                    timeout=10,
-                )
-                if chatResponse.status_code != 200:
-                    # token not available, may token has been revoked
-                    return False, False, False, token
+            client = OpenAI(
+                api_key=token.token,
+                base_url=base_url,
+            )
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": "Echo OK"}],
+                temperature=0.7,
+                max_tokens=100,
+                timeout=10,
+            )
+
+            if not response.choices[0].message.content:
+                # token not available, may token has been revoked
+                return False, False, False, token
+            else:
+                isGPT3Available = False
+                isGPT4Available = False
+
+                if "gpt-4" in model_name:
+                    isGPT4Available = True
+                elif "gpt-3.5" in model_name:
+                    isGPT3Available = True
                 else:
-                    isGPT3Available = False
-                    isGPT4Available = False
+                    isGPT4Available, isGPT3Available = True, True
 
-                    if "gpt-4" in model_name:
-                        isGPT4Available = True
-                    elif "gpt-3.5" in model_name:
-                        isGPT3Available = True
-                    else:
-                        isGPT4Available, isGPT3Available = True, True
+                return True, isGPT3Available, isGPT4Available, token
+        except Exception as e:
+            LOGGER.debug(e)
 
-                    return True, isGPT3Available, isGPT4Available, token
-        except:
             LOGGER.debug(
                 "we got exception in testing OpenAI token %s", token.maskToken()
             )
@@ -224,9 +227,7 @@ class COpenAITokenPool:
         rounds: int = 0
         while True:
             if rounds > 20:
-                raise RuntimeError(
-                    "COpenAITokenPool::getToken: 可用的API key耗尽！"
-                )
+                raise RuntimeError("COpenAITokenPool::getToken: 可用的API key耗尽！")
             try:
                 available, token = choice(self.tokens)
                 if not available:
@@ -240,9 +241,7 @@ class COpenAITokenPool:
                 raise RuntimeError("没有可用的 API key！")
 
 
-async def init_sakura_endpoint_queue(
-    projectConfig: CProjectConfig
-) -> Optional[Queue]:
+async def init_sakura_endpoint_queue(projectConfig: CProjectConfig) -> Optional[Queue]:
     """
     初始化端点队列，用于Sakura或GalTransl引擎。
 
@@ -262,9 +261,7 @@ async def init_sakura_endpoint_queue(
     if "endpoints" in projectConfig.getBackendConfigSection(section_name):
         endpoints = projectConfig.getBackendConfigSection(section_name)["endpoints"]
     else:
-        endpoints = [
-            projectConfig.getBackendConfigSection(section_name)["endpoint"]
-        ]
+        endpoints = [projectConfig.getBackendConfigSection(section_name)["endpoint"]]
     repeated = (workersPerProject + len(endpoints) - 1) // len(endpoints)
     for _ in range(repeated):
         for endpoint in endpoints:
