@@ -54,21 +54,6 @@ def initGPTToken(config: CProjectConfig, eng_type: str) -> Optional[list[COpenAI
         degradeBackend = val
 
     defaultEndpoint = "https://api.openai.com"
-    gpt35_tokens = config.getBackendConfigSection("GPT35").get("tokens")
-    if "gpt35" in eng_type and gpt35_tokens:
-        for tokenEntry in gpt35_tokens:
-            token = tokenEntry["token"]
-            domain = (
-                tokenEntry["endpoint"]
-                if tokenEntry.get("endpoint")
-                else defaultEndpoint
-            )
-            domain = domain[:-1] if domain.endswith("/") else domain
-            result.append(COpenAIToken(token, domain, True, False))
-            pass
-
-        if not degradeBackend:
-            return result
 
     if gpt4_tokens := config.getBackendConfigSection("GPT4").get("tokens"):
         for tokenEntry in gpt4_tokens:

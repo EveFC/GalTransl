@@ -13,7 +13,6 @@ import asyncio
 import re
 from dataclasses import dataclass
 from GalTransl import LOGGER
-from GalTransl.Backend.GPT3Translate import CGPT35Translate
 from GalTransl.Backend.GPT4Translate import CGPT4Translate
 from GalTransl.Backend.BingGPT4Translate import CBingGPT4Translate
 from GalTransl.Backend.SakuraTranslate import CSakuraTranslate
@@ -77,7 +76,14 @@ async def doLLMTranslate(
     file_list = get_file_list(projectConfig.getInputPath())
     if not file_list:
         raise RuntimeError(f"{projectConfig.getInputPath()}中没有待翻译的文件")
-
+    
+    # 按文件名自然排序（处理数字部分）
+    import re
+    def natural_sort_key(s):
+        return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
+    
+    file_list.sort(key=natural_sort_key)
+    
     # 读取所有文件获得total_chunks列表
     with ThreadPoolExecutor(max_workers=workersPerProject) as executor:
         future_to_file = {
@@ -378,8 +384,6 @@ async def init_gptapi(
     eng_type = projectConfig.select_translator
 
     match eng_type:
-        case "gpt35-0613" | "gpt35-1106" | "gpt35-0125":
-            return CGPT35Translate(projectConfig, eng_type, proxyPool, tokenPool)
         case "gpt4" | "gpt4-turbo" | "r1":
             return CGPT4Translate(projectConfig, eng_type, proxyPool, tokenPool)
         case "newbing":
