@@ -127,18 +127,26 @@ async def doLLMTranslate(
             LOGGER.error(f"任务执行失败: {e}")
             return None
 
-    # 优化任务分配策略，根据chunk大小进行分组处理
+    # 按文件分组chunks，保持文件内部的顺序
+    file_chunks = {}
+    for chunk in total_chunks:
+        if chunk.file_path not in file_chunks:
+            file_chunks[chunk.file_path] = []
+        file_chunks[chunk.file_path].append(chunk)
+    
+    # 确保每个文件内的chunks按索引排序
+    for file_path in file_chunks:
+        file_chunks[file_path].sort(key=lambda x: x.chunk_index)
+    
+    # 按照file_list的顺序处理文件，保持文件间的顺序
+    ordered_chunks = []
+    for file_path in file_list:
+        if file_path in file_chunks:
+            ordered_chunks.extend(file_chunks[file_path])
+    
+    # 创建任务队列，保持顺序但允许并行执行
     all_tasks = []
-    
-    # 计算每个chunk的复杂度估计值（基于chunk大小和交叉数量）
-    chunk_complexity = [(i, chunk.chunk_size + chunk.cross_num * 0.5) for i, chunk in enumerate(total_chunks)]
-    
-    # 根据复杂度对chunks进行排序（降序），确保复杂任务优先处理
-    chunk_complexity.sort(key=lambda x: x[1], reverse=True)
-    
-    # 创建任务并添加到队列
-    for chunk_idx, _ in chunk_complexity:
-        chunk = total_chunks[chunk_idx]
+    for chunk in ordered_chunks:
         task = run_task(
             doLLMTranslSingleChunk(
                 semaphore,
@@ -148,26 +156,17 @@ async def doLLMTranslate(
         )
         all_tasks.append(task)
     
-    # 使用as_completed而不是gather，可以更好地利用资源
-    # 当任务完成时立即处理结果，而不是等待所有任务完成
-    pending = set(asyncio.create_task(task) for task in all_tasks)
-    results = []
-    
-    while pending:
-        # 等待任何一个任务完成
-        done, pending = await asyncio.wait(
-            pending, 
-            return_when=asyncio.FIRST_COMPLETED
-        )
-        
-        # 处理已完成的任务
-        for task in done:
-            try:
-                result = task.result()
-                if result is not None:
-                    results.append(result)
-            except Exception as e:
-                LOGGER.error(f"任务执行失败: {e}")
+    # 使用有序执行策略
+    # 将任务分成批次，每批次同时执行workersPerProject个任务
+    # 确保前一批次完成后再执行下一批次
+    batch_size = workersPerProject
+    for i in range(0, len(all_tasks), batch_size):
+        batch_tasks = all_tasks[i:i+batch_size]
+        batch_results = await asyncio.gather(*batch_tasks)
+        for result in batch_results:
+            if result is not None:
+                # 处理结果
+                pass
     
     progress_bar.close()
 
