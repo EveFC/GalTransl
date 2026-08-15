@@ -244,8 +244,8 @@ class ProjectManager:
                     return
             
             # 创建快捷方式（如果适用）
-            if self.translator not in ["show-plugs", "dump-name"]:
-                self.create_shortcut_win()
+            # if self.translator not in ["show-plugs", "dump-name"]:
+            #     self.create_shortcut_win()
             # 执行核心任务
             self.start_worker()
 
