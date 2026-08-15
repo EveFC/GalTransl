@@ -1,0 +1,17 @@
+Core:
+  Name: DMM JSON
+  Type: file
+  Module: file_dmm_json
+
+Documentation:
+  Author: c0re100
+  Version: 1.0
+  Description: "Use Key Value JSON {\"こんにちは\": \"你好\"} as output format"
+
+Settings:
+  output_with_kv: True # Enable Key Value JSON mode
+  # Remove ruby tag before translate
+  # <ruby=リ・クリエイション>世界の再創生</ruby> → 世界の再創生
+  # default rule for twinkle star knight: <ruby=.*?>(.*?)</ruby>
+  remove_ruby_text: True
+  ruby_text_regex: "<ruby=.*?>(.*?)</ruby>"
