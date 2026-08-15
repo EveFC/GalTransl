@@ -1,5 +1,6 @@
 from typing import List
 from os import path
+from opencc import OpenCC
 from GalTransl.CSentense import CSentense, CTransList
 from GalTransl import LOGGER
 from GalTransl.Utils import process_escape
@@ -319,8 +320,10 @@ class CNormalDic:
 
 
 class CGptDict:
-    def __init__(self, dic_list: list) -> None:
+    def __init__(self, dic_list: list, select_translator: str) -> None:
         self._dic_list: List[CBasicDicElement] = []
+        self.opencc = OpenCC("t2s.json")
+        self.translator = select_translator
         for dic_path in dic_list:
             self.load_dic(dic_path)  # 加载字典
     
@@ -383,7 +386,10 @@ class CGptDict:
             if redundant_flag:
                 continue
 
-            dic = CBasicDicElement(search_word, replace_word, dic_name=dic_name)
+            if self.translator == "sakura-v1.0":
+                dic = CBasicDicElement(search_word, self.opencc.convert(replace_word), dic_name=dic_name)
+            else:
+                dic = CBasicDicElement(search_word, replace_word, dic_name=dic_name)
             dic.note = note
             self._dic_list.append(dic)
             normalDic_count += 1

@@ -461,7 +461,7 @@ async def doLLMTranslate(
         initDictList(post_dic_list, default_dic_dir, project_dir)
     )
     projectConfig.gpt_dic = CGptDict(
-        initDictList(gpt_dic_list, default_dic_dir, project_dir)
+        initDictList(gpt_dic_list, default_dic_dir, project_dir), projectConfig.select_translator
     )
 
     if projectConfig.getDictCfgSection().get("sortDict", True):
