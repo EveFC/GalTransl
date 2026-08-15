@@ -438,8 +438,8 @@ class BaseTranslate:
     def _normalize_parsed_translation_text(
         self, line_dst: str, current_tran: CSentense, n_symbol: str
     ) -> str:
-        if "Chinese" in self.target_lang:
-            line_dst = self.opencc.convert(line_dst)
+        # if "Chinese" in self.target_lang:
+        #     line_dst = self.opencc.convert(line_dst)
 
         if "”" not in current_tran.post_src and '"' not in current_tran.post_src:
             line_dst = line_dst.replace('"', "")
