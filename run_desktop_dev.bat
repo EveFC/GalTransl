@@ -1,6 +1,7 @@
 @echo off
 setlocal
 cd /d %~dp0
+CALL .venv/Scripts/activate.bat
 
 where python >nul 2>nul
 if errorlevel 1 (
