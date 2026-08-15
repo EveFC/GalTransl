@@ -450,7 +450,7 @@ async def doLLMTranslate(
     if not isPathExists(name_replaceDict_path_csv) and not isPathExists(
         name_replaceDict_path_xlsx
     ):
-        await dump_name_table_from_chunks(total_chunks, projectConfig)
+        # await dump_name_table_from_chunks(total_chunks, projectConfig)
         name_replaceDict_firstime = True
     
     # ---- 5. 载入字典（pre/post/gpt）----
