@@ -20,3 +20,4 @@ app_settings.json
 galtransl_backend.spec
 /build
 /dist
+/.idea/*
