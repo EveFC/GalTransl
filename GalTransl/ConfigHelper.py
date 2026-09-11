@@ -109,6 +109,7 @@ class CProblemType(Enum):
     语言不通 = 10
     缺控制符 = 11
     独白男他 = 12
+    LLM輸出簡體 = 13
 
 
 class CProjectConfig:

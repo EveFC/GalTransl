@@ -9,6 +9,7 @@ from collections import Counter
 from re import compile
 import requests
 import re
+from zhon import cedict
 
 PATTERN_CODE_BLOCK = compile(r"```([\w]*)\n([\s\S]*?)\n```")
 whitespace = " \t\n\r\v\f"
@@ -21,6 +22,9 @@ octdigits = "01234567"
 punctuation = r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"""
 punctuation_zh = "。？！…（）；：《》「」『』【】"
 printable = digits + ascii_letters + punctuation + whitespace
+
+simplified_only_chars = set(cedict.simplified) - set(cedict.traditional)
+SIMPLIFIED_ONLY_PATTERN = re.compile(f'[{"".join(simplified_only_chars)}]')
 
 def load_guideline_file(file_path: str) -> str:
     try:
@@ -217,6 +221,11 @@ def is_all_gbk(s):
     return str("".join(non_gbk_chars))
 
 
+def is_simplified(text):
+    """
+    Check if a string's Chinese characters are Simplified.
+    """
+    return bool(SIMPLIFIED_ONLY_PATTERN.search(text))
 
 
 def contains_english(text: str) -> str:

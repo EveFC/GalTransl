@@ -26,3 +26,5 @@ budoux
 # Very heavyweight tokenizer, manual installation recommended
 # numpy < 2.0.0
 # hanlp
+
+zhon

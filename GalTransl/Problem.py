@@ -11,7 +11,8 @@ from GalTransl.Utils import (
     punctuation_zh,
     contains_korean,
     is_all_gbk,
-    extract_control_substrings
+    extract_control_substrings,
+    is_simplified
 )
 from GalTransl.Dictionary import CGptDict
 
@@ -156,6 +157,9 @@ def find_problems(
             if tran.speaker == "" and "他" in post_dst:
                 if not any(exclude in post_dst for exclude in MONOLOGUE_MALE_HE_EXCLUDES):
                     problem_list.append("独白男他")
+        if CProblemType.LLM輸出簡體 in find_type:
+            if is_simplified(pre_dst):
+                problem_list.append(f"LLM輸出簡體")
 
         if arinashi_dict != {}:
             for key, value in arinashi_dict.items():
