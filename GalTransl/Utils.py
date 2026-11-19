@@ -9,6 +9,7 @@ from typing import Tuple, List
 from re import compile
 import requests
 import re
+from GalTransl.RuntimePaths import get_active_translation_guidelines_dir
 from zhon import cedict
 
 PATTERN_CODE_BLOCK = compile(r"```([\w]*)\n([\s\S]*?)\n```")
