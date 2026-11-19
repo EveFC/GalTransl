@@ -1,0 +1,563 @@
+[
+  {
+    "name": "problem_common",
+    "nameKey": "plugins:builtin.problem_common.name",
+    "descriptionKey": "plugins:builtin.problem_common.description",
+    "settings": [
+      {
+        "key": "avgSentenceLengthThreshold",
+        "labelKey": "plugins:builtin.problem_common.settings.avgSentenceLengthThreshold.label",
+        "descriptionKey": "plugins:builtin.problem_common.settings.avgSentenceLengthThreshold.description",
+        "options": []
+      }
+    ]
+  },
+  {
+    "name": "file_epub_epub",
+    "nameKey": "plugins:builtin.file_epub_epub.name",
+    "descriptionKey": "plugins:builtin.file_epub_epub.description",
+    "settings": [
+      {
+        "key": "是否自动识别名称",
+        "options": [],
+        "labelKey": "plugins:builtin.file_epub_epub.settings.autoDetectNames.label",
+        "descriptionKey": "plugins:builtin.file_epub_epub.settings.autoDetectNames.description"
+      },
+      {
+        "key": "名称识别正则表达式",
+        "options": [],
+        "labelKey": "plugins:builtin.file_epub_epub.settings.namePattern.label",
+        "descriptionKey": "plugins:builtin.file_epub_epub.settings.namePattern.description"
+      },
+      {
+        "key": "名称识别拼接方案",
+        "options": [],
+        "labelKey": "plugins:builtin.file_epub_epub.settings.nameTemplate.label",
+        "descriptionKey": "plugins:builtin.file_epub_epub.settings.nameTemplate.description"
+      },
+      {
+        "key": "双语显示",
+        "options": [],
+        "labelKey": "plugins:builtin.file_epub_epub.settings.bilingual.label",
+        "descriptionKey": "plugins:builtin.file_epub_epub.settings.bilingual.description"
+      },
+      {
+        "key": "原文颜色",
+        "options": [],
+        "labelKey": "plugins:builtin.file_epub_epub.settings.sourceColor.label",
+        "descriptionKey": "plugins:builtin.file_epub_epub.settings.sourceColor.description"
+      },
+      {
+        "key": "缩小比例",
+        "options": [],
+        "labelKey": "plugins:builtin.file_epub_epub.settings.sourceScale.label",
+        "descriptionKey": "plugins:builtin.file_epub_epub.settings.sourceScale.description"
+      },
+      {
+        "key": "是否拆分文件以支持单文件多线程",
+        "options": [],
+        "labelKey": "plugins:builtin.file_epub_epub.settings.splitChapters.label",
+        "descriptionKey": "plugins:builtin.file_epub_epub.settings.splitChapters.description"
+      }
+    ]
+  },
+  {
+    "name": "file_galtransl_json",
+    "nameKey": "plugins:builtin.file_galtransl_json.name",
+    "descriptionKey": "plugins:builtin.file_galtransl_json.description",
+    "settings": [
+      {
+        "key": "output_with_src",
+        "options": [],
+        "labelKey": "plugins:builtin.file_galtransl_json.settings.output_with_src.label",
+        "descriptionKey": "plugins:builtin.file_galtransl_json.settings.output_with_src.description"
+      }
+    ]
+  },
+  {
+    "name": "file_i18n_json",
+    "nameKey": "plugins:builtin.file_i18n_json.name",
+    "descriptionKey": "plugins:builtin.file_i18n_json.description",
+    "settings": []
+  },
+  {
+    "name": "file_mtbench_aio",
+    "nameKey": "plugins:builtin.file_mtbench_aio.name",
+    "descriptionKey": "plugins:builtin.file_mtbench_aio.description",
+    "settings": [
+      {
+        "key": "task",
+        "options": [
+          {
+            "value": "chrf",
+            "labelKey": "plugins:builtin.file_mtbench_aio.settings.task.options.chrf"
+          },
+          {
+            "value": "comet",
+            "labelKey": "plugins:builtin.file_mtbench_aio.settings.task.options.comet"
+          },
+          {
+            "value": "cutoff_rate",
+            "labelKey": "plugins:builtin.file_mtbench_aio.settings.task.options.cutoff_rate"
+          }
+        ],
+        "labelKey": "plugins:builtin.file_mtbench_aio.settings.task.label",
+        "descriptionKey": "plugins:builtin.file_mtbench_aio.settings.task.description"
+      },
+      {
+        "key": "chrf_ngram",
+        "options": [],
+        "labelKey": "plugins:builtin.file_mtbench_aio.settings.chrf_ngram.label",
+        "descriptionKey": "plugins:builtin.file_mtbench_aio.settings.chrf_ngram.description"
+      },
+      {
+        "key": "chrf_beta",
+        "options": [],
+        "labelKey": "plugins:builtin.file_mtbench_aio.settings.chrf_beta.label",
+        "descriptionKey": "plugins:builtin.file_mtbench_aio.settings.chrf_beta.description"
+      },
+      {
+        "key": "comet_model_name",
+        "options": [],
+        "labelKey": "plugins:builtin.file_mtbench_aio.settings.comet_model_name.label",
+        "descriptionKey": "plugins:builtin.file_mtbench_aio.settings.comet_model_name.description"
+      },
+      {
+        "key": "comet_batch_size",
+        "options": [],
+        "labelKey": "plugins:builtin.file_mtbench_aio.settings.comet_batch_size.label",
+        "descriptionKey": "plugins:builtin.file_mtbench_aio.settings.comet_batch_size.description"
+      }
+    ]
+  },
+  {
+    "name": "file_plaintext_txt",
+    "nameKey": "plugins:builtin.file_plaintext_txt.name",
+    "descriptionKey": "plugins:builtin.file_plaintext_txt.description",
+    "settings": [
+      {
+        "key": "保存双语txt文件",
+        "options": [],
+        "labelKey": "plugins:builtin.file_plaintext_txt.settings.bilingual.label",
+        "descriptionKey": "plugins:builtin.file_plaintext_txt.settings.bilingual.description"
+      },
+      {
+        "key": "上下双语1左右双语2",
+        "options": [
+          {
+            "value": 1,
+            "labelKey": "plugins:builtin.file_plaintext_txt.settings.bilingualLayout.options.layout1"
+          },
+          {
+            "value": 2,
+            "labelKey": "plugins:builtin.file_plaintext_txt.settings.bilingualLayout.options.layout2"
+          }
+        ],
+        "labelKey": "plugins:builtin.file_plaintext_txt.settings.bilingualLayout.label",
+        "descriptionKey": "plugins:builtin.file_plaintext_txt.settings.bilingualLayout.description"
+      },
+      {
+        "key": "txt读取编码",
+        "options": [],
+        "labelKey": "plugins:builtin.file_plaintext_txt.settings.sourceEncoding.label",
+        "descriptionKey": "plugins:builtin.file_plaintext_txt.settings.sourceEncoding.description"
+      },
+      {
+        "key": "txt写入编码",
+        "options": [],
+        "labelKey": "plugins:builtin.file_plaintext_txt.settings.outputEncoding.label",
+        "descriptionKey": "plugins:builtin.file_plaintext_txt.settings.outputEncoding.description"
+      }
+    ]
+  },
+  {
+    "name": "file_subtitle_srt_lrc_vtt",
+    "nameKey": "plugins:builtin.file_subtitle_srt_lrc_vtt.name",
+    "descriptionKey": "plugins:builtin.file_subtitle_srt_lrc_vtt.description",
+    "settings": [
+      {
+        "key": "保存双语字幕",
+        "options": [],
+        "labelKey": "plugins:builtin.file_subtitle_srt_lrc_vtt.settings.bilingual.label",
+        "descriptionKey": "plugins:builtin.file_subtitle_srt_lrc_vtt.settings.bilingual.description"
+      },
+      {
+        "key": "上下双语1左右双语2",
+        "options": [
+          {
+            "value": 1,
+            "labelKey": "plugins:builtin.file_subtitle_srt_lrc_vtt.settings.bilingualLayout.options.layout1"
+          },
+          {
+            "value": 2,
+            "labelKey": "plugins:builtin.file_subtitle_srt_lrc_vtt.settings.bilingualLayout.options.layout2"
+          }
+        ],
+        "labelKey": "plugins:builtin.file_subtitle_srt_lrc_vtt.settings.bilingualLayout.label",
+        "descriptionKey": "plugins:builtin.file_subtitle_srt_lrc_vtt.settings.bilingualLayout.description"
+      }
+    ]
+  },
+  {
+    "name": "file_translator++_xlsx",
+    "nameKey": "plugins:builtin.file_translator___xlsx.name",
+    "descriptionKey": "plugins:builtin.file_translator___xlsx.description",
+    "settings": [
+      {
+        "key": "是否自动识别名称",
+        "options": [],
+        "labelKey": "plugins:builtin.file_translator___xlsx.settings.autoDetectNames.label",
+        "descriptionKey": "plugins:builtin.file_translator___xlsx.settings.autoDetectNames.description"
+      },
+      {
+        "key": "名称识别正则表达式",
+        "options": [],
+        "labelKey": "plugins:builtin.file_translator___xlsx.settings.namePattern.label",
+        "descriptionKey": "plugins:builtin.file_translator___xlsx.settings.namePattern.description"
+      },
+      {
+        "key": "名称识别拼接方案",
+        "options": [],
+        "labelKey": "plugins:builtin.file_translator___xlsx.settings.nameTemplate.label",
+        "descriptionKey": "plugins:builtin.file_translator___xlsx.settings.nameTemplate.description"
+      },
+      {
+        "key": "清除换行符",
+        "options": [],
+        "labelKey": "plugins:builtin.file_translator___xlsx.settings.removeLineBreaks.label",
+        "descriptionKey": "plugins:builtin.file_translator___xlsx.settings.removeLineBreaks.description"
+      }
+    ]
+  },
+  {
+    "name": "text_bgi_fixruby",
+    "nameKey": "plugins:builtin.text_bgi_fixruby.name",
+    "descriptionKey": "plugins:builtin.text_bgi_fixruby.description",
+    "settings": [
+      {
+        "key": "remove_incorrect",
+        "options": [],
+        "labelKey": "plugins:builtin.text_bgi_fixruby.settings.remove_incorrect.label",
+        "descriptionKey": "plugins:builtin.text_bgi_fixruby.settings.remove_incorrect.description"
+      },
+      {
+        "key": "auto_correct",
+        "options": [],
+        "labelKey": "plugins:builtin.text_bgi_fixruby.settings.auto_correct.label",
+        "descriptionKey": "plugins:builtin.text_bgi_fixruby.settings.auto_correct.description"
+      },
+      {
+        "key": "process_log_level",
+        "options": [
+          {
+            "value": "debug",
+            "labelKey": "plugins:builtin.text_bgi_fixruby.settings.process_log_level.options.debug"
+          },
+          {
+            "value": "info",
+            "labelKey": "plugins:builtin.text_bgi_fixruby.settings.process_log_level.options.info"
+          },
+          {
+            "value": "warning",
+            "labelKey": "plugins:builtin.text_bgi_fixruby.settings.process_log_level.options.warning"
+          },
+          {
+            "value": "error",
+            "labelKey": "plugins:builtin.text_bgi_fixruby.settings.process_log_level.options.error"
+          }
+        ],
+        "labelKey": "plugins:builtin.text_bgi_fixruby.settings.process_log_level.label",
+        "descriptionKey": "plugins:builtin.text_bgi_fixruby.settings.process_log_level.description"
+      }
+    ]
+  },
+  {
+    "name": "text_common_full2Half",
+    "nameKey": "plugins:builtin.text_common_full2Half.name",
+    "descriptionKey": "plugins:builtin.text_common_full2Half.description",
+    "settings": [
+      {
+        "key": "是否替换标点",
+        "options": [],
+        "labelKey": "plugins:builtin.text_common_full2Half.settings.replacePunctuation.label",
+        "descriptionKey": "plugins:builtin.text_common_full2Half.settings.replacePunctuation.description"
+      },
+      {
+        "key": "替换时机",
+        "options": [
+          {
+            "value": "before_src_processed",
+            "labelKey": "plugins:builtin.text_common_full2Half.settings.stage.options.before_src_processed"
+          },
+          {
+            "value": "after_src_processed",
+            "labelKey": "plugins:builtin.text_common_full2Half.settings.stage.options.after_src_processed"
+          },
+          {
+            "value": "before_dst_processed",
+            "labelKey": "plugins:builtin.text_common_full2Half.settings.stage.options.before_dst_processed"
+          },
+          {
+            "value": "after_dst_processed",
+            "labelKey": "plugins:builtin.text_common_full2Half.settings.stage.options.after_dst_processed"
+          }
+        ],
+        "labelKey": "plugins:builtin.text_common_full2Half.settings.stage.label",
+        "descriptionKey": "plugins:builtin.text_common_full2Half.settings.stage.description"
+      },
+      {
+        "key": "反向替换",
+        "options": [],
+        "labelKey": "plugins:builtin.text_common_full2Half.settings.reverse.label",
+        "descriptionKey": "plugins:builtin.text_common_full2Half.settings.reverse.description"
+      },
+      {
+        "key": "自定义替换表",
+        "options": [],
+        "labelKey": "plugins:builtin.text_common_full2Half.settings.replacements.label",
+        "descriptionKey": "plugins:builtin.text_common_full2Half.settings.replacements.description"
+      }
+    ]
+  },
+  {
+    "name": "text_common_lineBreakFix",
+    "nameKey": "plugins:builtin.text_common_lineBreakFix.name",
+    "descriptionKey": "plugins:builtin.text_common_lineBreakFix.description",
+    "settings": [
+      {
+        "key": "换行符",
+        "options": [],
+        "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.lineBreak.label",
+        "descriptionKey": "plugins:builtin.text_common_lineBreakFix.settings.lineBreak.description"
+      },
+      {
+        "key": "换行模式",
+        "options": [
+          {
+            "value": "保持位置",
+            "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.mode.options.choice1"
+          },
+          {
+            "value": "平均",
+            "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.mode.options.choice2"
+          },
+          {
+            "value": "切最长",
+            "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.mode.options.choice3"
+          },
+          {
+            "value": "前置",
+            "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.mode.options.choice4"
+          },
+          {
+            "value": "后置",
+            "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.mode.options.choice5"
+          },
+          {
+            "value": "固定字数",
+            "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.mode.options.choice6"
+          }
+        ],
+        "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.mode.label",
+        "descriptionKey": "plugins:builtin.text_common_lineBreakFix.settings.mode.description"
+      },
+      {
+        "key": "分段字数阈值",
+        "options": [],
+        "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.segmentLength.label",
+        "descriptionKey": "plugins:builtin.text_common_lineBreakFix.settings.segmentLength.description"
+      },
+      {
+        "key": "强制修复",
+        "options": [],
+        "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.force.label",
+        "descriptionKey": "plugins:builtin.text_common_lineBreakFix.settings.force.description"
+      },
+      {
+        "key": "分词器",
+        "options": [
+          {
+            "value": "budoux",
+            "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.segmenter.options.budoux"
+          },
+          {
+            "value": "jieba",
+            "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.segmenter.options.jieba"
+          },
+          {
+            "value": "pkuseg",
+            "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.segmenter.options.pkuseg"
+          },
+          {
+            "value": "hanlp",
+            "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.segmenter.options.hanlp"
+          }
+        ],
+        "labelKey": "plugins:builtin.text_common_lineBreakFix.settings.segmenter.label",
+        "descriptionKey": "plugins:builtin.text_common_lineBreakFix.settings.segmenter.description"
+      }
+    ]
+  },
+  {
+    "name": "text_common_normalfix",
+    "nameKey": "plugins:builtin.text_common_normalfix.name",
+    "descriptionKey": "plugins:builtin.text_common_normalfix.description",
+    "settings": []
+  },
+  {
+    "name": "text_common_skipNoJP",
+    "nameKey": "plugins:builtin.text_common_skipNoJP.name",
+    "descriptionKey": "plugins:builtin.text_common_skipNoJP.description",
+    "settings": []
+  },
+  {
+    "name": "text_example_nouse",
+    "nameKey": "plugins:builtin.text_example_nouse.name",
+    "descriptionKey": "plugins:builtin.text_example_nouse.description",
+    "settings": [
+      {
+        "key": "set_int",
+        "options": [],
+        "labelKey": "plugins:builtin.text_example_nouse.settings.set_int.label",
+        "descriptionKey": "plugins:builtin.text_example_nouse.settings.set_int.description"
+      },
+      {
+        "key": "set_string",
+        "options": [],
+        "labelKey": "plugins:builtin.text_example_nouse.settings.set_string.label",
+        "descriptionKey": "plugins:builtin.text_example_nouse.settings.set_string.description"
+      },
+      {
+        "key": "set_bool",
+        "options": [],
+        "labelKey": "plugins:builtin.text_example_nouse.settings.set_bool.label",
+        "descriptionKey": "plugins:builtin.text_example_nouse.settings.set_bool.description"
+      },
+      {
+        "key": "设置样例4",
+        "options": [],
+        "labelKey": "plugins:builtin.text_example_nouse.settings.chineseKeyExample.label",
+        "descriptionKey": "plugins:builtin.text_example_nouse.settings.chineseKeyExample.description"
+      }
+    ]
+  },
+  {
+    "name": "text_message_serverchan_tgbot",
+    "nameKey": "plugins:builtin.text_message_serverchan_tgbot.name",
+    "descriptionKey": "plugins:builtin.text_message_serverchan_tgbot.description",
+    "settings": [
+      {
+        "key": "推送渠道",
+        "options": [
+          {
+            "value": "ServerChan",
+            "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.channel.options.ServerChan"
+          },
+          {
+            "value": "Telegram Bot",
+            "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.channel.options.choice2"
+          }
+        ],
+        "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.channel.label",
+        "descriptionKey": "plugins:builtin.text_message_serverchan_tgbot.settings.channel.description"
+      },
+      {
+        "key": "Telegram_Bot_API_URL",
+        "options": [],
+        "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.Telegram_Bot_API_URL.label",
+        "descriptionKey": "plugins:builtin.text_message_serverchan_tgbot.settings.Telegram_Bot_API_URL.description"
+      },
+      {
+        "key": "Telegram_Bot_Token",
+        "options": [],
+        "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.Telegram_Bot_Token.label",
+        "descriptionKey": "plugins:builtin.text_message_serverchan_tgbot.settings.Telegram_Bot_Token.description"
+      },
+      {
+        "key": "Telegram_Bot_ChatID",
+        "options": [],
+        "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.Telegram_Bot_ChatID.label",
+        "descriptionKey": "plugins:builtin.text_message_serverchan_tgbot.settings.Telegram_Bot_ChatID.description"
+      },
+      {
+        "key": "ServerChan_SendKey",
+        "options": [],
+        "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.ServerChan_SendKey.label",
+        "descriptionKey": "plugins:builtin.text_message_serverchan_tgbot.settings.ServerChan_SendKey.description"
+      },
+      {
+        "key": "启用声音通知",
+        "options": [],
+        "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.soundEnabled.label",
+        "descriptionKey": "plugins:builtin.text_message_serverchan_tgbot.settings.soundEnabled.description"
+      },
+      {
+        "key": "使用自定义音频",
+        "options": [],
+        "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.customAudio.label",
+        "descriptionKey": "plugins:builtin.text_message_serverchan_tgbot.settings.customAudio.description"
+      },
+      {
+        "key": "成功音频路径",
+        "options": [],
+        "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.successAudio.label",
+        "descriptionKey": "plugins:builtin.text_message_serverchan_tgbot.settings.successAudio.description"
+      },
+      {
+        "key": "失败音频路径",
+        "options": [],
+        "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.failureAudio.label",
+        "descriptionKey": "plugins:builtin.text_message_serverchan_tgbot.settings.failureAudio.description"
+      },
+      {
+        "key": "使用OpenAI TTS",
+        "options": [],
+        "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.openaiTts.label",
+        "descriptionKey": "plugins:builtin.text_message_serverchan_tgbot.settings.openaiTts.description"
+      },
+      {
+        "key": "OpenAI_API_Key",
+        "options": [],
+        "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.OpenAI_API_Key.label",
+        "descriptionKey": "plugins:builtin.text_message_serverchan_tgbot.settings.OpenAI_API_Key.description"
+      },
+      {
+        "key": "OpenAI_API_Base_URL",
+        "options": [],
+        "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.OpenAI_API_Base_URL.label",
+        "descriptionKey": "plugins:builtin.text_message_serverchan_tgbot.settings.OpenAI_API_Base_URL.description"
+      },
+      {
+        "key": "OpenAI_TTS_Voice",
+        "options": [
+          {
+            "value": "alloy",
+            "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.OpenAI_TTS_Voice.options.alloy"
+          },
+          {
+            "value": "echo",
+            "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.OpenAI_TTS_Voice.options.echo"
+          },
+          {
+            "value": "fable",
+            "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.OpenAI_TTS_Voice.options.fable"
+          },
+          {
+            "value": "onyx",
+            "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.OpenAI_TTS_Voice.options.onyx"
+          },
+          {
+            "value": "nova",
+            "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.OpenAI_TTS_Voice.options.nova"
+          },
+          {
+            "value": "shimmer",
+            "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.OpenAI_TTS_Voice.options.shimmer"
+          }
+        ],
+        "labelKey": "plugins:builtin.text_message_serverchan_tgbot.settings.OpenAI_TTS_Voice.label",
+        "descriptionKey": "plugins:builtin.text_message_serverchan_tgbot.settings.OpenAI_TTS_Voice.description"
+      }
+    ]
+  }
+]

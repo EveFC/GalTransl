@@ -1,0 +1,56 @@
+"""Public tool actions mapped to the existing operation handlers."""
+
+from GalTransl.Agent.models import AgentToolError
+
+
+TOOL_OPERATIONS = {
+    "cache_history": {"list": "list_cache_history", "diff": "diff_cache_history", "revert": "revert_cache_history"},
+    "input": {"list": "list_input_files", "read": "read_input_file", "search": "search_input", "repeats": "input_repeats"},
+    "guideline": {"read": "read_guideline", "append": "write_project_guideline", "replace": "write_project_guideline", "overwrite": "write_project_guideline"},
+    "dictionary": {"list": "list_dict_files", "read": "read_dict", "set": "save_dict", "delete": "save_dict", "overwrite": "save_dict"},
+    "names": {"read": "get_name_table", "set": "save_name_table", "overwrite": "save_name_table"},
+    "translation": {"start": "start_translation", "status": "get_runtime", "wait": "wait", "stop": "stop_translation"},
+    "edit_transl_cache": {"set": "patch_transl_cache", "delete": "delete_transl_cache"},
+    "search_replace_cache": {"search": "search_cache", "replace": "replace_cache"},
+    "output": {"read": "read_output", "search": "search_output_files"},
+    "subagents": {"run": "run_subagents", "changes": "read_proofread_changes", "revert": "revert_proofread_changes"},
+}
+
+PROBLEM_OPERATIONS = {"items": "list_problems", "filter": "manage_problem_filter", "white_list": "manage_problem_white_list"}
+
+
+def tool_operation(name: str, args: dict[str, object]) -> str:
+    """Resolve before permission checks; a malformed action never reaches a handler."""
+    if name == "update_project_config" and ("action" in args or "mode" in args):
+        raise AgentToolError("update_project_config 不再使用 action/mode；直接传 updates")
+    if name == "guideline" and "replace_all" in args:
+        raise AgentToolError("replace_all 已移除；replace 自动替换全部匹配，请删除该参数")
+    if name == "translation" and "minutes" in args:
+        raise AgentToolError("minutes 已移除；请换算为 seconds（1 分钟 = 60 秒）")
+    if name == "translation" and "sentence_range" in args and args.get("action") != "start":
+        raise AgentToolError("sentence_range 只用于 translation(action=\"start\")")
+    if name == "read_transl_cache" and (args.get("action") == "search" or "query" in args or "conditions" in args):
+        raise AgentToolError('缓存搜索已拆出，请改用 search_replace_cache(action="search", ...)')
+    if name == "edit_transl_cache" and args.get("action") == "replace":
+        raise AgentToolError('缓存替换已拆出，请改用 search_replace_cache(action="replace", query=old_text, replacement=new_text, field="pre_dst", ...)')
+    if name == "problems":
+        target = args.get("target", "items")
+        if not isinstance(target, str) or target not in PROBLEM_OPERATIONS:
+            raise AgentToolError("problems.target 必须为 items / filter / white_list")
+        actions = ("list",) if target == "items" else ("list", "set", "delete")
+        if args.get("action") not in actions:
+            raise AgentToolError(f"problems({target}) 必须显式指定 action：{' / '.join(actions)}")
+        return PROBLEM_OPERATIONS[target]
+    actions = TOOL_OPERATIONS.get(name)
+    if actions is None:
+        return name
+    action = args.get("action")
+    if not isinstance(action, str) or action not in actions:
+        raise AgentToolError(f"{name} 必须显式指定 action：{' / '.join(actions)}")
+    if name == "guideline" and action != "read" and args.get("scope", "project") != "project":
+        raise AgentToolError("只能修改 scope=project 的项目规范")
+    if name == "edit_transl_cache" and action == "delete" and any(
+        key in args for key in ("patches", "files", "old_text", "new_text", "replace_all", "fields", "clear_comment")
+    ):
+        raise AgentToolError("delete 只使用 filename/indexes，不能混用 set/replace 参数")
+    return actions[action]

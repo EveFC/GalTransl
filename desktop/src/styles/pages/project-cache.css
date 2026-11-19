@@ -16,7 +16,6 @@
   flex-direction: column;
   flex: 1;
   min-height: 0;
-  animation: cacheSlideFromLeft 200ms ease;
 }
 
 .project-cache-page__header {
@@ -52,7 +51,7 @@
   border: 1px solid rgba(191, 208, 226, 0.72);
   border-radius: var(--radius-panel);
   background: var(--color-surface);
-  box-shadow: var(--shadow-panel);
+  /* 不加外阴影，与其他自适应页面的面板一致（见 components/panel.css）。 */
   backdrop-filter: blur(14px);
 }
 
@@ -102,8 +101,12 @@
   background: var(--color-primary);
 }
 
-/* Vertically center the "select a file" empty hint in the main area. */
+/* Vertically center the "select a file" empty hint in the main area.
+   It sits inside .cache-layout, so drop EmptyState's own dashed frame and fill. */
 .cache-layout__main > .cache-layout__empty {
+  border: none;
+  border-radius: 0;
+  background: transparent;
   flex: 1;
   min-height: 0;
   display: flex;
@@ -226,6 +229,15 @@
   color: var(--color-text-muted);
   flex-shrink: 0;
   margin-left: var(--space-2);
+}
+
+/* 还没有缓存的输入文件：列出来是为了能读原文，标一下别让人以为它翻过了 */
+.cache-file-item__size--uncached {
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--color-line);
+  background: var(--color-neutral-soft);
+  font-weight: 600;
 }
 
 .cache-file-item--selected {
@@ -461,6 +473,7 @@
 }
 
 .cache-card {
+  flex-shrink: 0;
   background: var(--color-surface-strong);
   border: 1px solid var(--color-line);
   border-radius: var(--radius-card);
@@ -471,14 +484,49 @@
   gap: 2px;
 }
 
-.cache-card:hover {
-  border-color: var(--color-primary-soft);
+/* 鼠标经过时给一条清晰但柔和的蓝色线框；原来的 primary-soft 太接近底色，
+   看起来像边框变淡/消失。用 color-mix 让暗色主题下也保持足够的对比度。 */
+.cache-card:hover,
+.cache-card:focus-within {
+  border-color: color-mix(in srgb, var(--color-primary) 45%, var(--color-line));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-primary) 14%, transparent);
+}
+
+/* 屏幕外的卡片跳过排版/绘制（Chromium/WebView2 原生支持，零依赖）。
+   contain-intrinsic-size 的 auto 会记住上次实际高度，滚动条不会因估算而跳动。 */
+.cache-card {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 96px;
+}
+
+/* A result jump must measure real heights, including the cards before its target. */
+.cache-card-list--positioning .cache-card {
+  content-visibility: visible;
+}
+
+.cache-card-list--positioning {
+  overflow-anchor: none;
+}
+
+/* 窗口化渲染时屏幕外的卡片本来就没挂载；已挂载的要量真实高度，不能用占位尺寸。 */
+.cache-card-list--virtual .cache-card {
+  content-visibility: visible;
+}
+
+.cache-card-list__spacer {
+  flex-shrink: 0;
+  overflow-anchor: none;
 }
 
 .cache-card--problem {
   border-color: var(--color-warning-soft);
   background: color-mix(in srgb, var(--color-warning-soft) 15%, var(--color-surface-strong));
 }
+
+.cache-card--pre-deleted {
+    opacity: 0.5;
+    background: color-mix(in srgb, var(--color-neutral-soft) 30%, var(--color-surface-strong));
+  }
 
 .cache-card--highlight {
   animation: cache-card-flash 2s ease-out;
@@ -522,6 +570,18 @@
 .cache-card__problem-slot {
   flex: 0 1 auto;
   min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.cache-card__problem-item {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .cache-card__pill {
@@ -540,6 +600,114 @@
   flex-shrink: 0;
 }
 
+.cache-card__pill--dictionary {
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+  border: 1px solid transparent;
+  font-family: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.cache-card__pill--dictionary:hover,
+.cache-card__pill--dictionary[aria-expanded='true'] {
+  border-color: var(--color-primary);
+}
+
+.cache-card__pill--dictionary:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.cache-dictionary-details {
+  margin: var(--space-2) 0;
+  padding: var(--space-3);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-panel);
+  background: var(--color-surface);
+  max-height: 340px;
+  overflow: auto;
+  font-size: var(--cache-font-xs);
+}
+
+.cache-dictionary-details__hint,
+.cache-dictionary-details__source,
+.cache-dictionary-details__group p {
+  color: var(--color-text-muted);
+}
+
+.cache-dictionary-details__hint { margin: 0 0 var(--space-3); }
+.cache-dictionary-details__group + .cache-dictionary-details__group { margin-top: var(--space-3); }
+.cache-dictionary-details__source { overflow-wrap: anywhere; }
+.cache-dictionary-mini-list {
+  display: grid;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+.cache-dictionary-mini {
+  min-width: 0;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.cache-dictionary-mini__header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 5px 8px;
+  background: var(--color-primary-soft);
+}
+.cache-dictionary-mini__type {
+  flex-shrink: 0;
+  color: var(--color-primary);
+  font-weight: 600;
+}
+.cache-dictionary-mini__scroll { overflow-x: auto; }
+.cache-dictionary-mini__table {
+  width: 100%;
+  min-width: 360px;
+  table-layout: fixed;
+  border-collapse: collapse;
+  text-align: left;
+}
+.cache-dictionary-mini--conditional .cache-dictionary-mini__table { min-width: 560px; }
+.cache-dictionary-mini__line-column { width: 48px; }
+.cache-dictionary-mini__table th,
+.cache-dictionary-mini__table td {
+  padding: 5px 8px;
+  border-top: 1px solid var(--color-line);
+  border-right: 1px solid var(--color-line);
+  vertical-align: top;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 4;
+}
+.cache-dictionary-mini__table th {
+  color: var(--color-text-muted);
+  font-weight: 600;
+  background: var(--color-primary-soft);
+}
+.cache-dictionary-mini__table th:last-child,
+.cache-dictionary-mini__table td:last-child { border-right: 0; }
+.cache-dictionary-mini__table th:first-child,
+.cache-dictionary-mini__line { text-align: center; }
+.cache-dictionary-mini__line,
+.cache-dictionary-mini__empty { color: var(--color-text-muted); }
+.cache-dictionary-details__pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+.cache-card__pill--skip-check {
+  background: var(--color-neutral-soft);
+  color: var(--color-text-muted);
+  flex-shrink: 0;
+}
+
 .cache-card__pill--speaker {
   /* colors set via inline style from speakerHue() */
   border: 1px solid transparent;
@@ -555,6 +723,53 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.cache-card__pill--skip-check {
+  background: var(--color-neutral-soft);
+  color: var(--color-text-muted);
+  flex-shrink: 0;
+}
+
+.cache-card__problem-filter {
+  position: absolute;
+  top: 50%;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(180, 83, 9, 0.3);
+  border-radius: 50%;
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-50%) scale(0.88);
+  transition:
+    opacity var(--transition-fast),
+    background-color var(--transition-fast),
+    color var(--transition-fast),
+    border-color var(--transition-fast),
+    transform var(--transition-fast);
+}
+
+.cache-card__problem-item:hover .cache-card__problem-filter,
+.cache-card__problem-item:focus-within .cache-card__problem-filter {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(-50%) scale(1);
+}
+
+.cache-card__problem-filter:hover {
+  background: rgba(245, 158, 11, 0.2);
+  border-color: rgba(180, 83, 9, 0.55);
 }
 
 .cache-card__expand,
@@ -587,6 +802,14 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
+}
+
+.cache-card__chevron {
+  transition: transform var(--transition-fast);
+}
+
+[aria-expanded='true'] > .cache-card__chevron {
+  transform: rotate(90deg);
 }
 
 .cache-card__field {
@@ -692,6 +915,54 @@
   font-weight: 500;
 }
 
+.cache-card__textarea-wrap {
+  position: relative;
+  display: grid;
+  flex: 1;
+  min-width: 0;
+}
+
+.cache-card__textarea-wrap .cache-card__textarea {
+  width: 100%;
+  min-width: 0;
+}
+
+.cache-card__textarea-wrap:has(.cache-card__textarea-overlay) .cache-card__textarea:not(:focus) {
+  color: transparent;
+  caret-color: var(--color-text);
+}
+
+.cache-card__textarea-overlay {
+  position: absolute;
+  inset: 0;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  font-family: inherit;
+  font-size: var(--cache-font-base);
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  overflow: auto;
+  scrollbar-width: none;
+  color: var(--color-text);
+  pointer-events: none;
+}
+
+.cache-card__textarea:focus + .cache-card__textarea-overlay {
+  opacity: 0;
+}
+
+/* 只读（还没有缓存文件，看到的是原文）：禁用的输入框别淡到看不清内容 */
+.cache-card__input:disabled,
+.cache-card__textarea:disabled,
+.cache-card__delete:disabled {
+  opacity: 1;
+  color: var(--color-text-muted);
+  background: var(--color-surface-strong);
+  cursor: default;
+}
+
 .cache-card__readonly-input {
   display: block;
   width: 100%;
@@ -726,6 +997,30 @@
   cursor: default;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.cache-card__field--skip-check {
+  padding-top: var(--space-1);
+  border-top: 1px dashed var(--color-line);
+}
+
+.cache-card__checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--cache-font-xs);
+  color: var(--color-text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.cache-card__checkbox-label input[type="checkbox"] {
+  cursor: pointer;
+  accent-color: var(--color-primary);
+}
+
+.cache-card__checkbox-label:hover {
+  color: var(--color-text);
 }
 
 .cache-panel-actions {
@@ -786,26 +1081,97 @@
 
 /* ── Cache Search Panel (sidebar) ── */
 
+/* 三个标签页共用：内容从它相对上一个标签的方向滑入（方向由 ProjectCachePage 给出） */
+.cache-sidebar-pane--from-left {
+  animation: cacheSlideFromLeft 200ms ease;
+}
+
+.cache-sidebar-pane--from-right {
+  animation: cacheSlideFromRight 200ms ease;
+}
+
 .cache-search-panel {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
   flex: 1;
   min-height: 0;
-  animation: cacheSlideFromRight 200ms ease;
 }
 
-.cache-search-input-group {
+.cache-search-conditions {
   display: flex;
-  gap: var(--space-2);
+  flex-direction: column;
+  gap: 6px;
 }
 
-.cache-search--global {
-  flex: 1;
-  min-width: 0;
+/* 一个条件 = 一个整体输入框：字段 | 关键词 | 正则 | 删除 */
+.cache-search-box {
+  display: flex;
+  align-items: stretch;
+  height: 32px;
+  box-sizing: border-box;
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+  background: var(--color-surface-strong);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
 }
 
-/* cache-search-field — compact CustomSelect in cache search bar */
+.cache-search-box:hover {
+  border-color: var(--color-line-strong);
+}
+
+.cache-search-box:focus-within {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-soft);
+}
+
+.cache-search-box__input {
+  flex: 1 0 0;
+  min-width: 56px;
+  padding: 0 8px;
+  border: 0;
+  background: transparent;
+  color: var(--color-text);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.cache-search-box__input::placeholder {
+  color: var(--color-text-muted);
+  opacity: 0.7;
+}
+
+.cache-search-box__remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  align-self: center;
+  width: 22px;
+  height: 22px;
+  margin-right: 2px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: background var(--transition-fast), color var(--transition-fast), opacity var(--transition-fast);
+}
+
+.cache-search-box:hover .cache-search-box__remove,
+.cache-search-box:focus-within .cache-search-box__remove {
+  opacity: 1;
+}
+
+.cache-search-box__remove:hover {
+  background: color-mix(in srgb, var(--color-danger) 12%, transparent);
+  color: var(--color-danger);
+}
+
+/* cache-search-field — compact CustomSelect in the cache search panel */
 .cache-search-field.custom-select {
   flex-shrink: 0;
   width: auto;
@@ -813,11 +1179,11 @@
 }
 
 .cache-search-field.custom-select .custom-select__trigger {
-  min-height: 26px;
+  min-height: 28px;
   padding: 2px 8px;
   padding-right: 6px;
-  font-size: 11px;
-  border-radius: calc(var(--radius-control) - 4px);
+  font-size: 12px;
+  border-radius: 8px;
 }
 
 .cache-search-field.custom-select .custom-select__arrow {
@@ -836,30 +1202,118 @@
   font-size: 11px;
 }
 
-.cache-search-meta {
+/* 条件框里的字段选择：去掉自己的边框，只留一条分隔线，长字段名省略 */
+.cache-search-box__field.custom-select {
   display: flex;
-  align-items: center;
-  gap: var(--space-2);
+  /* 侧栏拖到最窄时让字段名先让位，关键词至少留得下几个字 */
+  flex-shrink: 1;
+  max-width: 46%;
 }
 
-.cache-search-meta .cache-search-status {
-  margin-left: auto;
-}
-
-.cache-replace-toggle__btn {
-  border: none;
-  background: none;
-  cursor: pointer;
-  font-size: 12px;
+.cache-search-box__field.custom-select .custom-select__trigger {
+  min-height: 0;
+  height: 100%;
+  border: 0;
+  border-right: 1px solid var(--color-line);
+  border-radius: 9px 0 0 9px;
+  background: transparent;
+  box-shadow: none;
   color: var(--color-text-muted);
-  padding: 2px var(--space-2);
-  border-radius: var(--radius-control);
-  transition: all var(--transition-fast);
 }
 
-.cache-replace-toggle__btn:hover {
+.cache-search-box__field.custom-select .custom-select__trigger:hover,
+.cache-search-box__field.custom-select.custom-select--open .custom-select__trigger {
   background: var(--color-neutral-soft);
   color: var(--color-text);
+}
+
+/* 正则开关：贴着输入框右边框的图标按钮，开启时变蓝 */
+.cache-search-regex-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  align-self: center;
+  width: 24px;
+  height: 22px;
+  margin-right: 4px;
+  border-radius: 6px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.cache-search-regex-toggle:hover {
+  background: var(--color-neutral-soft);
+  color: var(--color-text);
+}
+
+.cache-search-regex-toggle:has(input:checked) {
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+}
+
+.cache-search-regex-toggle:has(input:focus-visible) {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 1px;
+}
+
+.cache-search-regex-toggle input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.cache-search-hint {
+  padding: 0 2px;
+  color: var(--color-text-muted);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.cache-search-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  min-height: 26px;
+}
+
+.cache-search-toolbar .cache-search-status {
+  margin-left: auto;
+  padding: 0 2px;
+}
+
+.cache-search-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 24px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 7px;
+  background: none;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.cache-search-action:hover:not(:disabled) {
+  background: var(--color-neutral-soft);
+  color: var(--color-text);
+}
+
+.cache-search-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.cache-search-action--active {
+  color: var(--color-primary);
 }
 
 .cache-replace-group {
@@ -867,19 +1321,57 @@
   flex-direction: column;
   gap: var(--space-2);
   padding: var(--space-2);
-  background: var(--color-surface-base);
-  border: 1px solid var(--color-line);
-  border-radius: var(--radius-card);
+  background: var(--color-neutral-soft);
+  border-radius: 12px;
 }
 
-.cache-search--replace {
-  width: 100%;
+/* 查找 / 替换为 两个输入叠成一个框 */
+.cache-replace-fields {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+  background: var(--color-surface-strong);
+  overflow: hidden;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.cache-replace-fields:focus-within {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-soft);
+}
+
+.cache-replace-fields__input {
+  height: 30px;
+  min-width: 0;
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: var(--color-text);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.cache-replace-fields__input + .cache-replace-fields__input {
+  border-top: 1px solid var(--color-line);
 }
 
 .cache-replace-actions {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: var(--space-2);
-  justify-content: flex-end;
+}
+
+.cache-replace-actions__field.custom-select {
+  margin-right: auto;
+}
+
+.cache-replace-actions .button {
+  min-height: 28px;
+  padding: 0 var(--space-3);
+  font-size: 12px;
 }
 
 .cache-replace-preview {
@@ -1052,6 +1544,13 @@
   color: #dc2626;
 }
 
+/* 命中来自还没翻译的原文件（不是缓存）：标一下，省得当成"这条译文里有" */
+.search-result-card__badge--uncached {
+  background: var(--color-neutral-soft);
+  color: var(--color-text-muted);
+  flex-shrink: 0;
+}
+
 .search-result-card__line {
   display: flex;
   align-items: baseline;
@@ -1098,7 +1597,7 @@
   font-weight: 600;
 }
 
-@media (prefers-reduced-motion: no-preference) and (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) {
   .cache-card--flash,
   [class*="cacheSlideFrom"] {
     animation: none;
@@ -1232,11 +1731,18 @@
   border-color: rgba(47, 111, 235, 0.42);
 }
 
+.cache-problems-group__filter {
+  right: 34px;
+}
+
+.cache-problems-group__retransl:disabled {
+  cursor: wait;
+}
+
 .cache-problems-group__retransl:active {
   transform: translateY(1px);
 }
 
-.cache-problems-group__header:has(.cache-problems-group__retransl--active) .cache-problems-group__retransl,
 .cache-problems-group__retransl--active {
   opacity: 1 !important;
   pointer-events: auto !important;
@@ -1244,6 +1750,26 @@
   background: var(--color-primary);
   color: #fff;
   border-color: var(--color-primary);
+}
+
+.cache-problems-group__filter--active {
+  opacity: 1 !important;
+  pointer-events: auto !important;
+  transform: scale(1) !important;
+  background: var(--color-warning);
+  color: #fff;
+  border-color: var(--color-warning);
+}
+
+/* 基础 :hover 选择器更具体，会把激活态的实心底换成浅蓝而文字仍是白色——悬停时保持激活色 */
+.cache-problems-group__retransl--active:hover {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+}
+
+.cache-problems-group__filter--active:hover {
+  background: var(--color-warning);
+  border-color: var(--color-warning);
 }
 
 /* ── Retransl keyword popover (bubble) ── */

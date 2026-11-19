@@ -3,32 +3,52 @@
 
 <h1><p align='center' >GalTransl</p></h1>
 <div align=center><img src="https://img.shields.io/github/v/release/XD2333/GalTransl"/>   <img src="https://img.shields.io/github/license/XD2333/GalTransl"/>   <img src="https://img.shields.io/github/stars/XD2333/GalTransl"/></div>
-<p align='center' >支持GPT-4/Claude/Deepseek/Sakura等大语言模型的Galgame自动化翻译解决方案</p>
+<p align='center' >支持GPT/Claude/Deepseek/Sakura等大语言模型的Galgame自动化翻译解决方案</p>
 
   [English](https://github.com/XD2333/GalTransl/blob/main/README_EN.md)
   
-  GalTransl是一套将数个基础功能上的微小创新与对GPT提示工程（Prompt Engineering）的深度利用相结合的Galgame自动化翻译工具，用于制作内嵌式翻译补丁。现在提供**桌面端图形界面**，无需命令行操作即可完成翻译全流程。
-   
-   <img width="2044" height="1397" alt="image" src="https://github.com/user-attachments/assets/f85e4782-e53e-4b03-ae24-cd77b453c6e3" />
+  GalTransl是一套将数个基础功能上的改进与对GPT提示工程（Prompt Engineering）的深度利用相结合的Galgame自动化翻译工具，用于制作内嵌式翻译补丁。现在提供**桌面端图形界面**，无需命令行操作即可完成翻译全流程。
+
+> [!TIP]
+> **想翻译 Galgame，却不知道怎么提取台词、把译文放回游戏？**
+>
+> 直接使用桌面端的 **「提取 Agent」** 功能：新建提取，选择游戏目录，AI 会帮你识别引擎、提取台词，并在翻译完成后将 GalTransl 的翻译结果回写为游戏补丁。建议先测试几句中文，再翻译整部游戏；具体支持范围以引擎和游戏版本为准。
+
+<img width="1322" height="864" alt="image" src="https://github.com/user-attachments/assets/2b5df717-aa0a-4224-9e6d-015e084e9e8a" />
+
+
+## 🤖 现已支持 Agent 模式
+
+> [!IMPORTANT]
+> **现在 GalTransl 支持 Agent 模式，可以自主完成整个提取翻译流程。**
+>
+> 在桌面端进入 **提取/翻译Agent 模式**，用自然语言告诉它你的翻译需求，即可让 Agent 自主推进翻译任务。
+
+![GalTransl Agent 模式：自主进行翻译前准备并启动试译](./img/agent-mode.png)
+
 
 ## 前言
-&ensp;&ensp;&ensp;&ensp;GalTransl的核心是一组自动化翻译脚本，解决了使用ChatGPT自动化翻译Gal过程中已知的大部分问题，并提高了整体的翻译质量。同时，通过与其他项目的组合，打通了制作补丁的完整流程，一定程度降低了上手门槛。对此感兴趣的朋友可以通过本项目更容易的构建具有一定质量的机翻补丁，并(或许)可以尝试在此框架的基础上高效的构建更高质量的汉化补丁。  
+&ensp;&ensp;&ensp;&ensp;GalTransl的核心是一组自动化翻译流水线，解决了使用ChatGPT自动化翻译Gal过程中已知的大部分问题，并提高了整体的翻译质量。同时，通过与其他项目的组合，打通了制作补丁的完整流程，一定程度降低了上手门槛。对此感兴趣的朋友可以通过本项目更容易的构建具有一定质量的机翻补丁，并(或许)可以尝试在此框架的基础上高效的构建更高质量的汉化补丁。  
 
   * 特性：   
   1. 🖥️ **桌面端图形界面**——基于Tauri + React构建的现代桌面应用，无需命令行操作，支持深色模式、自定义背景、多项目管理等
-  2. 支持**GPT-4/Claude/Deepseek/Sakura**等大语言模型，并通过提示工程提高了GPT的翻译质量   
-  3. 首创**GPT字典**，让GPT了解人设，准确翻译人名、人称代词与生词   
-  4. 通过译前、译后字典与条件字典实现灵活的自动化字典系统   
-  5. 实时保存缓存、自动断点续翻   
-  6. 结合其他项目支持多引擎脚本一键解包与注入，提供完整教程降低上手难度
-  7. 支持直接翻译srt、lrc、vtt字幕文件，mtool json文件，t++ excel文件，epub文件
-  8. 🤗 [Galtransl-7B-v3.5](https://huggingface.co/SakuraLLM/GalTransl-7B-v2)是为视觉小说翻译任务专项优化的本地模型，可在6G VRAM以上显卡部署，由sakuraumi和xd2333共同构建
-  9. 🤗 [GalTransl-14B-v3](https://huggingface.co/SakuraLLM/Sakura-GalTransl-14B-v3)是GalTransl-v3模型的14b版本，得益于更大的底模及改进的对齐训练，GalTransl-14B-v3整体质量好于GalTransl-7B-v3   
+     
+<img width="2044" height="1397" alt="QQ20261003-110410" src="https://github.com/user-attachments/assets/25185c5b-7d5a-46d5-b4d1-0f3353ea67a0" />
 
-<b>❗❗使用本工具翻译并在未做全文校对/润色的前提下发布时，请在最显眼的位置标注"GPT翻译/AI翻译补丁"，而不是"个人汉化"或"AI汉化"补丁。</b>
+  3. 支持**GPT/Claude/Deepseek/Sakura**等大语言模型，并通过提示工程提高了GPT的翻译质量   
+  4. 支持**GPT字典**，让GPT了解人设，准确翻译人名、人称代词与生词   
+  5. 通过译前、译后字典与条件字典实现灵活的自动化字典系统   
+  6. 实时保存缓存、自动断点续翻   
+  7. 结合其他项目支持多引擎脚本一键解包与注入，提供完整教程降低上手难度
+  8. 支持直接翻译srt、lrc、vtt字幕文件，mtool json文件，t++ excel文件，epub文件
+  9. 🤗 [Galtransl-7B-v3.5](https://huggingface.co/SakuraLLM/GalTransl-7B-v2)是为视觉小说翻译任务专项优化的本地模型，可在6G VRAM以上显卡部署，由sakuraumi和xd2333共同构建
+  10. 🤗 [GalTransl-14B-v3](https://huggingface.co/SakuraLLM/Sakura-GalTransl-14B-v3)是GalTransl-v3模型的14b版本，得益于更大的底模及改进的对齐训练，GalTransl-14B-v3整体质量好于GalTransl-7B-v3   
+
+<b>❗❗使用本工具翻译并在未做全文校对/润色的前提下发布时，请在显眼的位置标注"xx模型AI翻译补丁"，而不应是"个人汉化"补丁。</b>
 
 ## 近期更新
-* 2026.4: 更新v7，新增**桌面端图形界面**（Tauri + React），支持深色模式、自定义背景、多项目管理、可视化翻译工作台等
+* 2026.8: 更新v8，新增Agent模式，由AI自主完成翻译流程
+* 2026.4: 更新v7，新增**桌面端图形界面**（Tauri + React），支持深色模式、自定义背景、多项目管理、可视化翻译流程等
 * 2025.5: 更新v6，新增翻译模板ForGal、新增GalTransl-14B-v3模型
 * 2024.5：更新v5，新增GalTransl-7B模型，新增多种文件类型支持   
 * 2024.2：更新v4版，主要支持了插件系统  
@@ -37,24 +57,18 @@
 * 2023.6：v1初版发布
 
 ## 导航
-* [环境准备](https://github.com/XD2333/GalTransl#环境准备)：环境与软件的安装   
+* [环境准备](https://github.com/XD2333/GalTransl#环境准备)：环境与软件的安装
 * [上手教程](https://github.com/XD2333/GalTransl#上手教程)：全流程介绍如何制作一个机翻补丁，**只想看怎么使用本工具的话，可以直接跳转第2章的2.2节**   
 * [配置文件与翻译引擎设置](https://github.com/XD2333/GalTransl#配置文件与翻译引擎设置)：本篇详细介绍各个翻译引擎API的调用与配置方式。   
 * [GalTransl核心功能介绍](https://github.com/XD2333/GalTransl#galtransl核心功能介绍)：介绍GPT字典、缓存、普通字典、找问题等功能。
 * 后续教程已经[转移至Wiki](https://github.com/xd2333/GalTransl/wiki)
+* [开发与构建](#开发与构建)：开发环境、源码运行、平台构建与自动发布（点击展开）
 
 ## 环境准备
   * **桌面版（推荐）**   
-  从 [Release](https://github.com/XD2333/GalTransl/releases/) 下载最新版压缩包，解压后双击 `GalTransl Desktop.exe` 即可使用，**无需安装Python或任何依赖**。桌面端会自动启动后端服务。
+  从 [Release](https://github.com/GalTransl/GalTransl/releases/) 下载对应平台的桌面包。Windows 使用 `GalTransl_*_win.zip`，解压后双击 `GalTransl Desktop.exe`，**无需安装 Python**。Linux x86_64 使用便携 `.tar.gz`，解压后运行 `./galtransl-desktop`；系统仍需具备 WebKitGTK 4.1 等运行库。macOS 提供 Intel 和 Apple Silicon 两种 DMG，同时附带便携 `.tar.gz`。桌面端会为每个实例自动启动独立后端并分配空闲端口，关闭一个窗口只会停止它自己的后端，其他窗口继续运行。
    
-  * **命令行版（开发者/高级用户）**   
-  如需使用命令行版本或参与开发：
 
-  1. [下载本项目](https://github.com/XD2333/GalTransl/releases/) 或 clone 仓库，解压到任意位置
-  2. 安装 Python 3.11.9。 [下载](https://www.python.org/downloads/release/python-3119/)   
-  **安装时勾选下方 add Python to path**
-  3. 安装Python依赖：双击 `安装、更新依赖.bat`，或手动执行 `pip install -r requirements.txt`
-  4. （桌面端开发）安装 Node.js，在 `desktop` 目录执行 `npm install`，然后运行 `run_desktop_dev.bat`
 
 ## 实用工具
 | 名称 | 说明 |
@@ -135,8 +149,8 @@
 1. **新建项目**：在首页点击"新建项目"，选择项目存放位置，导入待翻译文件
 2. **配置翻译后端**：在新建项目向导中选择翻译后端（如Deepseek、OpenAI等），填入API Key和Endpoint。也可以在左侧"后端配置"页面预先配置多个后端方案
 3. **设置字典**：在项目的"项目字典"页面配置GPT字典和常规字典（建议至少配置人名字典）
-4. **开始翻译**：在"翻译工作台"页面点击开始翻译，实时查看翻译进度和结果
-5. **查看缓存与问题**：翻译完成后在"缓存与问题"页面查看自动找错结果，修正缓存后重新生成
+4. **开始翻译**：在"开始翻译"页启动翻译，实时查看翻译进度和结果
+5. **浏览文本**：翻译完成后在"浏览文本"页查看自动找错结果，修正缓存后重新生成
 
 &ensp;&ensp;&ensp;&ensp;桌面端支持同时打开多个项目、深色模式、自定义背景等功能，具体可在"设置"页面调整。
 
@@ -156,6 +170,8 @@ backendSpecific:
         modelName: deepseek/deepseek-chat-v3-0324:free
         stream: true # 支持为单个token设置流式请求
 ```   
+
+思考等级在「后端配置」中设置，也可在 `OpenAI-Compatible` 段或单个令牌中填写 `reasoningEffort: none/minimal/low/medium/high/xhigh/max`，对应请求参数 `reasoning_effort`。全局未配置时不发送，令牌未配置时跟随全局；不会根据模型名称或地址自动设置，支持的等级以服务文档为准。
 
 * 一些收费api转发项目，例如：[硅基流动](https://cloud.siliconflow.cn/i/SvDatvsk)（modelName: "deepseek-ai/DeepSeek-V3.1-Terminus"）、[oaipro](https://api.oaipro.com/register?aff=ceAU)等等，以上只是举例，更多中转可以谷歌，本项目不担保它们的稳定性及可用性。   
    
@@ -357,7 +373,7 @@ $str20	$str20	player's codename, boy
 
 * 简单讲下如何用Emeditor修缓存：选中一个文件，先右键-Emeditor打开，然后把transl_cache内所有文件全选拖进去。   
 这时候标签可能会占很大位置，右键标签-自定义标签页，将"标签不合适时"改成"无"，这样标签就只会在一行了（需要使用Emeditor专业版）。   
-接着ctrl+f搜索，搜索你感兴趣的关键字（如problem、doub_content），勾选"搜索组群中所有文档"，即可快速在所有文件中搜索，或点提取快速预览所有的问题。
+接着ctrl+f搜索，搜索你感兴趣的关键字（如problem、proofread_comment），勾选"搜索组群中所有文档"，即可快速在所有文件中搜索，或点提取快速预览所有的问题。
 
 * **VSCode**也是非常好的修缓存工具，只要使用VsCode打开缓存文件夹，然后全局搜索如problem，就可以快速定位所有问题   
 
@@ -401,9 +417,169 @@ problemAnalyze:
 
 ## 配置文件与翻译引擎设置
 
+ForGal-json、ForGal-markdown 和 ForNovel 默认使用多轮对话翻译。同一文件分块内的连续批次共享对话，首轮发送完整规则和翻译规范，后续轮次发送新文本与本轮词表。流式和非流式响应的思考内容会随历史消息回传。Sakura/GalTransl 本地模型保持原有流程。
+
+桌面端「翻译设置」可开关多轮翻译，「高级设置」可调整会话限制；也可在项目配置的 `common` 中设置：
+
+```yaml
+gpt.multiTurn: true
+gpt.multiTurn.maxTurns: 8
+gpt.multiTurn.maxChars: 24000
+gpt.contextNum: 8
+```
+
+轮数或字符预算（含思考内容）达到限制后会新开会话，并补充最近 `gpt.contextNum` 句译文。字符预算用于限制历史，不会截断单批输入；模型上下文较小时也应减小单次翻译句数。缓存命中造成的跳段会从对应位置重新建立上下文。设置 `gpt.multiTurn: false` 可恢复单轮请求；`gpt.contextNum: 0` 仅关闭补充前文，不关闭多轮对话。接口每轮仍接收完整会话历史，费用取决于接口的上下文缓存策略。
+
 桌面端通过图形界面管理翻译后端配置（左侧"后端配置"页面），无需手动编辑YAML。项目级配置可在"配置编辑"页面修改。
 
 命令行版本的详细设置项可以直接阅读 `config.yaml` 配置文件注释，目前已经比较详细。
+
+
+## 开发与构建
+
+<details>
+<summary>开发环境配置（开发者/高级用户）</summary>
+
+* **命令行版（开发者/高级用户）**
+  如需使用命令行版本或参与开发：
+
+  1. [下载本项目](https://github.com/XD2333/GalTransl/releases/) 或 clone 仓库，解压到任意位置
+  2. 安装 Python 3.11.9。 [下载](https://www.python.org/downloads/release/python-3119/)
+  **安装时勾选下方 add Python to path**
+  3. 安装Python依赖：双击 `安装、更新依赖.bat`，或手动执行 `pip install -r requirements.txt`
+
+### 桌面端开发模式
+
+以下步骤适用于 Windows。从源码运行桌面端时，请先 clone 或下载本仓库源码，并在仓库根目录（包含 `run_desktop_dev.bat` 的目录）打开终端。
+
+**首次准备环境**
+
+1. 安装 [Python 3.11.9](https://www.python.org/downloads/release/python-3119/) 和 [Node.js LTS](https://nodejs.org/)，确保 `python`、`node`、`npm` 已加入 PATH。
+2. 若要启动原生桌面窗口，安装 [Rust](https://www.rust-lang.org/tools/install)，使用默认的 Windows MSVC 工具链；安装Rust时会提示安装VC工具链和SDK，要一并安装。
+3. 安装完成后重新打开终端，在仓库根目录执行以下命令，建立项目独立的 Python 环境并安装依赖：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+npm.cmd --prefix desktop ci
+```
+
+**日常启动**
+
+双击仓库根目录的 `run_desktop_dev.bat`，或在终端执行：
+
+```powershell
+.\run_desktop_dev.bat
+```
+
+启动脚本会自动激活仓库中的 `.venv`，并识别默认安装在 `%USERPROFILE%\.cargo\bin` 下的 Cargo。脚本会分别打开 Python 后端和前端开发控制台：
+
+- 后端地址为 [http://127.0.0.1:12333](http://127.0.0.1:12333)，前端开发地址为 [http://127.0.0.1:1420/](http://127.0.0.1:1420/)。
+- 检测到 Cargo 时，会编译并打开 Tauri 桌面窗口。首次启动需要下载 Rust 依赖并编译，请等待控制台完成。
+- 未检测到 Cargo 时，会启动浏览器开发模式；手动打开前端地址即可。此模式无需安装 Rust、C++ 编译工具或 WebView2。
+- 前端代码修改后支持热更新，Rust 代码修改后会自动重新编译；修改 Python 后端代码后需要重启后端。
+
+**使用注意**
+
+- `.venv` 和依赖只需首次创建、安装。更新源码后，如果依赖有变化，重新执行上面的 Python 依赖安装命令和 `npm.cmd --prefix desktop ci`。
+- 如果出现 `ModuleNotFoundError`，检查是否已将依赖安装到仓库的 `.venv` 中；启动脚本不会自动安装 Python 依赖。
+- 启动前确保 `12333` 和 `1420` 端口未被其他实例占用。退出时在后端、前端两个开发控制台分别按 `Ctrl+C` 停止服务，再关闭控制台；只关闭桌面窗口不会停止单独运行的 Python 后端。
+- 后端会独占监听端口；重复启动时，新后端会提示端口占用并退出，已有后端继续运行。应用此修复后，请先停止之前启动的所有旧后端，再重新运行启动脚本。
+
+### Linux x86_64 开发与构建
+
+当前 Linux 支持范围为 x86_64，不包含 ARM。
+
+Ubuntu 22.04+/Debian 12+ 可安装以下依赖：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential curl file libssl-dev patchelf rpm \
+  libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+```
+
+Fedora 可使用：
+
+```bash
+sudo dnf install webkit2gtk4.1-devel openssl-devel curl wget file \
+  libappindicator-gtk3-devel librsvg2-devel rpm-build dpkg
+```
+
+首次准备和日常启动：
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+npm --prefix desktop ci
+./run_desktop_dev.sh
+```
+
+脚本会先启动 Python 后端，再启动 Tauri 桌面端；未安装 Cargo 时会退回到浏览器开发模式。
+
+构建 Linux 发布包：
+
+```bash
+python build_linux_x64.py --no-bundles
+```
+
+Linux CI 和正式发布只生成便携包；需要本地测试安装包时，可通过 `--formats deb,appimage` 选择 Tauri 安装包格式。
+
+输出位于 `release/`：
+
+- `GalTransl_*_linux_x86_64.tar.gz`
+
+正式发布包应在 Ubuntu 22.04 或同等 glibc 基线的环境中构建。Linux、macOS 与 Windows 一致，默认在程序目录读写通用字典 `Dict/`、全局翻译规范 `translation_guidelines/` 和自定义背景 `desktop-background/`；会话与应用设置存放在 `~/.galtransl`，首次启动会迁移旧会话和设置。显式设置 `GALTRANSL_DATA_DIR` 时，会话、设置及这三个目录使用指定的数据目录；字典和规范会从程序目录复制初始文件，不覆盖已有修改。`GALTRANSL_APP_SETTINGS_PATH` 可单独指定应用设置文件。
+
+
+
+### macOS 开发与构建
+
+当前 macOS 构建覆盖 Intel（x86_64）和 Apple Silicon（arm64）。需要安装 Xcode Command Line Tools、Python 3.11、Node.js、Rust，以及项目依赖：
+
+```bash
+npm --prefix desktop ci
+python build_macos.py
+```
+
+构建结果位于 `release/`，包括对应架构的 `.dmg` 和便携 `.tar.gz`。未签名构建可能被 macOS Gatekeeper 拦截；正式分发时应配置 Apple Developer 签名与公证。
+
+</details>
+
+<details>
+<summary>自动构建与发布（维护者）</summary>
+
+### 自动构建与发布
+
+[Build and draft release](https://github.com/GalTransl/GalTransl/actions/workflows/build-release.yml) 使用 Windows x64、Ubuntu 22.04 x86_64 和 macOS Intel/Apple Silicon 原生 runner 编译桌面包。
+
+发布验收会从独立目录启动解压后的后端，使用临时配置和用户数据目录，并实际解析 TXT、JSON、EPUB 文件。macOS 还会挂载 DMG、复制其中的 `.app`，校验版本、前后端架构和资源，再启动应用包内的后端完成同样的检查。
+
+| 触发方式 | 结果 |
+| --- | --- |
+| 更新 `main`、提交 PR | 测试、构建 Windows、Linux 和 macOS，并上传本次 Actions artifacts |
+| Actions → Build and draft release → Run workflow | 手动试打包；只生成 artifacts，不创建或修改 Release |
+| 推送版本 tag（`8.2.0` 或 `v8.2.0`） | Windows、Linux、macOS 全部测试、构建及打包后检查通过后，创建草稿 Release 并上传附件 |
+
+**下载试构建**：打开工作流运行详情，在 **Artifacts** 中按需下载（均保留 14 天）。Linux 和 macOS 便携包直接以 `GalTransl_<版本>_linux_x86_64.tar.gz`、`GalTransl_<版本>_macos_x86_64.tar.gz` 或 `GalTransl_<版本>_macos_arm64.tar.gz` 为名提供，下载后解压一次即可使用，并保留可执行权限。Windows 的 `GalTransl-windows-x64` 和 macOS 对应架构的 `dmg` artifact 仍由 Actions 提供外层 ZIP。
+
+**发布新版本（维护者）**：
+
+1. 更新 `GalTransl/__init__.py` 中的 `GALTRANSL_VERSION`，提交并推送包含此工作流的代码。
+2. 推送与源码版本一致的新 tag。下面以尚未发布的 `8.2.0` 为例，实际使用时替换为本次版本：
+   ```bash
+   git tag 8.2.0
+   git push origin 8.2.0
+   ```
+3. 等待工作流成功，在 **Releases** 检查自动生成的草稿，补充发布说明，然后手动点击 **Publish release**。上传过程中不要提前发布草稿。
+
+tag 支持 `X.Y.Z` 和 `vX.Y.Z`，必须与源码版本一致；不要移动或重新使用已有 tag（例如 `8.1.0`）。正式附件包括 Windows `.zip`、Linux `.tar.gz`、macOS Intel/Apple Silicon 的 `.dmg` 和 `.tar.gz`，以及 `SHA256SUMS.txt`。下载全部附件后可用 `sha256sum -c SHA256SUMS.txt` 校验；Windows 可用 PowerShell `Get-FileHash <文件> -Algorithm SHA256` 对照清单。
+
+流程只使用 GitHub 内置的 `GITHUB_TOKEN`，不需要额外 PAT 或翻译 API 密钥。只有发布 job 申请 `contents: write`；如果组织策略禁止写入，需要管理员允许该仓库的 Release 写入权限。失败后可以重跑：现有草稿会更新自动构建的附件，保留手工编辑的标题和说明；已经正式发布的 Release 则拒绝覆盖。手动选择 tag 运行也只会生成 artifacts。
+
+构建后会解压最终便携包，在源码目录之外启动后端并检查版本和插件列表；这不替代完整桌面 GUI、各安装器及全部插件的功能测试。
+
+</details>
 
 
 

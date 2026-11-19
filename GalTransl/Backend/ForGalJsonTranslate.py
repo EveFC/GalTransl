@@ -16,19 +16,27 @@ from GalTransl.Cache import save_transCache_to_json
 from GalTransl.Dictionary import CGptDict
 from GalTransl.Utils import extract_code_blocks, fix_quotes
 from GalTransl.Backend.Prompts import (
+    FORGAL_JSON_FOLLOWUP_PROMPT,
     FORGAL_JSON_SYSTEM_PROMPT,
     FORGAL_JSON_TRANS_PROMPT,
     H_WORDS_LIST,
 )
-from GalTransl.Backend.BaseTranslate import BaseTranslate
+from GalTransl.Backend.MultiTurnTranslate import MultiTurnTranslate
 from openai._types import NOT_GIVEN
 
 
-class ForGalJsonTranslate(BaseTranslate):
+class ForGalJsonTranslate(MultiTurnTranslate):
+    followup_prompt = FORGAL_JSON_FOLLOWUP_PROMPT
+    default_trans_prompt = FORGAL_JSON_TRANS_PROMPT
+    default_system_prompt = FORGAL_JSON_SYSTEM_PROMPT
+
     _SIGCHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
 
     def _encode_sig_jsonline(self, sig: str, obj: dict) -> str:
         return f"{sig}|" + json.dumps(obj, ensure_ascii=False)
+
+    def _format_translation_input(self, lines, proofread=False):
+        return "\n".join(lines)
 
     # init
     def __init__(
@@ -39,14 +47,10 @@ class ForGalJsonTranslate(BaseTranslate):
         token_pool: COpenAITokenPool,
     ):
         super().__init__(config, eng_type, proxy_pool, token_pool)
-        self.trans_prompt = FORGAL_JSON_TRANS_PROMPT
-        self.system_prompt = FORGAL_JSON_SYSTEM_PROMPT
+        self.trans_prompt = self.default_trans_prompt
+        self.system_prompt = self.default_system_prompt
         self._apply_internal_prompt_template_overrides()
-        # enhance_jailbreak
-        if val := config.getKey("gpt.enhance_jailbreak"):
-            self.enhance_jailbreak = val
-        else:
-            self.enhance_jailbreak = False
+        self._load_enhance_jailbreak(config)
 
         self.last_translations = {}
         self.init_chatbot(eng_type=eng_type, config=config)
@@ -55,8 +59,11 @@ class ForGalJsonTranslate(BaseTranslate):
         pass
 
     async def translate(
-        self, trans_list: CTransList, gptdict="", proofread=False, filename=""
+        self, trans_list: CTransList, gptdict="", proofread=False, filename="", context_num=None
     ):
+        # 前文句数：拆分重试时随批次一起减半（批次拆 1/3，前文拆 1/2），见下方「拆分重试」
+        if context_num is None:
+            context_num = self.contextNum
         input_list = []
         sig_list = []
         tmp_enhance_jailbreak = False
@@ -108,27 +115,25 @@ class ForGalJsonTranslate(BaseTranslate):
                 del tmp_obj["name"]
 
             input_list.append(self._encode_sig_jsonline(sig, tmp_obj))
-        input_src = "\n".join(input_list)
+        input_src = self._format_translation_input(input_list, proofread)
 
-        self.restore_context(trans_list, self.contextNum, filename)
+        self.restore_context(trans_list, context_num, filename)
 
         prompt_template = self._build_prompt_request(input_src, gptdict)
 
         retry_count = 0
+        source_context_tried = False
         emitted_success_indices = set()
         while True:  # 一直循环，直到得到数据
             self._check_stop_requested()
-            if self.enhance_jailbreak or tmp_enhance_jailbreak:
-                assistant_prompt = "```jsonline"
-            else:
-                assistant_prompt = ""
+            jailbreak = self._enhance_jailbreak_strategy(tmp_enhance_jailbreak)
+            assistant_prompt = "```jsonline" if jailbreak == "prefill" else ""
 
-            messages = []
-            messages.append({"role": "system", "content": self.system_prompt})
-            prompt_req = self._apply_history_result(prompt_template, filename)
-            messages.append({"role": "user", "content": prompt_req})
-            if assistant_prompt:
-                messages.append({"role": "assistant", "content": assistant_prompt})
+            messages, session, prompt_req = self._prepare_translation_messages(
+                prompt_template, input_src, gptdict, trans_list, filename,
+                proofread=proofread, assistant_prompt=assistant_prompt,
+                image_mode=(jailbreak == "image"),
+            )
 
             if self.pj_config.active_workers == 1:
                 LOGGER.info(
@@ -161,7 +166,7 @@ class ForGalJsonTranslate(BaseTranslate):
                     parse_ok, parse_error = self._parse_jsonline_result_line(
                         line,
                         trans_list,
-                        getattr(self, "_last_chatbot_model_name", ""),
+                        self._get_chatbot_state()[1],
                         n_symbol,
                         key_name,
                         stream_cursor,
@@ -177,11 +182,19 @@ class ForGalJsonTranslate(BaseTranslate):
                 return True
 
             resp = None
-            resp, token = await self.ask_chatbot(
+            self._clear_chatbot_state()
+            reasoning = {}
+            resp, token = await self._ask_translation_batch(
+                session,
+                trans_list=trans_list, sig_list=sig_list, proofread=proofread,
+                n_symbol=n_symbol,
+                reasoning_holder=reasoning,
                 messages=messages,
                 file_name=f"{filename}:{idx_tip}",
                 base_try_count=retry_count,
                 stream_line_callback=_parse_stream_lines,
+                max_retry_count=self.max_api_retries,
+                progress_file=filename,
             )
 
             result_text = resp or ""
@@ -209,7 +222,7 @@ class ForGalJsonTranslate(BaseTranslate):
                 error_message = "输出为空/被拦截"
                 error_flag = True
 
-            if getattr(self, "_last_chatbot_was_stream", False):
+            if self._get_chatbot_state()[0]:
                 if stream_parse_error_message:
                     error_message = stream_parse_error_message
                     error_flag = True
@@ -240,7 +253,13 @@ class ForGalJsonTranslate(BaseTranslate):
                     if i >= len(trans_list) - 1:
                         break
 
-            if success_count > 0 and not stream_parse_error_message:
+            # 自动模式靠这个异常换模板/缩批；但已有通过校验的句子时不抛，
+            # 照常按部分结果返回，由自动模式采用这几句并记一次模板失败
+            if success_count <= 0 and (error_message or stream_parse_error_message or success_count != len(trans_list)):
+                self._raise_parse_error_for_auto(error_message or stream_parse_error_message or f"译文缺句：{success_count}/{len(trans_list)}", resp or "")
+
+            # 坏行之前已逐行通过校验的句子直接采用（流式、非流式一致），下一批从坏行那句接着翻
+            if success_count > 0:
                 error_flag = False  # 部分解析
 
             if not error_flag and success_count <= 0 and not result_trans_list:
@@ -268,7 +287,7 @@ class ForGalJsonTranslate(BaseTranslate):
                 )
                 retry_count += 1
                 self._check_stop_requested()
-                await asyncio.sleep(1)
+                await self._interruptible_sleep(1)
 
                 tmp_enhance_jailbreak = not tmp_enhance_jailbreak
 
@@ -283,16 +302,27 @@ class ForGalJsonTranslate(BaseTranslate):
                         gptdict,
                         proofread=proofread,
                         filename=filename,
+                        context_num=max(context_num // 2, 1) if context_num > 0 else 0,
                     )
-                # 单句重试仍错则重置会话
+                # 单句重试仍错：先重置会话、前文换成原文（上一批的译文本身可能就是被拒的原因）；
+                # 没有前文可换就直接是清空上文
                 if retry_count == 3 and self.smartRetry:
-                    self.last_translations[filename] = ""
+                    self.reset_conversation(filename)
+                    source_context_tried = self.restore_source_context(trans_list, context_num, filename)
                     LOGGER.warning(
-                        f"[解析错误][{filename}:{idx_tip}]连续3次出错，尝试清空上文"
+                        f"[解析错误][{filename}:{idx_tip}]连续3次出错，"
+                        + ("尝试将前文替换为原文" if source_context_tried else "尝试清空上文")
                     )
+                # 前文换成原文仍错，再清空上文试最后一次
+                elif retry_count == 4 and self.smartRetry and source_context_tried:
+                    self.reset_conversation(filename)
+                    LOGGER.warning(
+                        f"[解析错误][{filename}:{idx_tip}]连续4次出错，尝试清空上文"
+                    )
+                    continue
                 # 重试中止
                 if retry_count >= 4:
-                    self.last_translations[filename] = ""
+                    self.reset_conversation(filename)
                     LOGGER.error(
                         f"[解析错误][{filename}:{idx_tip}]解析反复出错，跳过本轮翻译"
                     )
@@ -315,8 +345,15 @@ class ForGalJsonTranslate(BaseTranslate):
                 )
 
             # 翻译完成，收尾
+            self._remember_translation_turn(
+                session, prompt_req, resp or "", reasoning, trans_list,
+                success_count, error_message, assistant_prompt,
+            )
             break
         return success_count, result_trans_list
+
+    async def _ask_translation_batch(self, session, *, trans_list, sig_list, proofread, n_symbol="", **kwargs):
+        return await self._ask_translation_chatbot(session, **kwargs)
 
     def _parse_jsonline_result_line(
         self,
@@ -408,22 +445,22 @@ class ForGalJsonTranslate(BaseTranslate):
             ensure_last_translations=True,
         )
 
-    def reset_conversation(self, filename=""):
-        self.last_translations[filename] = ""
-
-    def _format_restore_context_line(self, current_tran: CSentense) -> str:
+    def _format_restore_context_line(self, current_tran: CSentense, source: bool = False) -> str:
         speaker_name = current_tran.get_speaker_name()
         speaker = speaker_name if speaker_name else "null"
         tmp_obj = {
             "id": current_tran.index,
             "name": speaker,
-            "dst": current_tran.pre_dst,
         }
+        if source:
+            tmp_obj["src"] = current_tran.post_src
+        else:
+            tmp_obj["dst"] = current_tran.pre_dst
         if speaker == "null":
             del tmp_obj["name"]
         return self._encode_sig_jsonline("old", tmp_obj)
 
-    def _format_restore_context_payload(self, lines: List[str]) -> str:
+    def _format_restore_context_payload(self, lines: List[str], source: bool = False) -> str:
         return "```jsonline\n" + "\n".join(lines) + "\n```"
 
 

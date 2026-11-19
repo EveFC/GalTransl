@@ -1,8 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import '../styles/pages/project-name.css';
+import { UiError, message as uiMessage, t as translate, useMessageState, useUiLanguage } from "../i18n";
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ProjectPageContext } from '../components/ProjectLayout';
 import { Button } from '../components/Button';
 import { CustomSelect } from '../components/CustomSelect';
 import { PageHeader } from '../components/PageHeader';
+import { Icon } from '../components/Icon';
 import { Panel } from '../components/Panel';
 import { EmptyState, InlineFeedback, LoadingState } from '../components/page-state';
 import {
@@ -22,11 +25,13 @@ import {
   updateProjectConfig,
   fetchProjectDictionaryManager,
 } from '../lib/api';
+import { useRetainPage } from '../components/PageActivity';
 import { normalizeError } from '../lib/errors';
 
 const JOB_POLL_INTERVAL_MS = 1500;
 
 export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContext; active?: boolean }) {
+  useUiLanguage();
   const { projectId, projectDir, configFileName } = ctx;
 
   const [names, setNames] = useState<NameEntry[]>([]);
@@ -35,8 +40,9 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
   const [generating, setGenerating] = useState(false);
   const [saving, setSaving] = useState(false);
   const [aiTranslating, setAiTranslating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useMessageState<string | null>(null);
   const [dirty, setDirty] = useState(false);
+  useRetainPage(generating || saving || aiTranslating || dirty);
   const [searchQuery, setSearchQuery] = useState('');
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [debouncedSearch, setDebouncedSearch] = useState('');
@@ -46,8 +52,11 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
   const aiTranslateAbortRef = useRef<AbortController | null>(null);
 
   // GPT dict integration state
-  const [useGptDictForName, setUseGptDictForName] = useState(true);
+  // 读到配置前按关闭：否则叠加 effect 会先拿字典改写人名表，哪怕项目其实没开
+  const [useGptDictForName, setUseGptDictForName] = useState(false);
   const [gptDictNameMap, setGptDictNameMap] = useState<Map<string, string>>(new Map());
+  /** Bumped whenever the name table is (re)loaded so the GPT dict overlay reapplies to it */
+  const [namesRevision, setNamesRevision] = useState(0);
   const [gptToggleBusy, setGptToggleBusy] = useState(false);
 
   // AI translate popover state
@@ -66,7 +75,7 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
 
   // Close popover on outside click
   useEffect(() => {
-    if (!showAiPopover) return;
+    if (!active || !showAiPopover) return;
     const handler = (e: MouseEvent) => {
       if (aiPopoverRef.current && !aiPopoverRef.current.contains(e.target as Node)) {
         setShowAiPopover(false);
@@ -74,7 +83,7 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
-  }, [showAiPopover]);
+  }, [active, showAiPopover]);
 
   // React to global default backend profile changes
   useEffect(() => {
@@ -126,8 +135,9 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
       setNames(res.names);
       setSourceFile(res.source_file);
       setDirty(false);
+      setNamesRevision((value) => value + 1);
     } catch (err) {
-      setError(normalizeError(err, '加载人名表失败'));
+      setError(normalizeError(err, uiMessage("projects:projectNamePage.loadData_normalizeError_loadNameTableFailed")));
     } finally {
       setLoading(false);
     }
@@ -189,16 +199,16 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
     return parseGptDictLines(lines);
   }, [projectId, configFileName, parseGptDictLines]);
 
-  // Overlay GPT dict translations onto empty dst_name entries.
+  // Overlay GPT dict translations onto the name table. The dict takes priority over
+  // existing dst_name values, matching load_name_table in GalTransl/Name.py.
   const overlayGptDictOntoNames = useCallback(
     (list: NameEntry[], dictMap: Map<string, string>): { next: NameEntry[]; changed: number } => {
       let changed = 0;
       const next = list.map((entry) => {
-        if (entry.dst_name.trim() !== '') return entry;
         const src = entry.src_name.trim();
         if (!src) return entry;
         const mapped = dictMap.get(src);
-        if (!mapped) return entry;
+        if (!mapped || entry.dst_name === mapped) return entry;
         changed++;
         return { ...entry, dst_name: mapped };
       });
@@ -216,7 +226,8 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
       try {
         const res = await fetchProjectConfig(projectId, configFileName || 'config.yaml');
         const dictCfg = (res.config?.dictionary ?? {}) as Record<string, unknown>;
-        const enabled = dictCfg.useGPTDictInName === undefined ? true : Boolean(dictCfg.useGPTDictInName);
+        // 默认开启：缺键也按开启（与 DefaultProjectConfig、Name.py、配置页开关一致），只有显式 false 才关闭
+        const enabled = dictCfg.useGPTDictInName !== false;
         if (cancelled) return;
         setUseGptDictForName(enabled);
         if (enabled) {
@@ -225,7 +236,7 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
           setGptDictNameMap(map);
         }
       } catch {
-        // Non-critical: keep default enabled if config can't be read
+        // Non-critical: stay disabled if config can't be read
       }
     })();
     return () => { cancelled = true; };
@@ -264,7 +275,7 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
         setGptDictNameMap(new Map());
       }
     } catch (err) {
-      setError(normalizeError(err, '切换 GPT 字典用于人名失败'));
+      setError(normalizeError(err, uiMessage("projects:projectNamePage.handleToggleGptDictForName_normalizeError_gPTDictionaryNameTableFailed")));
     } finally {
       setGptToggleBusy(false);
     }
@@ -323,9 +334,9 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
       const finished = await pollJob(job.job_id);
 
       if (finished.status === 'failed') {
-        setError(`生成人名表失败: ${finished.error || '未知错误'}`);
+        setError(uiMessage("projects:projectNamePage.handleGenerate_setError_nameTableFailed", { value: finished.error || translate("common:actions.unknownError") }));
       } else if (finished.status === 'cancelled') {
-        setError('生成人名表已被取消');
+        setError(uiMessage("projects:projectNamePage.handleGenerate_setError_nameTableDoneCancel"));
       } else {
         const res = await fetchNameTable(projectId);
         let nextNames = res.names;
@@ -343,7 +354,7 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
         setDirty(nextDirty);
       }
     } catch (err) {
-      setError(normalizeError(err, '生成人名表失败'));
+      setError(normalizeError(err, uiMessage("projects:projectNamePage.handleGenerate_normalizeError_nameTableFailed")));
     } finally {
       setGenerating(false);
     }
@@ -353,6 +364,17 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
   useEffect(() => {
     namesRef.current = names;
   }, [names]);
+
+  // The table and the dict map load independently; whichever arrives last applies the overlay.
+  // Declared after the namesRef sync so it sees the freshly loaded table.
+  useEffect(() => {
+    if (!useGptDictForName || gptDictNameMap.size === 0 || namesRef.current.length === 0) return;
+    const { next, changed } = overlayGptDictOntoNames(namesRef.current, gptDictNameMap);
+    if (changed > 0) {
+      setNames(next);
+      setDirty(true);
+    }
+  }, [namesRevision, useGptDictForName, gptDictNameMap, overlayGptDictOntoNames]);
 
   const handleSave = useCallback(async () => {
     if (!projectId) return;
@@ -370,7 +392,7 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
         setDirty(false);
       }
     } catch (err) {
-      setError(normalizeError(err, '保存人名表失败'));
+      setError(normalizeError(err, uiMessage("projects:projectNamePage.handleSave_normalizeError_saveNameTableFailed")));
     } finally {
       setSaving(false);
     }
@@ -394,7 +416,7 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
   // Open AI translate popover — load profiles & preselect default
   const handleOpenAiPopover = useCallback(() => {
     if (names.filter((n) => n.dst_name.trim() === '').length === 0) {
-      setError('所有人名已翻译，无需AI翻译');
+      setError(uiMessage("projects:projectNamePage.handleOpenAiPopover_setError_nameTableDoneTranslationAITranslation"));
       return;
     }
     fetchBackendProfiles()
@@ -420,7 +442,7 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
         setShowAiPopover(true);
       })
       .catch(() => {
-        setError('加载后端配置失败');
+        setError(uiMessage("projects:projectNamePage.handleOpenAiPopover_setError_loadBackendConfigFailed"));
       });
   }, [names, projectDir]);
 
@@ -428,7 +450,7 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
     if (!projectId || aiTranslating) return;
     const untranslated = names.filter((n) => n.dst_name.trim() === '');
     if (untranslated.length === 0) {
-      setError('所有人名已翻译，无需AI翻译');
+      setError(uiMessage("projects:projectNamePage.handleAiTranslate_setError_nameTableDoneTranslationAITranslation"));
       return;
     }
     setShowAiPopover(false);
@@ -454,11 +476,11 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
 
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}));
-        throw new Error(errData.error || `请求失败：${response.status}`);
+        throw new UiError(errData.error || uiMessage("projects:projectNamePage.handleAiTranslate_message_failed", { status: response.status }));
       }
 
       const reader = response.body?.getReader();
-      if (!reader) throw new Error('无法读取流式响应');
+      if (!reader) throw new UiError(uiMessage("projects:projectNamePage.handleAiTranslate_message_unableRead"));
 
       const decoder = new TextDecoder();
       let sseBuf = '';
@@ -503,7 +525,7 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
                 }
               }
             } else if (eventType === 'error') {
-              setError(data.error || 'AI翻译人名失败');
+              setError(data.error || uiMessage("projects:projectNamePage.handleAiTranslate_setError_aITranslationNameTableFailed"));
             } else if (eventType === 'done') {
               aborted = true;
             }
@@ -515,14 +537,14 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
 
       if (filledCount > 0) setDirty(true);
       if (filledCount === 0) {
-        setError('AI未能返回任何翻译结果');
+        setError(uiMessage("projects:projectNamePage.handleAiTranslate_setError_aINotBackTranslation"));
       }
     } catch (err) {
       if ((err instanceof DOMException && err.name === 'AbortError') || ((err as Error | null)?.name === 'AbortError')) {
         if (filledCount > 0) setDirty(true);
-        setError('AI翻译人名已取消');
+        setError(uiMessage("projects:projectNamePage.handleAiTranslate_setError_aITranslationNameTableDoneCancel"));
       } else {
-        setError(normalizeError(err, 'AI翻译人名失败'));
+        setError(normalizeError(err, uiMessage("projects:projectNamePage.handleAiTranslate_normalizeError_aITranslationNameTableFailed")));
       }
     } finally {
       if (aiTranslateAbortRef.current === abortController) {
@@ -555,6 +577,12 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
     setDirty(true);
   }, []);
 
+  // GPT 字典覆盖的行以字典译名为准（翻译时也是字典优先），译名框只读：要改请改字典
+  const isGptDictApplied = useCallback((entry: NameEntry) => {
+    const dst = entry.dst_name.trim();
+    return useGptDictForName && dst !== '' && gptDictNameMap.get(entry.src_name.trim()) === dst;
+  }, [useGptDictForName, gptDictNameMap]);
+
   const handlePaste = useCallback((e: React.ClipboardEvent, field: 'src_name' | 'dst_name', startIndex: number) => {
     const text = e.clipboardData.getData('text/plain');
     if (text.includes('\n') || text.includes('\t')) {
@@ -572,45 +600,51 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
           if (parts.length > 1) {
             newNames[targetIndex] = { ...newNames[targetIndex], dst_name: (parts[1] || '').trim() };
           }
-        } else {
+        } else if (!isGptDictApplied(newNames[targetIndex])) {
           newNames[targetIndex] = { ...newNames[targetIndex], dst_name: (parts[0] || '').trim() };
         }
       }
       setNames(newNames);
       setDirty(true);
     }
-  }, [names]);
+  }, [names, isGptDictApplied]);
 
-  // Filter by search
-  const filteredNames = debouncedSearch
-    ? names.filter((n) =>
-        n.src_name.toLowerCase().includes(debouncedSearch.toLowerCase()) ||
-        n.dst_name.toLowerCase().includes(debouncedSearch.toLowerCase())
-      )
-    : names;
+  // Filter by search（顺带保留原始索引：渲染时不用再对每行 names.indexOf 扫全表）
+  const filteredNames = useMemo(() => {
+    if (!debouncedSearch) return names.map((entry, index) => ({ entry, index }));
+    const needle = debouncedSearch.toLowerCase();
+    const result: Array<{ entry: NameEntry; index: number }> = [];
+    for (let index = 0; index < names.length; index += 1) {
+      const entry = names[index];
+      if (entry.src_name.toLowerCase().includes(needle) || entry.dst_name.toLowerCase().includes(needle)) {
+        result.push({ entry, index });
+      }
+    }
+    return result;
+  }, [names, debouncedSearch]);
 
   const translatedCount = names.filter((n) => n.dst_name.trim() !== '').length;
 
   if (loading) return <LoadingState />;
 
   const saveLabel = saving
-    ? '保存中…'
+    ? translate("common:actions.saving")
     : dirty
-      ? '待保存'
-      : '已保存';
+      ? translate("projects:projectNamePage.saveLabel_message_save")
+      : translate("projects:projectNamePage.saveLabel_message_doneSave");
 
   const panelActions = (
     <div className="name-page__panel-actions">
       <input
         type="text"
         className="name-page__search"
-        placeholder="搜索人名..."
+        placeholder={translate("projects:projectNamePage.namePagePanelActions_placeholder_searchNameTable")}
         value={searchQuery}
         onChange={(e) => setSearchQuery(e.target.value)}
       />
       <label
         className="name-page__gpt-toggle"
-        title="打开后：自动设置项目配置中的「字典用在name字段(GPT)」，并用项目GPT字典中的条目覆盖未翻译的人名（AI翻译时会自动跳过这些人名）"
+        title={translate("projects:projectNamePage.namePageGptToggle_title_openAutoSettingsProjectConfigDictionaryName")}
       >
         <span className="toggle-switch">
           <input
@@ -621,28 +655,26 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
           />
           <span className="toggle-switch__slider" />
         </span>
-        <span className="name-page__gpt-toggle-label">GPT字典用于人名</span>
+        <span className="name-page__gpt-toggle-label">{translate("projects:projectNamePage.namePageGptToggle_message_gPTDictionaryNameTable")}</span>
       </label>
       <div className="name-page__panel-actions-group">
       <Button onClick={handleGenerate} disabled={generating} variant="secondary">
-        {generating ? '提取中...' : '提取人名表'}
+        {generating ? translate("projects:projectNamePage.namePagePanelActionsGroup_message_extract") : translate("projects:projectNamePage.namePagePanelActionsGroup_message_extractNameTable")}
       </Button>
       <div className="name-page__ai-wrap" ref={aiPopoverRef}>
         <Button
           onClick={aiTranslating ? handleCancelAiTranslate : handleOpenAiPopover}
           disabled={!aiTranslating && names.length === 0}
           variant={aiTranslating ? 'secondary' : 'primary'}
-          title={aiTranslating ? '点击取消当前人名翻译' : undefined}
+          title={aiTranslating ? translate("projects:projectNamePage.namePageAiWrap_title_cancelCurrentNameTableTranslation") : undefined}
         >
-          {aiTranslating ? '翻译中，点击取消' : 'AI翻译人名'}
+          {aiTranslating ? translate("projects:projectNamePage.namePageAiWrap_message_translationCancel") : translate("projects:projectNamePage.namePageAiWrap_message_aITranslationNameTable")}
         </Button>
         {showAiPopover && (
           <div className="name-page__ai-popover">
-            <div className="name-page__ai-popover-title">选择翻译后端</div>
+            <div className="name-page__ai-popover-title">{translate("projects:projectNamePage.namePageAiPopover_message_selectTranslationBackend")}</div>
             {aiProfileNames.length === 0 ? (
-              <div className="name-page__ai-popover-empty">
-                未找到后端配置，请先在「后端配置」页添加 OpenAI 兼容接口
-              </div>
+              <div className="name-page__ai-popover-empty">{translate("projects:projectNamePage.namePageAiPopover_message_notBackendConfigBackendConfigAddOpenAI")}</div>
             ) : (
               <>
                 <CustomSelect
@@ -657,7 +689,7 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
                       : aiProfileNames;
                     return sorted.map((name) => {
                       const model = aiProfileModelMap[name];
-                      const suffix = name === def ? '（默认）' : '';
+                      const suffix = name === def ? translate("projects:projectNamePage.suffix_message_default") : '';
                       const label = model ? `${name} - ${model}${suffix}` : `${name}${suffix}`;
                       return <option key={name} value={name}>{label}</option>;
                     });
@@ -667,9 +699,7 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
                   variant="primary"
                   onClick={handleAiTranslate}
                   disabled={!aiSelectedProfile}
-                >
-                  开始翻译
-                </Button>
+                >{translate("projects:projectNamePage.namePageAiPopover_message_startTranslation")}</Button>
               </>
             )}
           </div>
@@ -680,7 +710,7 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
         disabled={!dirty || saving}
         variant="primary"
         className={`name-page__save-btn name-page__save-btn--${saving ? 'saving' : dirty ? 'dirty' : 'saved'}`}
-        title={dirty ? '立即保存（编辑 1 秒后会自动保存）' : '已自动保存'}
+        title={dirty ? translate("projects:projectNamePage.namePagePanelActionsGroup_title_saveEdit1SecondsAutoSave") : translate("projects:projectNamePage.namePagePanelActionsGroup_title_doneAutoSave")}
       >
         {saveLabel}
       </Button>
@@ -690,37 +720,31 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
 
   return (
     <div className="page name-page">
-      <PageHeader title="人名翻译" description="用于翻译输入文件中的“name”字段，是直接替换模式。注意正文中的人名应使用“GPT字典”让模型翻译。" />
+      <PageHeader title={translate("projects:projectNamePage.pageNamePage_title_nameTableTranslation")} description={translate("projects:projectNamePage.pageNamePage_description_translationFileNameGalNameTableReplaceGPT")} />
 
       {error ? (
         <InlineFeedback
           className="inline-alert--floating"
           tone="error"
-          title="操作失败"
+          title={translate("projects:projectNamePage.pageNamePage_title_failed")}
           description={error}
           onDismiss={() => setError(null)}
         />
       ) : null}
 
-      <Panel title="人名替换表" actions={panelActions}>
+      <Panel title={translate("projects:projectNamePage.pageNamePage_title_nameTableReplace")} actions={panelActions}>
         <div className="name-page__stats">
-          <span className="name-page__stat">
-            共 {names.length} 个人名
-          </span>
-          <span className="name-page__stat">
-            已翻译 {translatedCount} / {names.length}
-          </span>
+          <span className="name-page__stat">{translate("projects:projectNamePage.namePageStats_message_countNameTable", { count: names.length })}</span>
+          <span className="name-page__stat">{translate("projects:projectNamePage.namePageStats_message_doneTranslation", { translatedCount: translatedCount, count: names.length })}</span>
           {sourceFile && (
-            <span className="name-page__stat">
-              来源: {sourceFile}
-            </span>
+            <span className="name-page__stat">{translate("projects:projectNamePage.namePageStats_message_source", { sourceFile: sourceFile })}</span>
           )}
         </div>
 
         {names.length === 0 && !generating ? (
           <EmptyState
-            title="尚未生成人名表"
-            description="点击「提取人名表」从当前项目的输入文件中提取所有人名。"
+            title={translate("projects:projectNamePage.pageNamePage_title_notNameTable")}
+            description={translate("projects:projectNamePage.pageNamePage_description_extractNameTableCurrentProjectFileExtractNameTable")}
           />
         ) : (
           <div className="name-page__table-wrap">
@@ -728,23 +752,20 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
               <thead>
                 <tr>
                   <th className="name-page__th name-page__th--index">#</th>
-                  <th className="name-page__th name-page__th--jp">原名</th>
-                  <th className="name-page__th name-page__th--cn">译名</th>
-                  <th className="name-page__th name-page__th--count">次数</th>
+                  <th className="name-page__th name-page__th--jp">{translate("projects:projectNamePage.namePageTable_message_text")}</th>
+                  <th className="name-page__th name-page__th--cn">{translate("projects:projectNamePage.namePageTable_message_textVariant2")}</th>
+                  <th className="name-page__th name-page__th--count">{translate("projects:projectNamePage.namePageTable_message_textVariant3")}</th>
                   <th className="name-page__th name-page__th--actions" />
                 </tr>
               </thead>
               <tbody>
-                {filteredNames.map((entry, i) => {
-                  const originalIndex = names.indexOf(entry);
+                {filteredNames.map(({ entry, index: originalIndex }) => {
                   const hasTranslation = entry.dst_name.trim() !== '';
-                  const isGptDictApplied = useGptDictForName
-                    && hasTranslation
-                    && gptDictNameMap.get(entry.src_name.trim()) === entry.dst_name.trim();
+                  const gptLocked = isGptDictApplied(entry);
                   return (
                     <tr
                       key={originalIndex}
-                      className={`name-page__row${hasTranslation ? ' name-page__row--translated' : ''}${isGptDictApplied ? ' name-page__row--gpt-translated' : ''}`}
+                      className={`name-page__row${hasTranslation ? ' name-page__row--translated' : ''}${gptLocked ? ' name-page__row--gpt-translated' : ''}`}
                     >
                       <td className="name-page__td name-page__td--index">{originalIndex + 1}</td>
                       <td className="name-page__td name-page__td--jp">
@@ -764,9 +785,11 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
                       <td className="name-page__td name-page__td--cn">
                         <input
                           type="text"
-                          className="name-page__input"
+                          className={`name-page__input${gptLocked ? ' name-page__input--locked' : ''}`}
                           value={entry.dst_name}
-                          placeholder={entry.src_name ? `输入 ${entry.src_name} 的译名...` : ''}
+                          readOnly={gptLocked}
+                          title={gptLocked ? translate("projects:projectNamePage.namePageTdNamePageTdCn_title_gptLocked") : undefined}
+                          placeholder={entry.src_name ? translate("projects:projectNamePage.namePageTdNamePageTdCn_placeholder_text", { src_name: entry.src_name }) : ''}
                           onChange={(e) => handleDstNameChange(originalIndex, e.target.value)}
                           onPaste={(e) => handlePaste(e, 'dst_name', originalIndex)}
                         />
@@ -777,9 +800,9 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
                           type="button"
                           className="name-page__delete-btn"
                           onClick={() => handleDeleteRow(originalIndex)}
-                          title="删除此行"
+                          title={translate("projects:projectNamePage.namePageDeleteBtn_title_delete")}
                         >
-                          ✕
+                          <Icon name="close" />
                         </button>
                       </td>
                     </tr>
@@ -791,8 +814,8 @@ export function ProjectNamePage({ ctx, active = true }: { ctx: ProjectPageContex
                       type="button"
                       className="name-page__add-btn"
                       onClick={handleAddRow}
-                      title="添加人名"
-                      aria-label="添加人名"
+                      title={translate("projects:projectNamePage.namePageAddBtn_title_addNameTable")}
+                      aria-label={translate("projects:projectNamePage.namePageAddBtn_ariaLabel_addNameTable")}
                     >
                       +
                     </button>

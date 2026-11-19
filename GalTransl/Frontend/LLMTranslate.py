@@ -13,17 +13,25 @@
 """
 
 from typing import List, Dict, Any, Optional, Union, Tuple
-from os import makedirs, cpu_count, sep as os_sep,listdir
+from os import makedirs, cpu_count, sep as os_sep,listdir, path as os_path, remove as os_remove
 from os.path import join as joinpath, exists as isPathExists, dirname
 from venv import logger
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import time
 import asyncio
+import copy
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 from GalTransl import LOGGER, NEED_OpenAITokenPool
 from GalTransl.i18n import get_text, GT_LANG
-from GalTransl.Cache import get_transCache_from_json
+from GalTransl.Cache import (
+    SplitCachePool,
+    _append_cache_file_path,
+    chunk_cache_name,
+    get_transCache_from_json,
+    list_file_cache_names,
+)
 from GalTransl.ConfigHelper import initDictList, CProjectConfig
 from GalTransl.Dictionary import CGptDict, CNormalDic
 from GalTransl.Problem import find_problems
@@ -38,6 +46,15 @@ from GalTransl.CSplitter import (
     DictionaryCombiner,
 )
 from GalTransl.TerminalOutput import should_print_translation_logs, terminal_progress
+from GalTransl.TranslationScope import SentenceRange
+from GalTransl.Frontend.TranslationEta import TranslationEtaEstimator
+from GalTransl.TailSplit import (
+    TailSplitHandle,
+    TailSplitRegistry,
+    TailSplitTask,
+    reset_current_tail_split,
+    set_current_tail_split,
+)
 
 
 def _runtime_project_dir(projectConfig: CProjectConfig) -> str:
@@ -160,10 +177,58 @@ def _check_stop_requested(projectConfig: CProjectConfig):
         raise JobCancelledError()
 
 
-def _build_runtime_file_maps(ordered_chunks: list[SplitChunkMetadata], input_dir: str) -> tuple[dict[str, int], dict[str, str]]:
+def _chunk_translation_list(chunk: SplitChunkMetadata, sentence_range: SentenceRange | None):
+    if sentence_range is None:
+        return chunk.trans_list
+    chunk_start = max(0, chunk.start_index - chunk.cross_num)
+    start = max(0, sentence_range.start - chunk_start)
+    end = max(0, sentence_range.end - chunk_start)
+    return chunk.trans_list[start:end]
+
+
+def _chunk_progress_slice(chunk: SplitChunkMetadata, sentence_range: SentenceRange | None, include_cross: bool = True) -> tuple[int, int]:
+    """块内计入进度的行区间（json_list / trans_list 下标）。
+
+    include_cross=True 是整块（交叉句两边的块都会真的翻一遍，按实际工作量计入进度）；
+    False 只取非交叉部分，用来算交叉句数。第一块前面没有交叉，非交叉起点是
+    start_index - chunk_start 而不是 cross_num。
+    """
+    chunk_start = max(0, chunk.start_index - chunk.cross_num)
+    if include_cross:
+        if sentence_range is None:
+            return 0, len(chunk.json_list)
+        start = max(0, sentence_range.start - chunk_start)
+        return start, max(start, sentence_range.end - chunk_start)
+    start = chunk.start_index - chunk_start
+    end = min(start + int(chunk.chunk_non_cross_size or 0), len(chunk.json_list))
+    if sentence_range is not None:
+        start = max(chunk.start_index, sentence_range.start) - chunk_start
+        end = max(start, min(chunk.end_index, sentence_range.end) - chunk_start)
+    return start, end
+
+
+def _count_progress_rows(chunk: SplitChunkMetadata, bounds: tuple[int, int]) -> int:
+    """区间内会进缓存的行数：message 为空的行不翻也不进缓存，不计。"""
+    return sum(
+        1
+        for row in chunk.json_list[bounds[0]:bounds[1]]
+        if isinstance(row, dict) and str(row.get("message", "") or "").strip()
+    )
+
+
+def _runtime_cross_total(ordered_chunks: list[SplitChunkMetadata], sentence_range: SentenceRange | None = None) -> int:
+    """进度分母里有多少是分块交叉句（同一句在相邻两块各翻一次，多出来的那份）。"""
+    return sum(
+        _count_progress_rows(chunk, _chunk_progress_slice(chunk, sentence_range))
+        - _count_progress_rows(chunk, _chunk_progress_slice(chunk, sentence_range, include_cross=False))
+        for chunk in ordered_chunks
+    )
+
+
+def _build_runtime_file_maps(ordered_chunks: list[SplitChunkMetadata], input_dir: str, sentence_range: SentenceRange | None = None) -> tuple[dict[str, int], dict[str, str]]:
     """构造两个给前端使用的映射：
 
-    - file_totals: {显示名: 该文件总行数}，用于前端展示每个文件的进度分母。
+    - file_totals: {显示名: 该文件要翻的总句数（含分块交叉句）}，用于前端展示每个文件的进度分母。
     - cache_file_display_map: {缓存文件名(.json): 显示名}，用于把缓存回写事件关联到对应文件。
     """
     file_totals: dict[str, int] = {}
@@ -172,17 +237,7 @@ def _build_runtime_file_maps(ordered_chunks: list[SplitChunkMetadata], input_dir
     for chunk in ordered_chunks:
         display_name = chunk.file_path.replace(input_dir, "").lstrip(os_sep).replace(os_sep, "/")
         file_totals.setdefault(display_name, 0)
-        non_cross_start = max(0, int(chunk.cross_num or 0))
-        non_cross_end = min(non_cross_start + int(chunk.chunk_non_cross_size or 0), len(chunk.json_list))
-        progress_countable = 0
-        for row in chunk.json_list[non_cross_start:non_cross_end]:
-            if not isinstance(row, dict):
-                continue
-            message = str(row.get("message", "") or "").strip()
-            if not message:
-                continue
-            progress_countable += 1
-        file_totals[display_name] += progress_countable
+        file_totals[display_name] += _count_progress_rows(chunk, _chunk_progress_slice(chunk, sentence_range))
         cache_key = display_name.replace("/", "-}")
         if chunk.total_chunks > 1:
             cache_key = f"{cache_key}_{chunk.chunk_index}"
@@ -194,12 +249,258 @@ def _build_runtime_file_maps(ordered_chunks: list[SplitChunkMetadata], input_dir
     return file_totals, cache_file_display_map
 
 
+# 当前 worker 正在翻的分片（缓存文件路径）：进度条回调据此把每批完成量记到对应分片上。
+# 后端的批次循环与 worker 在同一个 asyncio 任务里，ContextVar 会一路跟过去，不用改各家后端。
+_CURRENT_ETA_CHUNK: ContextVar[str] = ContextVar("galtransl_eta_chunk", default="")
+# ETA 上报间隔（秒）
+_ETA_REPORT_INTERVAL = 2.0
+
+
+def _file_cache_name(file_path: str, input_dir: str) -> str:
+    """输入文件在缓存目录里的基础名：相对路径，分隔符换成 "-}"（不含分片号与 .json）。"""
+    return file_path.replace(input_dir, "").lstrip(os_sep).replace(os_sep, "-}")
+
+
+def _chunk_cache_file_path(split_chunk: SplitChunkMetadata, input_dir: str, cache_dir: str) -> str:
+    """分片对应的缓存文件路径（不带 .json）；多分片的文件按 _{分片号} 区分。"""
+    file_name = _file_cache_name(split_chunk.file_path, input_dir)
+    suffix = f"_{split_chunk.chunk_index}" if split_chunk.total_chunks > 1 else ""
+    return joinpath(cache_dir, file_name + suffix)
+
+
+class _SplitCachePools:
+    """按输入文件给分片找兜底缓存（见 Cache.SplitCachePool）：改了分片设置，旧分片的译文照样能用。
+
+    当前分片布局之外的同名缓存（旧分片）排在后面，当前布局的排在前面。不分片、也没有旧分片缓存的
+    文件不兜底——查缓存的口径与以前完全一样。一个文件的分片都查过缓存后就丢掉它的兜底缓存，
+    不把整个项目的缓存攒在内存里。
+    """
+
+    def __init__(self, input_dir: str, cache_dir: str, input_cache_names: set[str]) -> None:
+        self.input_dir = input_dir
+        self.cache_dir = cache_dir
+        self.input_cache_names = input_cache_names
+        self._pools: dict[str, list] = {}  # file_path -> [pool, 还没查缓存的分片数]
+
+    def cache_names(self, split_chunk: SplitChunkMetadata) -> tuple[list[str], list[str]]:
+        """(缓存目录里已有的当前布局缓存文件名, 不属于当前布局的旧分片缓存文件名)"""
+        cache_name = _file_cache_name(split_chunk.file_path, self.input_dir)
+        current = [chunk_cache_name(cache_name, i, split_chunk.total_chunks) for i in range(split_chunk.total_chunks)]
+        # 别的输入文件可能就叫 foo_1 这种「看着像分片」的名字，它的缓存不算 foo 的
+        exclude = self.input_cache_names - {chunk_cache_name(cache_name, 0, 1)}
+        existing = list_file_cache_names(self.cache_dir, cache_name, exclude=exclude)
+        return [name for name in current if name in existing], [name for name in existing if name not in current]
+
+    def get(self, split_chunk: SplitChunkMetadata) -> SplitCachePool | None:
+        entry = self._pools.get(split_chunk.file_path)
+        if entry is None:
+            current, stale = self.cache_names(split_chunk)
+            pool = None
+            if (split_chunk.total_chunks > 1 and current) or stale:
+                names = current + stale
+                pool = SplitCachePool(joinpath(self.cache_dir, name) for name in names)
+            entry = self._pools[split_chunk.file_path] = [pool, split_chunk.total_chunks]
+        return entry[0]
+
+    def done(self, split_chunk: SplitChunkMetadata) -> None:
+        """这个分片查完缓存了；同一文件的分片都查完就丢掉兜底缓存。"""
+        entry = self._pools.get(split_chunk.file_path)
+        if entry is None:
+            return
+        entry[1] -= 1
+        if entry[1] <= 0:
+            del self._pools[split_chunk.file_path]
+
+
+def _remove_stale_chunk_caches(split_chunk: SplitChunkMetadata, pools: _SplitCachePools) -> None:
+    """整个文件按当前分片布局写完快照后，删掉不属于当前布局的旧分片缓存。
+
+    旧分片里还用得上的译文，查缓存时已经并进当前分片、随快照写下了；留着旧文件只会让
+    浏览文本、进度统计里同一句出现两遍。
+    """
+    _, stale = pools.cache_names(split_chunk)
+    for name in stale:
+        path = joinpath(pools.cache_dir, name)
+        for target in (path, _append_cache_file_path(path)):
+            try:
+                if isPathExists(target):
+                    os_remove(target)
+            except OSError as exc:
+                LOGGER.warning(f"[cache]清理旧分片缓存失败：{target}: {exc}")
+    if stale:
+        LOGGER.info(
+            f"[cache]{_file_cache_name(split_chunk.file_path, pools.input_dir)} 的分片设置已变更，"
+            f"旧分片缓存已并入当前分片，清理 {len(stale)} 个旧缓存文件"
+        )
+
+
+def _cache_lookup_kwargs(projectConfig: CProjectConfig, eng_type: str) -> dict[str, Any]:
+    """翻译时判定缓存命中的参数。开翻前统计待翻句数与 worker 共用，两边口径不会走样。"""
+    return {
+        "retry_failed": projectConfig.getKey("retranslFail"),
+        "retran_key": projectConfig.getKey("retranslKey"),
+        "eng_type": eng_type,
+        "problem_filter_keys": projectConfig.getKey("problemFilterKey", []),
+        "problem_white_list": projectConfig.getKey("problemWhiteList", []),
+    }
+
+
+def _preprocess_chunk(split_chunk: SplitChunkMetadata, projectConfig: CProjectConfig) -> None:
+    """翻译前处理只做一次：开翻前统计待翻句数时已经做过的分片，worker 里不再重复替换。"""
+    if getattr(split_chunk, "preprocessed", False):
+        return
+    preprocess_trans_list(split_chunk.trans_list, projectConfig, projectConfig.pre_dic, projectConfig.tPlugins)
+    split_chunk.preprocessed = True
+
+
+async def _count_pending_lines(
+    split_chunk: SplitChunkMetadata,
+    cache_file_path: str,
+    projectConfig: CProjectConfig,
+    eng_type: str,
+    fallback_pool: SplitCachePool | None = None,
+) -> int:
+    """分片里这次真正要翻的句数：用与 worker 相同的缓存判定，在句子副本上跑一遍。
+
+    缓存判定会就地改写句子（命中时填译文），所以复制一份并把上下句指针接到副本上
+    （缓存 key 由前后句拼成），原句保持不动，留给 worker 正式判定。
+    """
+    translation_list = _chunk_translation_list(split_chunk, projectConfig.runtime_sentence_range)
+    if not translation_list:
+        return 0
+    copies = {id(tran): copy.copy(tran) for tran in split_chunk.trans_list}
+    for tran in copies.values():
+        tran.prev_tran = copies.get(id(tran.prev_tran), tran.prev_tran) if tran.prev_tran else None
+        tran.next_tran = copies.get(id(tran.next_tran), tran.next_tran) if tran.next_tran else None
+    _, unhit = await get_transCache_from_json(
+        [copies[id(tran)] for tran in translation_list],
+        cache_file_path,
+        quiet=True,
+        fallback_pool=fallback_pool,
+        **_cache_lookup_kwargs(projectConfig, eng_type),
+    )
+    return len(unhit)
+
+
+# 收尾拆分：队列取空的 worker 多久看一次有没有能拆的段（秒）
+_TAIL_SPLIT_POLL_INTERVAL = 0.5
+
+
+def _config_flag(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return bool(value)
+
+
+def _tail_split_lines(projectConfig: CProjectConfig, eng_type: str) -> int:
+    """收尾拆分每次拆出、以及拆完后原段至少留下的句数（两批）；没开返回 0。"""
+    if "rebuild" in eng_type or not _config_flag(projectConfig.getKey("splitTailChunks", False)):
+        return 0
+    try:
+        per_request = int(projectConfig.getKey("gpt.numPerRequestTranslate") or 0)
+    except (TypeError, ValueError):
+        per_request = 0
+    return 2 * (per_request if per_request > 0 else 32)
+
+
+async def _tail_split_loop(semaphore: asyncio.Semaphore, projectConfig: CProjectConfig, gptapi: Any) -> None:
+    """队列取空后的 worker：有够拆的段就拆走它还没发出的后一半来翻，直到所有段都翻完。"""
+    registry: TailSplitRegistry = projectConfig.tail_split_registry
+    while registry.active:
+        _check_stop_requested(projectConfig)
+        if registry.pick() is None:
+            await asyncio.sleep(_TAIL_SPLIT_POLL_INTERVAL)
+            continue
+        async with semaphore:
+            victim = registry.pick()  # 等信号量期间可能已经被别的 worker 拆过
+            if victim is not None:
+                await _translate_tail_piece(victim, projectConfig, gptapi)
+
+
+async def _translate_tail_piece(victim: TailSplitTask, projectConfig: CProjectConfig, gptapi: Any) -> None:
+    """拆走 victim 还没发出的后一半，作为新的一段串行翻完（它自己也还能再被拆）。"""
+    registry: TailSplitRegistry = projectConfig.tail_split_registry
+    spare = victim.handle.spare
+    stolen = victim.handle.split()
+    registry.pieces += 1
+    piece_no = registry.pieces
+    piece = TailSplitTask(
+        split_chunk=victim.split_chunk,
+        cache_file_path=victim.cache_file_path,
+        base_filename=victim.base_filename,
+        translation_list=victim.translation_list,
+        eta_key=f"{victim.cache_file_path}#{piece_no}",
+        handle=TailSplitHandle(victim.handle.min_lines),
+    )
+    # victim 收尾（校对、快照、输出）前要等这段翻完
+    done = asyncio.get_running_loop().create_future()
+    victim.handle.children.append(done)
+    LOGGER.info(f"[收尾拆分] {victim.base_filename} 还有 {spare} 句未发出，拆出 {len(stolen)} 句交给空闲线程")
+    eta_estimator = getattr(projectConfig, "eta_estimator", None)
+    if eta_estimator is not None:
+        eta_estimator.split(victim.eta_key, piece.eta_key, len(stolen))
+    registry.add(piece)
+    eta_token = _CURRENT_ETA_CHUNK.set(piece.eta_key)
+    tail_token = set_current_tail_split(piece.handle)
+    try:
+        try:
+            await ensure_model_available_if_needed(projectConfig)
+            # 后端文件名多带一个 _{段号}：上下文历史各段分开记，运行时事件仍归到同一个文件
+            await gptapi.batch_translate(
+                f"{piece.base_filename}_{piece_no}",
+                piece.cache_file_path,
+                piece.translation_list,
+                projectConfig.getKey("gpt.numPerRequestTranslate"),
+                retry_failed=projectConfig.getKey("retranslFail"),
+                gpt_dic=projectConfig.gpt_dic,
+                retran_key=projectConfig.getKey("retranslKey"),
+                translist_hit=[],
+                translist_unhit=stolen,
+            )
+        finally:
+            reset_current_tail_split(tail_token)
+            _CURRENT_ETA_CHUNK.reset(eta_token)
+            registry.remove(piece)
+        await piece.handle.wait_children()
+    except asyncio.CancelledError:
+        done.cancel()
+        raise
+    except BaseException as exc:
+        done.set_exception(exc)
+        raise
+    else:
+        done.set_result(None)
+    finally:
+        if eta_estimator is not None:
+            eta_estimator.finish(piece.eta_key)
+
+
+class _EtaTrackingBar:
+    """包一层进度条：未跳过的完成量（真正翻过的句子）按当前分片记进 ETA 估算器。"""
+
+    def __init__(self, bar: Any, projectConfig: CProjectConfig) -> None:
+        self._bar = bar
+        self._config = projectConfig
+
+    def __call__(self, count: int = 1, *args: Any, **kwargs: Any) -> Any:
+        result = self._bar(count, *args, **kwargs)
+        estimator = getattr(self._config, "eta_estimator", None)
+        key = _CURRENT_ETA_CHUNK.get()
+        if estimator is not None and key and not kwargs.get("skipped"):
+            estimator.record(key, int(count or 0))
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._bar, name)
+
+
 async def update_progress_title(
     bar, semaphore, workersPerProject: int, projectConfig: CProjectConfig
 ):
     """异步任务，用于动态更新 alive_bar 的标题以显示活动工作线程数。"""
     base_title = "翻译进度"
     is_interactive = should_print_translation_logs(projectConfig)
+    last_eta_report = 0.0
     while True:
         try:
             # 计算当前活动的任务数
@@ -222,6 +523,15 @@ async def update_progress_title(
                 workers_active=active_workers,
                 workers_configured=configured_workers,
             )
+            estimator = getattr(projectConfig, "eta_estimator", None)
+            now = time()
+            if estimator is not None and now - last_eta_report >= _ETA_REPORT_INTERVAL:
+                last_eta_report = now
+                # 信号量按分片占用：自动调并发降下来时，同时在翻的分片也跟着变少
+                estimator.workers = max(1, int(getattr(projectConfig, "runtime_workers_effective", workersPerProject)))
+                eta = estimator.estimate()
+                if eta is not None:
+                    _update_runtime(projectConfig, eta_seconds=eta)
             # 更新标题（仅 CLI 模式有 bar）
             if is_interactive:
                 new_title = f"{base_title} [{active_workers}/{configured_workers} 并发]"
@@ -257,7 +567,10 @@ def preprocess_trans_list(trans_list, projectConfig, pre_dic, tPlugins=None):
             "file_galtransl_json",
             "file_mtbench_aio",
         ]:
-            if projectConfig.select_translator not in ["ForNovel"]:
+            if projectConfig.select_translator not in ("ForNovel", "ForNovel-tool") and not (
+                projectConfig.select_translator == "auto-translate"
+                and not getattr(tran, "source_file_has_name", bool(tran.speaker))
+            ):
                 tran.analyse_dialogue()
 
         tran.post_src = pre_dic.do_replace(tran.post_src, tran)
@@ -356,6 +669,8 @@ async def doLLMTranslate(
 
     # 获取待翻译文件列表
     file_list = get_file_list(projectConfig.getInputPath())
+    # 全部输入文件（不只是本次要翻的）在缓存目录里的不分片缓存名：认旧分片缓存时排除别的文件
+    input_cache_names = {chunk_cache_name(_file_cache_name(f, input_dir), 0, 1) for f in file_list}
     if not file_list:
         # dump-name / GenDic 等仅基于输入文件的短路流程，空目录不算致命错误，友好返回
         if "dump-name" in eng_type or eng_type == "GenDic":
@@ -364,6 +679,20 @@ async def doLLMTranslate(
             )
             return True
         raise RuntimeError(f"{projectConfig.getInputPath()}中没有待翻译的文件")
+
+    # 输入清单返回相对路径；同名文件必须按路径区分，避免试译意外多选。
+    runtime_input_files = getattr(projectConfig, "runtime_input_files", None)
+    sentence_range = projectConfig.runtime_sentence_range
+    if runtime_input_files:
+        wanted = {f.replace("\\", "/") for f in runtime_input_files}
+        by_name = {os_path.relpath(f, input_dir).replace(os_sep, "/"): f for f in file_list}
+        missing = wanted - by_name.keys()
+        if missing:
+            raise RuntimeError(
+                f"指定的输入文件 {sorted(missing)} 在 {projectConfig.getInputPath()} 中不存在，请使用 input(action=\"list\") 返回的相对路径"
+            )
+        file_list = [f for name, f in by_name.items() if name in wanted]
+        LOGGER.info(f"本次只翻译指定的 {len(file_list)} 个文件: {sorted(wanted)}")
 
     # 按文件名自然排序（处理数字部分）
     import re
@@ -380,9 +709,16 @@ async def doLLMTranslate(
     # ---- 2. 读取所有文件并切分为 chunk ----
     # 使用线程池并发读文件（IO 密集型），同时通过 fPlugins 解析为 json_list
     file_loader_workers = max(1, min(cpu_count() or 1, 8))
+    if getattr(projectConfig, "fPluginAuto", False):
+        # filePlugin: auto —— 每个文件只交给识别出的那个插件（例如 txt 插件会把
+        # 任何文件都当纯文本读，不能让它去“试” json）；识别不了的文件跳过
+        file_plugin_routes = route_file_plugins(file_list, fPlugins, projectConfig.getProjectDir())
+        file_list = [f for f in file_list if file_plugin_routes.get(f)]
+    else:
+        file_plugin_routes = {f: fPlugins for f in file_list}
     with ThreadPoolExecutor(max_workers=file_loader_workers) as executor:
         future_to_file = {
-            executor.submit(fplugins_load_file, file_path, fPlugins): file_path
+            executor.submit(fplugins_load_file, file_path, file_plugin_routes[file_path]): file_path
             for file_path in file_list
         }
         for future in as_completed(future_to_file):
@@ -390,14 +726,26 @@ async def doLLMTranslate(
             file_path = future_to_file[future]
             try:
                 json_list, save_func = future.result()
+                if sentence_range is not None and sentence_range.start >= len(json_list):
+                    raise ValueError(f"{file_path} 只有 {len(json_list)} 句，sentence_range={sentence_range} 未选中任何句子")
                 projectConfig.file_save_funcs[file_path] = save_func
-                total_chunks.extend(input_splitter.split(json_list, file_path))
+                chunks = input_splitter.split(json_list, file_path)
+                file_has_name = any("name" in row or "names" in row for row in json_list)
+                for chunk in chunks:
+                    for tran in chunk.trans_list:
+                        tran.source_file_has_name = file_has_name
+                        tran.source_file_path = file_path
+                total_chunks.extend(chunks)
                 if eng_type == "GenDic":
                     all_jsons.extend(json_list)
             except Exception as exc:
+                if sentence_range is not None:
+                    raise
                 LOGGER.error(get_text("file_processing_error", GT_LANG, file_path, exc))
 
     # ---- 2.5 特殊引擎短路：只导出 name 表 / 只生成字典，不进入翻译流程 ----
+    if sentence_range is not None and not total_chunks:
+        raise ValueError("所选文件没有可翻译的句子，请检查文件插件和 sentence_range")
     if "dump-name" in eng_type:
         _check_stop_requested(projectConfig)
         await dump_name_table_from_chunks(total_chunks, projectConfig)
@@ -407,7 +755,12 @@ async def doLLMTranslate(
         _check_stop_requested(projectConfig)
         await ensure_model_available_if_needed(projectConfig)
         gptapi = await init_gptapi(projectConfig)
-        await gptapi.batch_translate(all_jsons)
+        try:
+            await gptapi.batch_translate(all_jsons)
+        finally:
+            # GenDic returns before the normal translation cleanup path.
+            # Always close its HTTP clients, including on cancellation/errors.
+            await gptapi.shutdown()
         return True
 
     # ---- 3. 根据 sortBy 决定 chunk 处理顺序 ----
@@ -435,9 +788,15 @@ async def doLLMTranslate(
         total_chunks.sort(key=lambda x: x.chunk_size, reverse=True)
         ordered_chunks = total_chunks
 
-    total_lines = sum([len(chunk.trans_list) for chunk in ordered_chunks])
-    runtime_file_totals, runtime_cache_map = _build_runtime_file_maps(ordered_chunks, input_dir)
-    _update_runtime(projectConfig, file_totals=runtime_file_totals, cache_file_display_map=runtime_cache_map)
+    total_lines = sum(len(_chunk_translation_list(chunk, sentence_range)) for chunk in ordered_chunks)
+    runtime_file_totals, runtime_cache_map = _build_runtime_file_maps(ordered_chunks, input_dir, sentence_range)
+    selected_indexes = {
+        cache_name: [str(tran.index) for tran in _chunk_translation_list(chunk, sentence_range)]
+        for chunk, cache_name in zip(ordered_chunks, runtime_cache_map)
+    } if sentence_range is not None else {}
+    _update_runtime(projectConfig, file_totals=runtime_file_totals, cache_file_display_map=runtime_cache_map,
+                    cache_file_selected_indexes=selected_indexes,
+                    cross_total=_runtime_cross_total(ordered_chunks, sentence_range))
 
     # ---- 4. name 替换表（首次运行时自动生成）----
     name_replaceDict_path_xlsx = joinpath(
@@ -478,6 +837,43 @@ async def doLLMTranslate(
         projectConfig.name_replaceDict = load_name_table(
             name_replaceDict_path_xlsx, name_replaceDict_firstime,total_chunks,projectConfig
         )
+
+    # ---- 5.5 翻译前处理 + 统计每个分片这次真正要翻的句数 ----
+    # 前处理挪到这里统一做（worker 里会跳过）：缓存 key 要用前处理后的说话人，统计才准。
+    # 待翻句数用于：size 排序按实际工作量排（续翻/重翻时，大部分已有缓存的大分片不该排在前面），
+    # 以及 ETA 按调度模拟剩余时间。rebuild 不翻译，不统计。
+    eta_estimator = None
+    pending_by_chunk: dict[int, int] = {}
+    count_pending = "rebuild" not in eng_type
+    counting_pools = _SplitCachePools(input_dir, cache_dir, input_cache_names)
+    # 同一文件的分片挨着统计，它的兜底缓存统计完就能丢
+    file_order = {file_path: i for i, file_path in enumerate(file_list)}
+    for chunk in sorted(ordered_chunks, key=lambda chunk: file_order.get(chunk.file_path, 0)):
+        _check_stop_requested(projectConfig)
+        _preprocess_chunk(chunk, projectConfig)
+        if count_pending:
+            pending_by_chunk[id(chunk)] = await _count_pending_lines(
+                chunk, _chunk_cache_file_path(chunk, input_dir, cache_dir), projectConfig, eng_type,
+                fallback_pool=counting_pools.get(chunk),
+            )
+            counting_pools.done(chunk)
+    if count_pending:
+        if soryBy == "size":
+            # 稳定排序：待翻量相同的仍按分片大小
+            ordered_chunks.sort(key=lambda chunk: pending_by_chunk[id(chunk)], reverse=True)
+        eta_estimator = TranslationEtaEstimator(workers=max(1, workersPerProject))
+        eta_estimator.queue(
+            (_chunk_cache_file_path(chunk, input_dir, cache_dir), pending_by_chunk[id(chunk)])
+            for chunk in ordered_chunks
+        )
+        LOGGER.info(f"本次待翻译 {sum(pending_by_chunk.values())} 句（{len(ordered_chunks)} 个分片）")
+    projectConfig.eta_estimator = eta_estimator
+    projectConfig.split_cache_pools = _SplitCachePools(input_dir, cache_dir, input_cache_names)
+    # 收尾拆分（splitTailChunks）：队列取空后，空闲 worker 拆走正在翻的分片还没发出的后半段
+    projectConfig.tail_split_lines = _tail_split_lines(projectConfig, eng_type)
+    projectConfig.tail_split_registry = TailSplitRegistry() if projectConfig.tail_split_lines else None
+    if eta_estimator is not None:
+        eta_estimator.min_split_lines = projectConfig.tail_split_lines
 
     # ---- 6. 初始化共享的 gptapi 实例（所有 worker 共用同一实例）----
     gptapi = await init_gptapi(projectConfig)
@@ -521,7 +917,7 @@ async def doLLMTranslate(
         should_print_translation_logs(projectConfig),
         total=total_lines, title="翻译进度", unit=" line", enrich_print=False, dual_line=True,length=30
     ) as bar:
-        projectConfig.bar = bar
+        projectConfig.bar = _EtaTrackingBar(bar, projectConfig)
 
         # 启动后台任务来更新进度条标题
         title_update_task = asyncio.create_task(
@@ -550,6 +946,8 @@ async def doLLMTranslate(
                 _check_stop_requested(projectConfig)
                 split_chunk = await chunk_queue.get()
                 if split_chunk is None:
+                    if projectConfig.tail_split_registry is not None:
+                        await _tail_split_loop(semaphore, projectConfig, gptapi)
                     return
                 await doLLMTranslSingleChunk(
                     semaphore,
@@ -644,10 +1042,7 @@ async def doLLMTranslSingleChunk(
         input_file_path = file_path
         output_file_path = input_file_path.replace(input_dir, output_dir)
 
-        cache_file_path = joinpath(
-            cache_dir,
-            file_name + (f"_{file_index}" if total_splits > 1 else ""),
-        )
+        cache_file_path = _chunk_cache_file_path(split_chunk, input_dir, cache_dir)
 
         part_info = f" (part {file_index+1}/{total_splits})" if total_splits > 1 else ""
         _update_runtime(
@@ -662,36 +1057,75 @@ async def doLLMTranslSingleChunk(
         LOGGER.debug(f"  实际大小: {split_chunk.chunk_size}")
         LOGGER.debug(f"  交叉数量: {split_chunk.cross_num}")
 
-        # 翻译前处理
-        preprocess_trans_list(split_chunk.trans_list, projectConfig, pre_dic, tPlugins)
+        # 翻译前处理（开翻前统计待翻句数时通常已做过）
+        _preprocess_chunk(split_chunk, projectConfig)
+
+        translation_list = _chunk_translation_list(split_chunk, projectConfig.runtime_sentence_range)
+        selected = {id(tran) for tran in translation_list}
+        outside_range = [tran for tran in split_chunk.trans_list if id(tran) not in selected]
+        # 本文件的其它分片缓存（含改分片设置前的旧分片）：本分片缓存里没有的句子到这里找
+        split_cache_pools = getattr(projectConfig, "split_cache_pools", None)
+        fallback_pool = split_cache_pools.get(split_chunk) if split_cache_pools else None
+        # 收尾拆分：先登记，队列取空的 worker 看到还有分片在翻就会等着拆，不会提前退出
+        tail_registry = getattr(projectConfig, "tail_split_registry", None)
+        tail_task = None
+        if tail_registry is not None:
+            tail_task = TailSplitTask(
+                split_chunk=split_chunk,
+                cache_file_path=cache_file_path,
+                base_filename=file_name + (f"_{file_index}" if total_splits > 1 else ""),
+                translation_list=translation_list,
+                eta_key=cache_file_path,
+                handle=TailSplitHandle(projectConfig.tail_split_lines),
+            )
+            tail_registry.add(tail_task)
+        if outside_range:
+            # 范围外只读旧缓存；重翻关键字和失败重试不能清掉这些句子的已有译文。
+            await get_transCache_from_json(outside_range, cache_file_path, ignr_post_src=True,
+                                           eng_type=eng_type, fallback_pool=fallback_pool)
 
         translist_hit, translist_unhit = await get_transCache_from_json(
-            split_chunk.trans_list,
+            translation_list,
             cache_file_path,
-            retry_failed=projectConfig.getKey("retranslFail"),
             proofread=False,
-            retran_key=projectConfig.getKey("retranslKey"),
-            eng_type=eng_type,
+            fallback_pool=fallback_pool,
+            **_cache_lookup_kwargs(projectConfig, eng_type),
         )
+        if split_cache_pools:
+            split_cache_pools.done(split_chunk)
 
         if len(translist_hit) > 0:
             projectConfig.bar(len(translist_hit), skipped=True) # 更新进度条
+
+        # ETA：登记本分片的实际待翻量，并让进度条回调把每批完成量记到本分片上
+        eta_estimator = getattr(projectConfig, "eta_estimator", None)
+        if eta_estimator is not None:
+            eta_estimator.start(cache_file_path, len(translist_unhit))
+        eta_chunk_token = _CURRENT_ETA_CHUNK.set(cache_file_path)
 
         if len(translist_unhit) > 0:
             _check_stop_requested(projectConfig)
             await ensure_model_available_if_needed(projectConfig)
             # 执行翻译
-            await gptapi.batch_translate(
-                file_name + (f"_{file_index}" if total_splits > 1 else ""),
-                cache_file_path,
-                split_chunk.trans_list,
-                projectConfig.getKey("gpt.numPerRequestTranslate"),
-                retry_failed=projectConfig.getKey("retranslFail"),
-                gpt_dic=gpt_dic,
-                retran_key=projectConfig.getKey("retranslKey"),
-                translist_hit=translist_hit,
-                translist_unhit=translist_unhit,
-            )
+            tail_token = set_current_tail_split(tail_task.handle if tail_task else None)
+            try:
+                await gptapi.batch_translate(
+                    file_name + (f"_{file_index}" if total_splits > 1 else ""),
+                    cache_file_path,
+                    translation_list,
+                    projectConfig.getKey("gpt.numPerRequestTranslate"),
+                    retry_failed=projectConfig.getKey("retranslFail"),
+                    gpt_dic=gpt_dic,
+                    retran_key=projectConfig.getKey("retranslKey"),
+                    translist_hit=translist_hit,
+                    translist_unhit=translist_unhit,
+                )
+            finally:
+                reset_current_tail_split(tail_token)
+            if tail_task is not None:
+                # 拆出去的段都翻完，这个分片才算翻完：校对、快照、输出都要用到全部译文
+                tail_registry.remove(tail_task)
+                await tail_task.handle.wait_children()
 
             # 执行校对（如果启用）
             if projectConfig.getKey("gpt.enableProofRead"):
@@ -700,7 +1134,7 @@ async def doLLMTranslSingleChunk(
                     await gptapi.batch_translate(
                         file_name,
                         cache_file_path,
-                        split_chunk.trans_list,
+                        translation_list,
                         projectConfig.getKey("gpt.numPerRequestProofRead"),
                         retry_failed=projectConfig.getKey("retranslFail"),
                         gpt_dic=gpt_dic,
@@ -711,9 +1145,18 @@ async def doLLMTranslSingleChunk(
                     LOGGER.warning("当前引擎不支持校对，跳过校对步骤")
             gptapi.clean_up()
 
+        if tail_task is not None:
+            tail_registry.remove(tail_task)
+        _CURRENT_ETA_CHUNK.reset(eta_chunk_token)
+        if eta_estimator is not None:
+            eta_estimator.finish(cache_file_path)
+
         # 翻译后处理
         _check_stop_requested(projectConfig)
         postprocess_trans_list(split_chunk.trans_list, projectConfig, post_dic, tPlugins)
+        for tran in outside_range:
+            if not tran.pre_dst and not tran.proofread_zh and tran.post_src:
+                tran.post_dst = tran.pre_src
 
         et = time()
         LOGGER.info(
@@ -756,11 +1199,7 @@ async def postprocess_results(
     for i, chunk in enumerate(resultChunks):
         trans_list = chunk.trans_list
         file_path = chunk.file_path
-        cache_file_path = joinpath(
-            cache_dir,
-            file_path.replace(input_dir, "").lstrip(os_sep).replace(os_sep, "-}")
-            + (f"_{chunk.chunk_index}" if chunk.total_chunks > 1 else ""),
-        )
+        cache_file_path = _chunk_cache_file_path(chunk, input_dir, cache_dir)
 
         # rebuildr 是"只重建输出文件"模式，不应修改缓存；其余引擎正常刷新
         if eng_type != "rebuildr":
@@ -772,6 +1211,9 @@ async def postprocess_results(
                 post_save=True,
                 project_dir=_runtime_project_dir(projectConfig),
             )
+    split_cache_pools = getattr(projectConfig, "split_cache_pools", None)
+    if eng_type != "rebuildr" and split_cache_pools:
+        _remove_stale_chunk_caches(resultChunks[0], split_cache_pools)
 
     # 使用output_combiner合并结果，即使只有一个结果
     all_trans_list, all_json_list = DictionaryCombiner.combine(resultChunks)
@@ -811,12 +1253,21 @@ async def init_gptapi(
     eng_type = projectConfig.select_translator
 
     match eng_type:
-        case "ForGal-tsv":
-            from GalTransl.Backend.ForGalTsvTranslate import ForGalTsvTranslate
-            return ForGalTsvTranslate(projectConfig, eng_type, proxyPool, tokenPool)
+        case "auto-translate":
+            from GalTransl.Backend.AutoTranslate import AutoTranslate
+            return AutoTranslate(projectConfig, eng_type, proxyPool, tokenPool)
+        case "ForGal-tool":
+            from GalTransl.Backend.ForGalToolTranslate import ForGalToolTranslate
+            return ForGalToolTranslate(projectConfig, eng_type, proxyPool, tokenPool)
+        case "ForGal-markdown":
+            from GalTransl.Backend.ForGalMarkdownTranslate import ForGalMarkdownTranslate
+            return ForGalMarkdownTranslate(projectConfig, eng_type, proxyPool, tokenPool)
         case "ForNovel":
             from GalTransl.Backend.ForNovelTranslate import ForNovelTranslate
             return ForNovelTranslate(projectConfig, eng_type, proxyPool, tokenPool)
+        case "ForNovel-tool":
+            from GalTransl.Backend.ForNovelToolTranslate import ForNovelToolTranslate
+            return ForNovelToolTranslate(projectConfig, eng_type, proxyPool, tokenPool)
         case "ForGal-json":
             from GalTransl.Backend.ForGalJsonTranslate import ForGalJsonTranslate
             return ForGalJsonTranslate(projectConfig, eng_type, proxyPool, tokenPool)
@@ -834,6 +1285,26 @@ async def init_gptapi(
             return GenDic(projectConfig, eng_type, proxyPool, tokenPool)
         case _:
             raise ValueError(f"不支持的翻译引擎类型 {eng_type}")
+
+
+def route_file_plugins(file_list: List[str], fPlugins: list, project_dir: str) -> Dict[str, list]:
+    """filePlugin: auto 时给每个文件挑插件，返回 {file_path: [plugin]}（识别不了的是空列表）。"""
+    from GalTransl.FilePluginDetect import detect_file_plugins
+
+    by_name = {}
+    for plugin in fPlugins:
+        if isinstance(plugin, str):
+            continue
+        by_name[plugin.yaml_dict["Core"]["Module"]] = plugin
+    routes = {}
+    for file_path, name in detect_file_plugins(file_list, project_dir).items():
+        plugin = by_name.get((name or "").replace("(project_dir)", ""))
+        if plugin is None:
+            LOGGER.warning(f"自动识别文件插件：{file_path} 没有匹配的文件插件，已跳过")
+        else:
+            LOGGER.debug(f"自动识别文件插件：{file_path} -> {plugin.name}")
+        routes[file_path] = [plugin] if plugin else []
+    return routes
 
 
 def fplugins_load_file(file_path: str, fPlugins: list) -> Tuple[List[Dict], Any]:

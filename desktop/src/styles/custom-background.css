@@ -15,7 +15,7 @@
 .app-layout--custom-background .project-translate-page .panel,
 .app-layout--custom-background .home-open,
 .app-layout--custom-background .home-history,
-.app-layout--custom-background .home-jobs,
+.app-layout--custom-background .home-flow,
 .app-layout--custom-background .project-translate-page .ptv2-cockpit,
 .app-layout--custom-background .plugin-card,
 .app-layout--custom-background .job-card,
@@ -30,6 +30,7 @@
 .app-layout--custom-background .home-hero,
 .app-layout--custom-background .home-hero__stats,
 .app-layout--custom-background .project-cache-page .cache-layout,
+.app-layout--custom-background .project-dictionary-page .dict-layout,
 .app-layout--custom-background .sidebar__project-confirm-bubble,
 .app-layout--custom-background .sidebar__context-menu,
 .app-layout--custom-background .project-cache-page .cache-context-menu,
@@ -42,7 +43,7 @@
   -webkit-backdrop-filter: blur(var(--custom-bg-surface-blur));
 }
 
-.app-layout--custom-background .app-layout__content:has(.home-page)::before {
+.app-layout--custom-background .app-layout__page:has(.home-page)::before {
   opacity: calc(var(--custom-bg-surface-soft-opacity-resolved) + 0.06);
 }
 
@@ -61,7 +62,8 @@
   opacity: calc(var(--custom-bg-surface-soft-opacity-resolved) + 0.08);
 }
 
-.app-layout--custom-background .project-cache-page .cache-layout {
+.app-layout--custom-background .project-cache-page .cache-layout,
+.app-layout--custom-background .project-dictionary-page .dict-layout {
   background:
     linear-gradient(180deg, rgba(255, 255, 255, calc(var(--custom-bg-surface-soft-opacity-resolved) + 0.14)), rgba(245, 249, 255, calc(var(--custom-bg-surface-soft-opacity-resolved) + 0.04))),
     rgba(255, 255, 255, calc(var(--custom-bg-surface-soft-opacity-resolved) + 0.04)) !important;
@@ -85,7 +87,6 @@
  .app-layout--custom-background .project-cache-page .retransl-popover,
  .app-layout--custom-background .project-cache-page .retransl-popover__arrow,
  .app-layout--custom-background .project-cache-page .retransl-popover__input,
- .app-layout--custom-background .project-dictionary-page .dict-tab,
  .app-layout--custom-background .project-dictionary-page .dict-layout__sidebar,
  .app-layout--custom-background .project-dictionary-page .dict-create-file input,
  .app-layout--custom-background .project-dictionary-page .dict-search,
@@ -102,7 +103,6 @@
   -webkit-backdrop-filter: blur(var(--custom-bg-surface-blur-soft));
 }
 
- .app-layout--custom-background .project-dictionary-page .dict-tab,
  .app-layout--custom-background .project-dictionary-page .dict-layout__sidebar {
   background: var(--custom-bg-fill-strong) !important;
   backdrop-filter: blur(var(--custom-bg-surface-blur-soft));
@@ -121,15 +121,9 @@
  .app-layout--custom-background .project-dictionary-page .dict-card__cell--index,
  .app-layout--custom-background .project-dictionary-page .dict-card__add-row-btn,
  .app-layout--custom-background .project-dictionary-page .dict-card__row-delete,
+ .app-layout--custom-background .project-dictionary-page .dict-card__row-open-cache,
  .app-layout--custom-background .name-page .name-page__th {
   background: var(--custom-bg-fill-strong) !important;
-  backdrop-filter: blur(var(--custom-bg-surface-blur-soft));
-  -webkit-backdrop-filter: blur(var(--custom-bg-surface-blur-soft));
-}
-
-.app-layout--custom-background .project-cache-page .cache-layout__main > .cache-layout__empty {
-  background: rgba(255, 255, 255, calc(var(--custom-bg-surface-soft-opacity-resolved) + 0.06)) !important;
-  border-color: rgba(191, 208, 226, calc(var(--custom-bg-surface-soft-opacity-resolved) + 0.5));
   backdrop-filter: blur(var(--custom-bg-surface-blur-soft));
   -webkit-backdrop-filter: blur(var(--custom-bg-surface-blur-soft));
 }
@@ -145,7 +139,6 @@
 .app-layout--custom-background .field textarea,
 .app-layout--custom-background .settings-number-row__control input,
 .app-layout--custom-background .settings-number-row__control select,
-.app-layout--custom-background .sidebar__project-close,
 .app-layout--custom-background .sidebar__project-confirm-no,
 .app-layout--custom-background .sidebar__toggle-btn {
   background: rgba(255, 255, 255, calc(var(--custom-bg-surface-opacity-resolved) + 0.18));
@@ -173,8 +166,6 @@
 }
 
 .app-layout--custom-background .home-history__item:hover,
-.app-layout--custom-background .home-job-row:hover,
-.app-layout--custom-background .home-job-row--clickable:hover,
 .app-layout--custom-background .sidebar__nav-item:hover,
 .app-layout--custom-background .sidebar__project-header:hover,
 .app-layout--custom-background .sidebar__project-child:hover,
@@ -206,7 +197,7 @@
 :root[data-theme='dark'] .app-layout--custom-background .project-translate-page .panel,
 :root[data-theme='dark'] .app-layout--custom-background .home-open,
 :root[data-theme='dark'] .app-layout--custom-background .home-history,
-:root[data-theme='dark'] .app-layout--custom-background .home-jobs,
+:root[data-theme='dark'] .app-layout--custom-background .home-flow,
 :root[data-theme='dark'] .app-layout--custom-background .project-translate-page .ptv2-cockpit,
 :root[data-theme='dark'] .app-layout--custom-background .plugin-card,
 :root[data-theme='dark'] .app-layout--custom-background .job-card,
@@ -221,6 +212,7 @@
 :root[data-theme='dark'] .app-layout--custom-background .home-hero,
 :root[data-theme='dark'] .app-layout--custom-background .home-hero__stats,
 :root[data-theme='dark'] .app-layout--custom-background .project-cache-page .cache-layout,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-layout,
 :root[data-theme='dark'] .app-layout--custom-background .sidebar__project-confirm-bubble,
 :root[data-theme='dark'] .app-layout--custom-background .sidebar__context-menu,
 :root[data-theme='dark'] .app-layout--custom-background .project-cache-page .cache-context-menu,
@@ -233,11 +225,12 @@
   -webkit-backdrop-filter: blur(var(--custom-bg-surface-blur));
 }
 
-:root[data-theme='dark'] .app-layout--custom-background .app-layout__content:has(.home-page)::before {
+:root[data-theme='dark'] .app-layout--custom-background .app-layout__page:has(.home-page)::before {
   opacity: calc(var(--custom-bg-surface-soft-opacity-resolved) + 0.08);
 }
 
-:root[data-theme='dark'] .app-layout--custom-background .project-cache-page .cache-layout {
+:root[data-theme='dark'] .app-layout--custom-background .project-cache-page .cache-layout,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-layout {
   background:
     linear-gradient(180deg, rgba(24, 34, 48, calc(var(--custom-bg-surface-soft-opacity-resolved) + 0.18)), rgba(12, 19, 30, calc(var(--custom-bg-surface-soft-opacity-resolved) + 0.06))),
     rgba(14, 22, 32, calc(var(--custom-bg-surface-soft-opacity-resolved) + 0.06)) !important;
@@ -267,7 +260,6 @@
 :root[data-theme='dark'] .app-layout--custom-background .project-cache-page .retransl-popover,
 :root[data-theme='dark'] .app-layout--custom-background .project-cache-page .retransl-popover__arrow,
 :root[data-theme='dark'] .app-layout--custom-background .project-cache-page .retransl-popover__input,
-:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-tab,
 :root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-layout__sidebar,
 :root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-create-file input,
 :root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-search,
@@ -284,7 +276,6 @@
   -webkit-backdrop-filter: blur(var(--custom-bg-surface-blur-soft));
 }
 
-:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-tab,
 :root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-layout__sidebar {
   background: var(--custom-bg-fill-strong) !important;
   backdrop-filter: blur(var(--custom-bg-surface-blur-soft));
@@ -303,15 +294,9 @@
 :root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__cell--index,
 :root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__add-row-btn,
 :root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__row-delete,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__row-open-cache,
 :root[data-theme='dark'] .app-layout--custom-background .name-page .name-page__th {
   background: var(--custom-bg-fill-strong) !important;
-  backdrop-filter: blur(var(--custom-bg-surface-blur-soft));
-  -webkit-backdrop-filter: blur(var(--custom-bg-surface-blur-soft));
-}
-
-:root[data-theme='dark'] .app-layout--custom-background .project-cache-page .cache-layout__main > .cache-layout__empty {
-  background: rgba(14, 22, 32, calc(var(--custom-bg-surface-soft-opacity-resolved) + 0.08)) !important;
-  border-color: rgba(65, 83, 111, calc(var(--custom-bg-surface-soft-opacity-resolved) + 0.5));
   backdrop-filter: blur(var(--custom-bg-surface-blur-soft));
   -webkit-backdrop-filter: blur(var(--custom-bg-surface-blur-soft));
 }
@@ -321,7 +306,6 @@
 :root[data-theme='dark'] .app-layout--custom-background .field textarea,
 :root[data-theme='dark'] .app-layout--custom-background .settings-number-row__control input,
 :root[data-theme='dark'] .app-layout--custom-background .settings-number-row__control select,
-:root[data-theme='dark'] .app-layout--custom-background .sidebar__project-close,
 :root[data-theme='dark'] .app-layout--custom-background .sidebar__project-confirm-no,
 :root[data-theme='dark'] .app-layout--custom-background .sidebar__toggle-btn {
   background: rgba(20, 30, 43, calc(var(--custom-bg-surface-opacity-resolved) + 0.2));
@@ -342,7 +326,6 @@
 :root[data-theme='dark'] .app-layout--custom-background .project-cache-page .cache-sidebar-tab,
 :root[data-theme='dark'] .app-layout--custom-background .project-cache-page .cache-problems-group__header,
 :root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-file-item--active,
-:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-tab--active,
 :root[data-theme='dark'] .app-layout--custom-background .name-page .name-page__input:focus,
 :root[data-theme='dark'] .app-layout--custom-background .problem-analyze-section__loading,
 :root[data-theme='dark'] .app-layout--custom-background .problem-analyze-section__item,
@@ -352,8 +335,6 @@
 }
 
 :root[data-theme='dark'] .app-layout--custom-background .home-history__item:hover,
-:root[data-theme='dark'] .app-layout--custom-background .home-job-row:hover,
-:root[data-theme='dark'] .app-layout--custom-background .home-job-row--clickable:hover,
 :root[data-theme='dark'] .app-layout--custom-background .sidebar__nav-item:hover,
 :root[data-theme='dark'] .app-layout--custom-background .sidebar__project-header:hover,
 :root[data-theme='dark'] .app-layout--custom-background .sidebar__project-child:hover,
@@ -367,7 +348,7 @@
 :root[data-theme='dark'] .app-layout--custom-background .project-cache-page .cache-card__delete:hover,
 :root[data-theme='dark'] .app-layout--custom-background .project-cache-page .cache-problems-group__header:hover,
 :root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-file-item:hover,
-:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-tab:hover,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-file-tree__header:hover,
 :root[data-theme='dark'] .app-layout--custom-background .sidebar__context-menu-item:hover:not(:disabled) {
   background: var(--custom-bg-fill-soft-hover);
 }
@@ -382,5 +363,90 @@
 :root[data-theme='dark'] .app-layout--custom-background .project-cache-page .retransl-popover__input:focus,
 :root[data-theme='dark'] .app-layout--custom-background .name-page .name-page__search:focus {
   background: var(--custom-bg-fill-strong) !important;
+}
+
+/* ── Agent 页面 ──
+   Agent 的两个大面板（主对话 cockpit / 会话栏）自带纯白（暗色下是近似不透明的深蓝）渐变，
+   又没在上面的名单里，自定义背景下就是整块挡掉壁纸。这里换成静态半透明渐变，
+   各自右上角那团品牌光晕保留——没了它这两块就不是 Agent 页了。
+   同时把输入框 / 「回到最新」/ 下发配置菜单按其它页的 fill-strong 档处理。 */
+
+.app-layout--custom-background .agent-cockpit,
+.app-layout--custom-background .agent-sessions {
+  background:
+    radial-gradient(circle at 92% -18%, rgba(47, 111, 235, 0.14), transparent 46%),
+    linear-gradient(
+      180deg,
+      rgba(255, 255, 255, calc(var(--custom-bg-surface-opacity-resolved) + 0.22)),
+      rgba(248, 251, 255, calc(var(--custom-bg-surface-opacity-resolved) + 0.1))
+    ),
+    rgba(255, 255, 255, var(--custom-bg-surface-opacity-resolved));
+}
+
+.app-layout--custom-background .agent-composer,
+.app-layout--custom-background .agent-jump-bottom,
+.app-layout--custom-background .agent-profile-menu {
+  background: var(--custom-bg-fill-strong) !important;
+}
+
+:root[data-theme='dark'] .app-layout--custom-background .agent-cockpit,
+:root[data-theme='dark'] .app-layout--custom-background .agent-sessions {
+  background:
+    radial-gradient(circle at 92% -18%, rgba(67, 129, 255, 0.2), transparent 48%),
+    linear-gradient(
+      180deg,
+      rgba(24, 34, 48, calc(var(--custom-bg-surface-opacity-resolved) + 0.24)),
+      rgba(14, 22, 32, calc(var(--custom-bg-surface-opacity-resolved) + 0.12))
+    ),
+    rgba(14, 22, 32, var(--custom-bg-surface-opacity-resolved));
+}
+
+/* ── blur 收敛 ──
+   模糊收敛到顶层容器（侧栏、面板、弹层、卡片本身），行内小元素不再逐个模糊：
+   缓存卡片字段、字典单元格/输入框、吸顶表头这类元素数量随条目增长，滚动时每次重绘都要
+   采样背景，是自定义背景下滚动卡顿的大头。它们只保留半透明底色，视觉上仍然是「透出壁纸」。
+   放在文件末尾 + 带 dark 前缀，才能压过前面的浅色/暗色规则。 */
+.app-layout--custom-background .project-cache-page .cache-card__input,
+.app-layout--custom-background .project-cache-page .cache-card__textarea,
+.app-layout--custom-background .project-cache-page .cache-card__readonly-textarea,
+.app-layout--custom-background .project-dictionary-page .dict-card__fields,
+.app-layout--custom-background .project-dictionary-page .dict-card__table-head,
+.app-layout--custom-background .project-dictionary-page .dict-card__table-add-row,
+.app-layout--custom-background .project-dictionary-page .dict-card__field-label,
+.app-layout--custom-background .project-dictionary-page .dict-card__cell,
+.app-layout--custom-background .project-dictionary-page .dict-card__cell--index,
+.app-layout--custom-background .project-dictionary-page .dict-card__input,
+.app-layout--custom-background .project-dictionary-page .dict-card__note-input,
+.app-layout--custom-background .project-dictionary-page .dict-card__add-row-btn,
+.app-layout--custom-background .project-dictionary-page .dict-card__row-delete,
+.app-layout--custom-background .project-dictionary-page .dict-card__row-open-cache,
+.app-layout--custom-background .name-page .name-page__th,
+:root[data-theme='dark'] .app-layout--custom-background .project-cache-page .cache-card__input,
+:root[data-theme='dark'] .app-layout--custom-background .project-cache-page .cache-card__textarea,
+:root[data-theme='dark'] .app-layout--custom-background .project-cache-page .cache-card__readonly-textarea,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__fields,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__table-head,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__table-add-row,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__field-label,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__cell,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__cell--index,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__input,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__note-input,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__add-row-btn,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__row-delete,
+:root[data-theme='dark'] .app-layout--custom-background .project-dictionary-page .dict-card__row-open-cache,
+:root[data-theme='dark'] .app-layout--custom-background .name-page .name-page__th {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* The stream already sits on a blurred panel. Nested blur on every card and
+   its SRC/DST block adds two render surfaces per row during scrolling. */
+.app-layout--custom-background .project-translate-page .runtime-event,
+.app-layout--custom-background .project-translate-page .runtime-success-compact,
+:root[data-theme='dark'] .app-layout--custom-background .project-translate-page .runtime-event,
+:root[data-theme='dark'] .app-layout--custom-background .project-translate-page .runtime-success-compact {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 

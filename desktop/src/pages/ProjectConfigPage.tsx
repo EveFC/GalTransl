@@ -1,4 +1,6 @@
+import { message as uiMessage, t as translate, useMessageState, useUiLanguage } from "../i18n";
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { usePageActive, useRetainPage } from '../components/PageActivity';
 import { useSearchParams } from 'react-router-dom';
 import type { ProjectPageContext } from '../components/ProjectLayout';
 import { Panel } from '../components/Panel';
@@ -7,42 +9,77 @@ import { EmptyState, ErrorState, InlineFeedback, LoadingState } from '../compone
 import {
   type PluginInfo,
   fetchProjectConfig,
+  previewProjectConfigYaml,
   updateProjectConfig,
   fetchPlugins,
   getBackendProfileNames,
   getDefaultBackendProfile,
   getSelectedBackendProfileDisplay,
   setSelectedBackendProfile,
+  setProjectConfigDirty,
   BACKEND_PROFILES_CHANGE_EVENT,
   DEFAULT_BACKEND_PROFILE_CHANGE_EVENT } from '../lib/api';
 import { normalizeError } from '../lib/errors';
+import { prefersReducedMotion } from '../lib/motion';
 import {
   ConfigSectionNav,
-  CommonSettingsSection,
+  CONFIG_SECTIONS,
+  TranslationSettingsSection,
   BackendSettingsSection,
-  PluginSettingsSection,
+  FileIOSettingsSection,
+  TextProcessingSettingsSection,
   DictionarySettingsSection,
   ProblemAnalyzeSection,
   RetranslKeySection,
+  ProblemFilterSection,
+  ProjectGuidelineSection,
   type ConfigSectionKey,
 } from './project-config';
 
 export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
+  useUiLanguage();
   const { projectDir, projectId, configFileName } = ctx;
 
   const [config, setConfig] = useState<Record<string, unknown> | null>(null);
+  const [problemPlugins, setProblemPlugins] = useState<PluginInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useMessageState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [dirty, setDirty] = useState(false);
+  useRetainPage(dirty || saving);
+  const configRef = useRef(config);
+  configRef.current = config;
+  const contextRef = useRef('');
+  contextRef.current = `${projectId}:${configFileName}`;
+  const active = usePageActive();
   const [searchParams] = useSearchParams();
   const [activeSection, setActiveSection] = useState<ConfigSectionKey>(() => {
     const s = searchParams.get('section');
-    if (s && ['common', 'backendSpecific', 'plugin', 'dictionary', 'problemAnalyze', 'retranslKey'].includes(s)) return s as ConfigSectionKey;
-    return 'common';
+    // 兼容原来的插件设置链接，默认进入排在首位的文件读写。
+    if (s === 'plugin') return 'fileIO';
+    return CONFIG_SECTIONS.find((section) => section.key === s)?.key ?? 'fileIO';
   });
   const [yamlView, setYamlView] = useState(false);
+  useEffect(() => {
+    const section = searchParams.get('section');
+    if (section === 'plugin') setActiveSection('fileIO');
+    else if (CONFIG_SECTIONS.some((item) => item.key === section)) setActiveSection(section as ConfigSectionKey);
+  }, [searchParams]);
+
+  const wasActiveRef = useRef(active);
+  const refreshAllowedRef = useRef(false);
+  refreshAllowedRef.current = active && !dirty && !saving;
+  useEffect(() => {
+    const wasActive = wasActiveRef.current;
+    wasActiveRef.current = active;
+    if (wasActive || !refreshAllowedRef.current || !projectId) return;
+    let cancelled = false;
+    void fetchProjectConfig(projectId, configFileName).then((data) => {
+      if (!cancelled && refreshAllowedRef.current) setConfig(data.config);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [active, projectId, configFileName]);
 
   // Global backend profile selection
   const [backendProfileNames, setBackendProfileNames] = useState<string[]>([]);
@@ -53,12 +90,19 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
   const [filePlugins, setFilePlugins] = useState<PluginInfo[]>([]);
   const [textPlugins, setTextPlugins] = useState<PluginInfo[]>([]);
 
+  useEffect(() => {
+    if (projectDir) {
+      setProjectConfigDirty(projectDir, dirty);
+    }
+  }, [projectDir, dirty]);
+
   // Ref for scroll-to-section
   const mainRef = useRef<HTMLDivElement>(null);
 
   // Load config
   useEffect(() => {
     if (!projectId) return;
+    setSaving(false);
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -70,13 +114,33 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
         }
       })
       .catch((err) => {
-        if (!cancelled) setError(normalizeError(err, '加载配置失败'));
+        if (!cancelled) setError(normalizeError(err, uiMessage("config:projectConfigPage.projectConfigPage_normalizeError_loadConfigFailed")));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
   }, [projectId, configFileName]);
+
+  // YAML 源码视图：由后端按保存时同样的格式渲染，所见即写入文件的内容
+  const [yamlText, setYamlText] = useState<string | null>(null);
+  const [yamlError, setYamlError] = useMessageState<string | null>(null);
+  useEffect(() => {
+    if (!yamlView || !config || !projectId) {
+      setYamlText(null);
+      return;
+    }
+    const controller = new AbortController();
+    setYamlError(null);
+    previewProjectConfigYaml(projectId, config, controller.signal)
+      .then((data) => setYamlText(data.yaml))
+      .catch((err) => {
+        if (controller.signal.aborted) return;
+        setYamlText(null);
+        setYamlError(normalizeError(err, uiMessage("config:projectConfigPage.yamlPreview_normalizeError_renderFailed")));
+      });
+    return () => controller.abort();
+  }, [yamlView, config, projectId]);
 
   // Load backend profile names and current selection
   useEffect(() => {
@@ -120,6 +184,15 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
     return () => { cancelled = true; };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    setProblemPlugins([]);
+    if (projectId) fetchPlugins(projectId).then((plugins) => {
+      if (!cancelled) setProblemPlugins(plugins.filter((plugin) => plugin.type === 'problem'));
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [projectId]);
+
   // Get/set nested config value. Prefer literal flat keys containing dots
   // (e.g. YAML under `common:` uses keys like `gpt.translation_guideline`).
   const getNestedValue = useCallback((obj: Record<string, unknown>, path: string): unknown => {
@@ -140,6 +213,30 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
   const setNestedValue = useCallback((obj: Record<string, unknown>, path: string, value: unknown): Record<string, unknown> => {
     const keys = path.split('.');
     const result = JSON.parse(JSON.stringify(obj));
+    // common 下的配置项都是平铺的点号键（后端按 `gpt.xxx.yyy` 整体读取）。
+    // 文件里还没有这个键时不能按点号拆成嵌套对象，否则后端读不到。
+    if (keys[0] === 'common' && keys.length > 2) {
+      const isObject = (v: unknown): v is Record<string, unknown> => v != null && typeof v === 'object' && !Array.isArray(v);
+      if (!isObject(result.common)) result.common = {};
+      const common = result.common as Record<string, unknown>;
+      common[keys.slice(1).join('.')] = value;
+      // 清掉以前误写出的同名嵌套值（只删叶子，不动还有别的子项的对象）
+      const parents: Record<string, unknown>[] = [common];
+      let node: unknown = common;
+      for (const key of keys.slice(1, -1)) {
+        node = isObject(node) ? node[key] : undefined;
+        if (!isObject(node)) return result;
+        parents.push(node);
+      }
+      const leafParent = parents[parents.length - 1];
+      const leafKey = keys[keys.length - 1];
+      if (!Object.prototype.hasOwnProperty.call(leafParent, leafKey) || isObject(leafParent[leafKey])) return result;
+      delete leafParent[leafKey];
+      for (let i = parents.length - 1; i > 0 && Object.keys(parents[i]).length === 0; i--) {
+        delete parents[i - 1][keys[i]];
+      }
+      return result;
+    }
     let current: Record<string, unknown> = result;
     for (let i = 0; i < keys.length - 1; i++) {
       const remaining = keys.slice(i).join('.');
@@ -219,7 +316,8 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
   }, []);
 
   const handleSave = useCallback(async () => {
-    if (!projectId || !config) return;
+    if (!projectId || !config) return false;
+    const context = `${projectId}:${configFileName}`;
     setSaving(true);
     setError(null);
     setSaveSuccess(false);
@@ -227,12 +325,16 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
       await updateProjectConfig(projectId, {
         config,
         config_file_name: configFileName });
-      setSaveSuccess(true);
-      setDirty(false);
+      if (contextRef.current === context && configRef.current === config) {
+        setSaveSuccess(true);
+        setDirty(false);
+      }
+      return true;
     } catch (err) {
-      setError(normalizeError(err, '保存配置失败'));
+      if (contextRef.current === context) setError(normalizeError(err, uiMessage("config:projectConfigPage.handleSave_normalizeError_saveConfigFailed")));
+      return false;
     } finally {
-      setSaving(false);
+      if (contextRef.current === context) setSaving(false);
     }
   }, [projectId, config, configFileName]);
 
@@ -242,15 +344,15 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
     setYamlView(false);
     // Scroll main area to top so new section is visible
     if (mainRef.current) {
-      mainRef.current.scrollTo({ top: 0, behavior: 'smooth' });
+      mainRef.current.scrollTo({ top: 0, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
     }
   }, []);
 
   if (loading) {
     return (
       <div className="project-config-page">
-        <PageHeader className="project-config-page__header" title="配置编辑" />
-        <LoadingState title="加载配置中…" description={`正在读取 ${configFileName}。`} />
+        <PageHeader className="project-config-page__header" title={translate("config:projectConfigPage.projectConfigPage_title_configEdit")} />
+        <LoadingState title={translate("config:projectConfigPage.projectConfigPage_title_loadConfig")} description={translate("config:projectConfigPage.projectConfigPage_description_pendingRead", { configFileName: configFileName })} />
       </div>
     );
   }
@@ -258,8 +360,8 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
   if (error && !config) {
     return (
       <div className="project-config-page">
-        <PageHeader className="project-config-page__header" title="配置编辑" />
-        <ErrorState title="加载配置失败" description={error} />
+        <PageHeader className="project-config-page__header" title={translate("config:projectConfigPage.projectConfigPage_title_configEdit")} />
+        <ErrorState title={translate("config:projectConfigPage.projectConfigPage_title_loadConfigFailed")} description={error} />
       </div>
     );
   }
@@ -268,7 +370,7 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
 
   return (
     <div className="project-config-page">
-      <PageHeader className="project-config-page__header" title="配置编辑" description={`可视化编辑项目配置文件 ${configFileName}`} />
+      <PageHeader className="project-config-page__header" title={translate("config:projectConfigPage.projectConfigPage_title_configEdit")} description={translate("config:projectConfigPage.projectConfigPage_description_editProjectConfigFile", { configFileName: configFileName })} />
 
       <div className="project-config-page__content">
         <ConfigSectionNav
@@ -284,23 +386,29 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
 
         <div className="project-config-page__main" ref={mainRef}>
           {error && (
-            <InlineFeedback tone="error" title="配置保存失败" description={error} />
+            <InlineFeedback tone="error" title={translate("config:projectConfigPage.projectConfigPageMain_title_configSaveFailed")} description={error} />
           )}
           {saveSuccess && (
-            <InlineFeedback className="inline-alert--floating" tone="success" title="配置已保存" description="当前项目配置已成功写入磁盘。" onDismiss={() => setSaveSuccess(false)} />
+            <InlineFeedback className="inline-alert--floating" tone="success" title={translate("config:projectConfigPage.projectConfigPageMain_title_configDoneSave")} description={translate("config:projectConfigPage.projectConfigPageMain_description_currentProjectConfigDoneSuccess")} onDismiss={() => setSaveSuccess(false)} />
           )}
 
-          <div key={yamlView ? 'yaml' : activeSection} className="section-fade-in">
+          <fieldset key={yamlView ? 'yaml' : activeSection} className="section-fade-in project-config-fields" disabled={saving}>
           {yamlView ? (
-            <Panel title="YAML源码" description="直接编辑YAML配置源码（只读预览，修改请使用上方表单）">
-              <pre className="yaml-preview">
-                {config ? JSON.stringify(config, null, 2) : '无配置数据'}
-              </pre>
+            <Panel title={translate("config:projectConfigPage.sectionFadeInProjectConfigFields_title_yAMLSource")} description={translate("config:projectConfigPage.sectionFadeInProjectConfigFields_description_editYAMLConfigSourcePreviewChange")}>
+              {yamlError ? (
+                <InlineFeedback tone="error" title={translate("config:projectConfigPage.yamlPreview_title_renderFailed")} description={yamlError} />
+              ) : (
+                <pre className="yaml-preview">
+                  {!config
+                    ? translate("config:projectConfigPage.yamlPreview_message_config")
+                    : yamlText ?? translate("config:projectConfigPage.yamlPreview_message_rendering")}
+                </pre>
+              )}
             </Panel>
           ) : (
             <>
               {activeSection === 'common' && (
-                <CommonSettingsSection
+                <TranslationSettingsSection
                   commonConfig={commonConfig}
                   onFieldChange={handleFieldChange}
                   onListFieldChange={handleListFieldChange}
@@ -336,11 +444,11 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
                 />
               )}
 
-              {activeSection === 'plugin' && (
-                <PluginSettingsSection
+              {activeSection === 'fileIO' && (
+                <FileIOSettingsSection
                   config={config}
                   filePlugins={filePlugins}
-                  textPlugins={textPlugins}
+                  onFieldChange={handleFieldChange}
                   onFilePluginChange={(value) => {
                     setConfig((prev) => {
                       const plugin = { ...((prev?.plugin as Record<string, unknown>) || {}) };
@@ -350,6 +458,14 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
                     setSaveSuccess(false);
                     setDirty(true);
                   }}
+                  onPluginSettingChange={handlePluginSettingChange}
+                />
+              )}
+
+              {activeSection === 'textProcessing' && (
+                <TextProcessingSettingsSection
+                  config={config}
+                  textPlugins={textPlugins}
                   onPluginSettingChange={handlePluginSettingChange}
                   onToggleTextPlugin={handleToggleTextPlugin}
                 />
@@ -369,10 +485,15 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
               {activeSection === 'problemAnalyze' && (
                 <ProblemAnalyzeSection
                   config={config}
+                  projectId={projectId}
+                  problemPlugins={problemPlugins}
+                  onPluginSettingChange={handlePluginSettingChange}
+                  onProblemPluginsChange={(plugins) => handleListFieldChange('plugin.problemPlugins', plugins)}
                   onProblemListChange={(lines) => {
                     setConfig((prev) => {
                       const pa = { ...((prev?.problemAnalyze as Record<string, unknown>) || {}) };
                       pa.problemList = lines;
+                      if (lines === null) delete pa.GPT35;
                       return prev ? { ...prev, problemAnalyze: pa } : prev;
                     });
                   }}
@@ -380,8 +501,13 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
                 />
               )}
 
+              {activeSection === 'projectGuideline' && (
+                <ProjectGuidelineSection projectId={projectId} projectDir={projectDir} />
+              )}
+
               {activeSection === 'retranslKey' && (
                 <RetranslKeySection
+                  key="retranslKey"
                   config={config}
                   onChange={(keys) => {
                     setConfig((prev) => {
@@ -394,9 +520,27 @@ export function ProjectConfigPage({ ctx }: { ctx: ProjectPageContext }) {
                   onDirty={() => { setSaveSuccess(false); setDirty(true); }}
                 />
               )}
+
+              {activeSection === 'problemFilterKey' && (
+                <ProblemFilterSection
+                  key="problemFilterKey"
+                  config={config}
+                  onChange={(field, keys) => {
+                    setConfig((prev) => {
+                      if (!prev) return prev;
+                      const common = { ...((prev.common as Record<string, unknown>) || {}) };
+                      common[field] = keys;
+                      return { ...prev, common };
+                    });
+                    setSaveSuccess(false);
+                    setDirty(true);
+                  }}
+                  onDirty={() => { setSaveSuccess(false); setDirty(true); }}
+                />
+              )}
             </>
           )}
-          </div>
+          </fieldset>
 
         </div>
       </div>

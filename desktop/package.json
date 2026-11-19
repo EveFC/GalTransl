@@ -1,20 +1,31 @@
 {
   "name": "galtransl-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "8.5.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:backend-connection": "node --test tests/backend-connection.test.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:i18n": "node --test tests/i18n.test.mjs",
+    "i18n:check": "node scripts/check-i18n.mjs",
     "preview": "vite preview",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "build:linux": "cd .. && python3 build_linux_x64.py",
+    "extraction:prepare": "python ../scripts/prepare_extraction.py"
   },
   "dependencies": {
+    "@formkit/auto-animate": "^0.10.0",
     "@tauri-apps/plugin-dialog": "^2.7.0",
+    "@tauri-apps/plugin-notification": "^2.4.0",
     "@tauri-apps/plugin-shell": "^2.3.5",
+    "i18next": "^26.4.2",
+    "motion": "^14.6.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "react-i18next": "^17.0.15",
     "react-router-dom": "^7.14.0"
   },
   "devDependencies": {
@@ -22,6 +33,7 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "react-test-renderer": "^18.3.1",
     "typescript": "^5.6.3",
     "vite": "^5.4.10"
   }

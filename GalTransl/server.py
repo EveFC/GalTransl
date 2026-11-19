@@ -1,29 +1,78 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import hashlib
 import json
+import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from typing import Any
 from urllib.parse import urlparse, parse_qs, unquote
 from uuid import uuid4
 
 import os
+import re
+import sys
 from datetime import datetime
 from yaml import safe_load, safe_dump
 
-from GalTransl import TRANSLATOR_SUPPORTED, INPUT_FOLDERNAME, OUTPUT_FOLDERNAME, CACHE_FOLDERNAME, GALTRANSL_VERSION, new_version
+from GalTransl import TRANSLATOR_SUPPORTED, INPUT_FOLDERNAME, OUTPUT_FOLDERNAME, CACHE_FOLDERNAME, GALTRANSL_VERSION, new_version, update_thread
+from GalTransl import GUIDELINES_FOLDERNAME, DEFAULT_GUIDELINE_NAME
 from GalTransl.Service import JobSpec, JobState, create_job_state, run_job
 from GalTransl.AppSettings import load_app_settings, save_app_settings
+from GalTransl.Extraction.http import route_extraction
+from GalTransl.AppUpdate import route_update
+from GalTransl.CustomBackground import (
+    load_custom_background,
+    save_custom_background_settings,
+    save_custom_background_image,
+    read_custom_background_image,
+    clear_custom_background,
+)
+from GalTransl.Cache import CACHE_TEMP_SUFFIX, _cache_get
+from GalTransl.CacheHistory import begin_edit, finish_edit, indexed_entries, project_lock
+from GalTransl.CacheHistoryHttp import cache_history_action
+from GalTransl.Search import (
+    cache_search_texts,
+    cache_search_matches,
+    cache_search_match_fragments,
+    CacheSearchCondition,
+    CACHE_SEARCH_MAX_ROWS,
+    CACHE_SEARCH_MAX_CHARS,
+    parse_cache_search_conditions,
+    parse_search_order as _parse_search_order,
+    select_search_hits as _sample_search_hits,
+)
 from GalTransl.DefaultProjectConfig import DEFAULT_PROJECT_CONFIG_YAML
+from GalTransl.RuntimePaths import (
+    BUNDLED_DICT_SEED_MARKER,
+    get_active_dict_dir,
+    get_plugins_dir,
+    resolve_dict_dir,
+    get_active_translation_guidelines_dir,
+)
+from GalTransl.ProblemFilter import filter_problem_text, summarize_problem_filter_hits
+from GalTransl.ProblemWhiteList import build_problem_white_list_index, is_problem_whitelisted
+from GalTransl.ProjectGuideline import (
+    PROJECT_GUIDELINE_FILENAME,
+    apply_project_guideline_edit,
+    project_guideline_path,
+    read_project_guideline,
+)
 from GalTransl.Backend.Prompts import (
     FORGAL_JSON_SYSTEM_PROMPT,
+    FORGAL_TOOL_SYSTEM_PROMPT,
+    FORNOVEL_TOOL_SYSTEM_PROMPT,
+    FORNOVEL_TOOL_TRANS_PROMPT,
+    FORGAL_TOOL_TRANS_PROMPT,
     FORGAL_JSON_TRANS_PROMPT,
-    FORGAL_TSV_SYSTEM,
-    FORGAL_TSV_TRANS_PROMPT_EN,
+    FORGAL_MARKDOWN_SYSTEM,
+    FORGAL_MARKDOWN_TRANS_PROMPT_EN,
     FORNOVEL_TRANS_PROMPT_EN,
     GalTransl_SYSTEM_PROMPT,
     GalTransl_TRANS_PROMPT_V3,
@@ -39,19 +88,28 @@ from GalTransl.server_runtime import (
     RuntimeRegistry,
     _CACHE_APPEND_SUFFIX,
     _ConcurrentLimitError,
+    _cache_entry_is_failed,
+    _cache_entry_is_translated,
+    _read_cache_append_rows,
     _has_newer_release,
     _normalize_project_dir,
     _normalize_retran_terms,
     _parse_runtime_job_started_at_ns,
     _safe_project_dir,
     _trim_preview,
+    begin_runtime_request,
     decode_project_dir,
     encode_project_dir,
+    end_runtime_request,
+    note_runtime_request,
+    record_runtime_usage,
     record_runtime_error,
     record_runtime_success,
     reset_runtime_project,
     update_runtime_status,
 )
+
+from GalTransl.Agent import AgentRuntime
 
 def _read_yaml_file(path: str) -> dict:
     """Read and parse a YAML file."""
@@ -59,21 +117,47 @@ def _read_yaml_file(path: str) -> dict:
         return safe_load(f) or {}
 
 
+def _dump_yaml_text(data: dict) -> str:
+    """Serialize config the same way _write_yaml_file does (also used by the YAML preview)."""
+    return safe_dump(data, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+
 def _write_yaml_file(path: str, data: dict) -> None:
     """Write data to a YAML file atomically."""
+    text = _dump_yaml_text(data)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        safe_dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        f.write(text)
     os.replace(tmp, path)
 
 
-def _list_dir_entries(dir_path: str, *, count_json_entries: bool = False) -> list[dict[str, Any]]:
-    """List files in a directory with basic metadata."""
+def _list_dir_entries(
+    dir_path: str,
+    *,
+    count_json_entries: bool = False,
+    skip_suffixes: tuple[str, ...] = (),
+    recursive: bool = False,
+) -> list[dict[str, Any]]:
+    """List files in a directory with basic metadata.
+
+    skip_suffixes 用于过滤掉不该露面的中间文件：缓存目录传 (CACHE_TEMP_SUFFIX,)，
+    免得界面与 Agent 把 `<缓存>.json.tmp` 这种快照残留当成一个缓存文件
+    （它既没有条目数、也读不出完整内容）。
+    """
     entries = []
     if not os.path.isdir(dir_path):
         return entries
-    for name in sorted(os.listdir(dir_path)):
+    names = (
+        sorted(os.path.relpath(os.path.join(root, name), dir_path).replace(os.sep, "/")
+               for root, _, files in os.walk(dir_path) for name in files)
+        if recursive else sorted(os.listdir(dir_path))
+    )
+    for name in names:
+        if skip_suffixes and name.endswith(tuple(skip_suffixes)):
+            continue
         full = os.path.join(dir_path, name)
+        if not _is_path_within(dir_path, full):
+            continue
         stat = os.stat(full) if os.path.isfile(full) else None
         entry = {
             "name": name,
@@ -126,8 +210,8 @@ def _is_safe_config_filename(filename: str) -> bool:
 
 
 def _is_path_within(base_dir: str, target_path: str) -> bool:
-    base_abs = os.path.abspath(base_dir)
-    target_abs = os.path.abspath(target_path)
+    base_abs = os.path.normcase(os.path.realpath(base_dir))
+    target_abs = os.path.normcase(os.path.realpath(target_path))
     try:
         common = os.path.commonpath([base_abs, target_abs])
     except ValueError:
@@ -149,6 +233,39 @@ def _dict_category_config_key(category: str) -> str:
     raise ValueError(f"invalid dictionary category: {category}")
 
 
+def _program_dir() -> str:
+    """程序所在目录：新建项目向导「父目录」的默认值。
+
+    打包后（PyInstaller）后端可执行文件在 <程序目录>/backend/ 下，往上一层才是程序目录；
+    开发时后端是从仓库根目录启动的（run_backend.py），进程工作目录就是它。
+    """
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        if os.path.basename(exe_dir).lower() == "backend":
+            return os.path.dirname(exe_dir)
+        return exe_dir
+    cwd = os.getcwd()
+    if cwd and os.path.isdir(cwd):
+        return cwd
+    # 兜底：本文件在 <程序目录>/GalTransl/ 下
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _is_dict_entry_line(line_item: str) -> bool:
+    """一行是不是有效词条。
+
+    口径与桌面端字典页的解析（parseRows）严格一致：注释（`//`、`#`、`\\\\`）、GenDic 写的
+    分区标题（----------↓人名↓----------）、空行、以及没有 Tab 的行都不算词条。否则文件列表里
+    的「N 条」会和卡片里实际显示的条目数对不上（比如 `# 格式为...` 这种表头注释被算成一条）。
+    """
+    if not line_item.strip() or "\t" not in line_item:
+        return False
+    if line_item.startswith(("\\\\", "//", "#")):
+        return False
+    # GenDic 生成字典的分区标题行（----------↓人名↓----------）不是词条
+    return not (line_item.startswith("---") and "↓" in line_item)
+
+
 def _read_dict_file_payload(file_path: str) -> dict[str, Any]:
     if not os.path.isfile(file_path):
         return {
@@ -165,11 +282,7 @@ def _read_dict_file_payload(file_path: str) -> dict[str, Any]:
         return {
             "path": file_path,
             "lines": lines,
-            "count": len([
-                line_item
-                for line_item in lines
-                if line_item.strip() and not line_item.startswith("\\\\") and not line_item.startswith("//")
-            ]),
+            "count": len([line_item for line_item in lines if _is_dict_entry_line(line_item)]),
             "mtime": mtime,
         }
     except Exception:
@@ -182,7 +295,16 @@ def _read_dict_file_payload(file_path: str) -> dict[str, Any]:
         }
 
 
-def _collect_project_dict_payload(project_dir: str, config_name: str) -> dict[str, Any]:
+def _resolve_common_dict_path(default_folder: Any, project_dir: str, file_key: str) -> str:
+    """配置里一条通用字典（不带 (project_dir) 前缀）对应的文件路径。只接受纯文件名。"""
+    from GalTransl.ConfigHelper import initDictList
+
+    if not _is_safe_dict_filename(file_key) or DICT_PROJECT_MARKER in file_key:
+        raise ValueError("invalid dictionary filename")
+    return initDictList([file_key], str(default_folder or "Dict"), project_dir)[0]
+
+
+def _collect_project_dict_payload(project_dir: str, config_name: str, include_common: bool = False) -> dict[str, Any]:
     if not _is_safe_config_filename(config_name):
         raise ValueError("invalid config filename")
     config_path = os.path.join(project_dir, config_name)
@@ -224,7 +346,7 @@ def _collect_project_dict_payload(project_dir: str, config_name: str) -> dict[st
             continue
         dict_contents[file_key] = _read_dict_file_payload(file_path)
 
-    return {
+    payload: dict[str, Any] = {
         "project_dir": project_dir,
         "config_file_name": config_name,
         "pre_dict_files": pre_files,
@@ -232,10 +354,28 @@ def _collect_project_dict_payload(project_dir: str, config_name: str) -> dict[st
         "post_dict_files": post_files,
         "dict_contents": dict_contents,
     }
+    if include_common:
+        # 当前配置启用的通用字典按原配置顺序并入各分类（加载顺序影响匹配）
+        default_folder = dict_cfg.get("defaultDictFolder", "Dict")
+        common_files: list[str] = []
+        for key, all_files in (("pre_dict_files", pre_all), ("gpt_dict_files", gpt_all), ("post_dict_files", post_all)):
+            payload[key] = all_files
+            for file_key in all_files:
+                if file_key.startswith(DICT_PROJECT_MARKER) or file_key in dict_contents:
+                    continue
+                common_files.append(file_key)
+                try:
+                    dict_contents[file_key] = _read_dict_file_payload(
+                        _resolve_common_dict_path(default_folder, project_dir, file_key)
+                    )
+                except ValueError as exc:
+                    dict_contents[file_key] = {"path": "", "lines": [], "count": 0, "mtime": None, "error": str(exc)}
+        payload["common_dict_files"] = common_files
+    return payload
 
 
 def _common_dict_directory() -> str:
-    return os.path.abspath("Dict")
+    return str(get_active_dict_dir())
 
 
 def _ensure_project_dict_file_configured(project_dir: str, config_name: str, category: str, filename: str) -> None:
@@ -318,7 +458,8 @@ def _collect_common_dict_payload() -> dict[str, Any]:
     files = [
         name
         for name in sorted(os.listdir(dict_dir))
-        if os.path.isfile(os.path.join(dict_dir, name)) and name != COMMON_DICT_CATEGORY_MAP
+        if os.path.isfile(os.path.join(dict_dir, name))
+        and name not in {COMMON_DICT_CATEGORY_MAP, BUNDLED_DICT_SEED_MARKER}
     ]
 
     pre_files: list[str] = []
@@ -351,16 +492,28 @@ def _collect_common_dict_payload() -> dict[str, Any]:
 
 
 _DEFAULT_TRANSLATOR_PROMPTS: dict[str, dict[str, str]] = {
+    "auto-translate": {
+        "system_prompt": "Automatically selects the underlying translation template.",
+        "user_prompt": "Model names containing sakura or galtransl (case-insensitive) use sakura-v1.0 or galtransl-v3 respectively; errors only halve the batch without switching templates. Otherwise, files with name/names fields use ForGal-tool → ForGal-markdown → ForGal-json. Other files use ForNovel-tool → ForNovel. Errors switch templates and halve the retry batch, with at most four retries (five attempts total). Each mode uses its own prompts.",
+    },
     "ForGal-json": {
         "system_prompt": FORGAL_JSON_SYSTEM_PROMPT,
         "user_prompt": FORGAL_JSON_TRANS_PROMPT,
     },
-    "ForGal-tsv": {
-        "system_prompt": FORGAL_TSV_SYSTEM,
-        "user_prompt": FORGAL_TSV_TRANS_PROMPT_EN,
+    "ForGal-tool": {
+        "system_prompt": FORGAL_TOOL_SYSTEM_PROMPT,
+        "user_prompt": FORGAL_TOOL_TRANS_PROMPT,
+    },
+    "ForGal-markdown": {
+        "system_prompt": FORGAL_MARKDOWN_SYSTEM,
+        "user_prompt": FORGAL_MARKDOWN_TRANS_PROMPT_EN,
+    },
+    "ForNovel-tool": {
+        "system_prompt": FORNOVEL_TOOL_SYSTEM_PROMPT,
+        "user_prompt": FORNOVEL_TOOL_TRANS_PROMPT,
     },
     "ForNovel": {
-        "system_prompt": FORGAL_TSV_SYSTEM,
+        "system_prompt": FORGAL_MARKDOWN_SYSTEM,
         "user_prompt": FORNOVEL_TRANS_PROMPT_EN,
     },
     "sakura-v1.0": {
@@ -415,36 +568,47 @@ def _build_prompt_templates_payload() -> dict[str, Any]:
     return {"templates": templates}
 
 
-_PROBLEM_TYPE_CATALOG: list[dict[str, str]] = [
-    {"name": "词频过高", "description": "某字在译文中重复大于 20 次（且远多于原文）。"},
-    {"name": "标点错漏", "description": "括号/引号/冒号等标点与原文不一致。"},
-    {"name": "残留日文", "description": "译文中残留日文平假名或片假名。"},
-    {"name": "丢失换行", "description": "译文缺少原文中的行内换行。"},
-    {"name": "多加换行", "description": "译文换行符比原文多，可能导致溢出。"},
-    {"name": "比日文长", "description": "译文长度超过原文 1.3 倍（常用，宽松阈值）。"},
-    {"name": "比日文长严格", "description": "译文长度超过原文（零容忍，严格阈值）。"},
-    {"name": "字典使用", "description": "没有按 GPT 字典的要求翻译。"},
-    {"name": "引入英文", "description": "原文无英文，但译文引入了英文单词。"},
-    {"name": "语言不通", "description": "译文包含大量非 GBK 字符（仅对中文目标语言生效）。"},
-    {"name": "缺控制符", "description": "译文缺少原文中的控制符（如 \\n、变量标记等）。"},
-    {"name": "独白男他", "description": "独白（无name）译文出现'他'。"},
+def _list_problem_types(project_dir: str = "") -> list[dict]:
+    from GalTransl.Problem import list_problem_types
     {"name": "LLM輸出簡體", "description": "LLM輸出簡體。"},
-]
+
+    return list_problem_types(project_dir)
 
 
-def _list_problem_types() -> list[dict[str, str]]:
-    """Return the list of problem types supported by the backend analyzer.
+def _guidelines_dir() -> str:
+    """全局翻译规范目录（默认使用程序目录，支持显式数据目录覆盖）。
 
-    Each entry has ``name`` (used in YAML config) and a short ``description``.
-    Kept in sync with :class:`GalTransl.ConfigHelper.CProblemType` and
-    :func:`GalTransl.Problem.find_problems`.
+    各项目的 config `common.gpt.translation_guideline` 从这里选一份；翻译时它拼在
+    项目规范之前（项目规范冲突时以项目规范为准）。
     """
-    return list(_PROBLEM_TYPE_CATALOG)
+    return str(get_active_translation_guidelines_dir())
+
+
+def _is_safe_guideline_filename(name: str) -> bool:
+    """规范文件名校验：单层文件名、不是隐藏文件、后缀只认 .md/.txt。
+
+    挡的是"往自己不该写的地方写"（`../x.md`、子目录、`.gitignore` 这类），所以宁严勿松。
+    """
+    if not name or name != os.path.basename(name) or name.startswith("."):
+        return False
+    return name.lower().endswith((".md", ".txt"))
+
+
+def _normalize_new_guideline_filename(raw: Any) -> str:
+    """新建时的文件名：没写后缀就补 .md（输入「MyStyle」得到「MyStyle.md」）。"""
+    name = str(raw or "").strip()
+    if not name:
+        raise ValueError("filename is required")
+    if not name.lower().endswith((".md", ".txt")):
+        name += ".md"
+    if not _is_safe_guideline_filename(name):
+        raise ValueError("invalid guideline filename")
+    return name
 
 
 def _list_translation_guidelines() -> list[str]:
     """List translation guideline filenames under the ``translation_guidelines`` folder."""
-    guidelines_dir = os.path.abspath("translation_guidelines")
+    guidelines_dir = _guidelines_dir()
     if not os.path.isdir(guidelines_dir):
         return []
     result: list[str] = []
@@ -452,35 +616,853 @@ def _list_translation_guidelines() -> list[str]:
         full = os.path.join(guidelines_dir, name)
         if not os.path.isfile(full):
             continue
-        lower = name.lower()
-        if lower.endswith(".md") or lower.endswith(".txt"):
+        if _is_safe_guideline_filename(name):
             result.append(name)
     return result
 
 
-def _scan_plugins() -> list[dict[str, Any]]:
-    """Scan the plugins directory and return plugin metadata."""
-    plugins_dir = os.path.abspath("plugins")
-    result = []
-    if not os.path.isdir(plugins_dir):
-        return result
-    for name in sorted(os.listdir(plugins_dir)):
-        yaml_path = os.path.join(plugins_dir, name, f"{name}.yaml")
-        if not os.path.isfile(yaml_path):
+def _list_translation_guideline_files() -> list[dict[str, Any]]:
+    """规范文件清单（含大小/修改时间/是否内置兜底），给「通用翻译规范管理」页用。"""
+    directory = _guidelines_dir()
+    if not os.path.isdir(directory):
+        return []
+    files: list[dict[str, Any]] = []
+    for name in sorted(os.listdir(directory)):
+        if not _is_safe_guideline_filename(name):
             continue
+        full = os.path.join(directory, name)
+        if not os.path.isfile(full):
+            continue
+        try:
+            stat = os.stat(full)
+        except OSError:
+            continue
+        files.append({
+            "name": name,
+            "size": int(stat.st_size),
+            "mtime": float(stat.st_mtime),
+            "builtin": name == DEFAULT_GUIDELINE_NAME,
+        })
+    return files
+
+
+# ---- 全局翻译规范的写操作（三个 POST 路由的处理函数）----
+# 都是「(响应体, 状态码)」的纯函数：请求体解析（_read_json_body）留在 handler 里，
+# 逻辑放这儿——do_POST 本身已经很长，再往里堆就超过静态分析的可分析规模了。
+
+
+def _create_guideline_from_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], HTTPStatus]:
+    """新建一份全局规范（重名报 409，**不覆盖**：覆盖该走 save）。"""
+    try:
+        filename = _normalize_new_guideline_filename(payload.get("filename"))
+        directory = _guidelines_dir()
+        os.makedirs(directory, exist_ok=True)
+        file_path = os.path.join(directory, filename)
+        if os.path.exists(file_path):
+            return {"error": f"「{filename}」已存在，换个文件名或直接编辑它"}, HTTPStatus.CONFLICT
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(str(payload.get("content", "")))
+        return {"success": True, "filename": filename, "path": file_path}, HTTPStatus.OK
+    except ValueError as exc:
+        return {"error": str(exc)}, HTTPStatus.BAD_REQUEST
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"failed to create guideline: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+def _save_guideline_from_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], HTTPStatus]:
+    """覆写一份全局规范；文件不存在报 404——不做"顺手新建"，文件名打错时宁可报错，
+    也别悄悄多出一份空规范。"""
+    filename = str(payload.get("filename", "")).strip()
+    if not _is_safe_guideline_filename(filename):
+        return {"error": "invalid guideline filename"}, HTTPStatus.BAD_REQUEST
+    file_path = os.path.join(_guidelines_dir(), filename)
+    if not os.path.isfile(file_path):
+        return (
+            {"error": f"guideline not found: {filename}", "available": _list_translation_guidelines()},
+            HTTPStatus.NOT_FOUND,
+        )
+    try:
+        content = str(payload.get("content", ""))
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return {"success": True, "filename": filename, "length": len(content)}, HTTPStatus.OK
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"failed to save guideline: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+def _delete_guideline_from_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], HTTPStatus]:
+    """删除一份全局规范。
+
+    兜底那份（DEFAULT_GUIDELINE_NAME）不许删：没配规范的项目翻译时会读它，删掉等于那些
+    项目直接报「读不到规范」。别的文件若正被某个项目配置引用，删了要用户自己去那份配置里
+    换一份——所以前端会二次确认（这里不猜、也不静默改别人的配置）。
+    """
+    filename = str(payload.get("filename", "")).strip()
+    if not _is_safe_guideline_filename(filename):
+        return {"error": "invalid guideline filename"}, HTTPStatus.BAD_REQUEST
+    if filename == DEFAULT_GUIDELINE_NAME:
+        return (
+            {"error": f"「{DEFAULT_GUIDELINE_NAME}」是未配置规范时的兜底文件，不能删除"},
+            HTTPStatus.BAD_REQUEST,
+        )
+    file_path = os.path.join(_guidelines_dir(), filename)
+    if not os.path.isfile(file_path):
+        return (
+            {"error": f"guideline not found: {filename}", "available": _list_translation_guidelines()},
+            HTTPStatus.NOT_FOUND,
+        )
+    try:
+        os.remove(file_path)
+        return {"success": True, "filename": filename}, HTTPStatus.OK
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"failed to delete guideline: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+# 全局翻译规范的写路由 → 处理函数（do_POST 里按这张表分派）
+_GUIDELINE_WRITE_ROUTES: dict[str, Any] = {
+    "/api/translation-guidelines/create": _create_guideline_from_payload,
+    "/api/translation-guidelines/save": _save_guideline_from_payload,
+    "/api/translation-guidelines/delete": _delete_guideline_from_payload,
+}
+
+
+def _init_file_plugin(project_dir: str, cfg, fname: str):
+    """定位并初始化单个文件插件，返回插件对象。
+
+    定位插件（PluginManager.locatePlugins + loadPlugins）本身不便宜；批量解析多个
+    文件时每个插件只初始化一次，之后逐个 load_file 即可（见 _ProjectFilePlugins）。
+    """
+    from GalTransl.GTPlugin import GTextPlugin, GFilePlugin
+    from GalTransl.yapsy.PluginManager import PluginManager
+
+    plugin_manager = PluginManager(
+        {"GTextPlugin": GTextPlugin, "GFilePlugin": GFilePlugin},
+        [str(get_plugins_dir()), os.path.join(project_dir, "plugins")],
+    )
+    plugin_manager.locatePlugins()
+    if "(project_dir)" in fname:
+        fname = fname.replace("(project_dir)", "")
+    info_path = os.path.join(project_dir, "plugins", fname, f"{fname}.yaml")
+    candidate = plugin_manager.getPluginCandidateByInfoPath(info_path)
+    if candidate is None:
+        info_path = os.path.join(str(get_plugins_dir()), fname, f"{fname}.yaml")
+        candidate = plugin_manager.getPluginCandidateByInfoPath(info_path)
+    if candidate is None:
+        raise RuntimeError(f"未找到文件插件: {fname}")
+    plugin_manager.setPluginCandidates([candidate])
+    plugin_manager.loadPlugins()
+    for plugin in plugin_manager.getPluginsOfCategory("GFilePlugin"):
+        plugin_conf = plugin.yaml_dict
+        if not isinstance(plugin_conf.get("Settings"), dict):  # 有的插件 yaml 没有 Settings 段
+            plugin_conf["Settings"] = {}
+        project_plugin_conf = cfg.getPluginConfigSection()
+        plugin_module = plugin_conf["Core"]["Module"]
+        if plugin_module in project_plugin_conf:
+            plugin_conf["Settings"].update(project_plugin_conf[plugin_module])
+        plugin_conf["Settings"]["project_dir"] = project_dir
+        project_conf = dict(cfg.getCommonConfigSection())
+        project_conf["project_dir"] = project_dir
+        plugin.plugin_object.gtp_init(plugin_conf, project_conf)
+        return plugin.plugin_object
+    raise RuntimeError(f"文件插件 {fname} 加载失败")
+
+
+class _ProjectFilePlugins:
+    """按文件取项目的文件插件：固定插件直接用它；filePlugin: auto 时逐个文件识别，
+    同一个插件只初始化一次。"""
+
+    def __init__(self, project_dir: str, config_file_name: str):
+        from GalTransl.ConfigHelper import CProjectConfig
+        from GalTransl.FilePluginDetect import is_auto, scan_extension_map
+
+        self.project_dir = project_dir
+        self.cfg = CProjectConfig(project_dir, config_file_name or "config.yaml")
+        self.fname = self.cfg.getFilePlugin()
+        if not self.fname:
+            raise RuntimeError("项目配置没有设置文件插件（plugin.filePlugin），无法解析输入文件")
+        self.auto = is_auto(self.fname)
+        self._ext_map = scan_extension_map(project_dir) if self.auto else None
+        self._objects: dict[str, Any] = {}
+
+    def get(self, file_path: str):
+        """返回 (插件对象, 插件名)。"""
+        from GalTransl.FilePluginDetect import detect_file_plugin
+
+        fname = self.fname
+        if self.auto:
+            fname = detect_file_plugin(file_path, self._ext_map)
+            if not fname:
+                raise RuntimeError(f"无法自动识别 {os.path.basename(file_path)} 的格式，没有可用的文件插件")
+        if fname not in self._objects:
+            self._objects[fname] = _init_file_plugin(self.project_dir, self.cfg, fname)
+        return self._objects[fname], fname
+
+
+def _normalize_input_entries(result: Any, fname: str) -> list[dict[str, Any]]:
+    """把文件插件 load_file 的结果规整成 [{index, name, pre_src, ...}]。"""
+    if isinstance(result, tuple):
+        result = result[0]
+    if not isinstance(result, list):
+        raise RuntimeError(f"文件插件 {fname} 返回了非列表结果")
+    entries: list[dict[str, Any]] = []
+    for i, item in enumerate(result):
+        # 文件插件返回原始条目：正文键是 message（GalTransl JSON 约定），
+        # 说话人键是 name。pre_src/post_jp 是管道后段 CSentense 的字段名，
+        # 这里一并兼容，映射成统一的 {index, name, pre_src} 给 Agent。
+        if isinstance(item, dict):
+            text = (
+                str(item.get("message", "") or "")
+                or str(item.get("pre_src", "") or "")
+                or str(item.get("post_jp", "") or "")
+                or str(item.get("src_msg", "") or "")
+            )
+            speaker = str(item.get("name", "") or "")
+            # Loader/translation cache use 1-based indexes when the
+            # source item does not provide one.  Preserve an explicit
+            # source index (some plugins emit it) and otherwise use the
+            # same 1-based fallback for both input and output parsing.
+            raw_index = item.get("index", i + 1)
+            try:
+                entry_index = int(raw_index)
+            except (TypeError, ValueError):
+                entry_index = i + 1
+            entry = {"index": entry_index, "name": speaker, "pre_src": text}
+            if speaker:
+                entry["speaker"] = speaker
+            entries.append(entry)
+        else:
+            entries.append({"index": i + 1, "name": "", "pre_src": str(item)})
+    return entries
+
+
+def _load_input_file_entries(project_dir: str, config_file_name: str, filename: str, folder: str | None = None, *, force_reload: bool = False) -> list[dict[str, Any]]:
+    """Parse a project input/output file into normalized entries via its file plugin.
+
+    Mirrors how the translation pipeline reads input (fplugins_load_file) so
+    the Agent sees exactly what would be translated. Entries carry an `index`
+    (1-based position in file unless the plugin supplies an explicit index)
+    for range reads. `folder` defaults to the input dir;
+    pass OUTPUT_FOLDERNAME to read a delivered output file instead.
+    """
+    target_folder = folder or INPUT_FOLDERNAME
+    file_path = os.path.join(project_dir, target_folder, filename)
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"file not found in {target_folder}: {filename}")
+
+    plugin_object, fname = _ProjectFilePlugins(project_dir, config_file_name).get(file_path)
+    loader = plugin_object.reload_file if force_reload else plugin_object.load_file
+    return _normalize_input_entries(loader(file_path), fname)
+
+
+def _cache_key_for_input_name(input_name: str) -> str:
+    """输入文件（相对 gt_input、用 '/' 分隔）对应的缓存文件名。
+
+    与 Frontend/LLMTranslate._build_runtime_file_maps 的规则一致：'/' 换成 '-}'，
+    没有 .json 后缀的补一个（foo.ks → foo.ks.json）。长文件运行时还会切块成 foo_1.json，
+    列目录时看不出来，所以判断「有没有缓存」时按同名 + `_<n>` 一起认（见 _cache_name_bases）。
+    """
+    cache_key = str(input_name or "").replace("/", "-}")
+    if cache_key and not cache_key.endswith(".json"):
+        cache_key += ".json"
+    return cache_key
+
+
+def _input_name_candidates(cache_filename: str) -> list[str]:
+    """缓存文件名反推回可能的输入文件相对路径，按可能性从高到低。
+
+    反向走一遍命名规则：去掉 .append.jsonl 与 .json、`-}` 还原成 '/'、切块后缀 `_<n>` 去掉；
+    每剥一层都留一个候选，因为输入文件本身可能就叫 foo.json（缓存也叫 foo.json），
+    也可能叫 foo.ks（缓存是 foo.ks.json）。
+    """
+    base = str(cache_filename or "")
+    if base.endswith(_CACHE_APPEND_SUFFIX):
+        base = base[: -len(_CACHE_APPEND_SUFFIX)]
+    if base.endswith(".json"):
+        base = base[: -len(".json")]
+
+    variants = [base, f"{base}.json"]
+    chunk_base = re.sub(r"_\d+$", "", base)
+    if chunk_base != base:
+        variants += [chunk_base, f"{chunk_base}.json"]
+
+    names: list[str] = []
+    for variant in variants:
+        name = variant.replace("-}", "/")
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _resolve_input_file_for_cache_name(project_dir: str, cache_filename: str) -> str | None:
+    """缓存文件名 → gt_input 里的相对路径；找不到返回 None。
+
+    只认落在 gt_input 里的相对路径：跳过绝对路径与带 `..` 的候选，避免读到项目外面去。
+    """
+    input_dir = os.path.join(project_dir, INPUT_FOLDERNAME)
+    if not os.path.isdir(input_dir):
+        return None
+    for name in _input_name_candidates(cache_filename):
+        if os.path.isabs(name) or ".." in name.split("/"):
+            continue
+        if os.path.isfile(os.path.join(input_dir, name)):
+            return name
+    return None
+
+
+def _output_files_for_cache_name(project_dir: str, cache_filename: str) -> list[str]:
+    """Find existing output files using the same cache naming rules as input files."""
+    output_dir = os.path.join(project_dir, OUTPUT_FOLDERNAME)
+    matches: list[str] = []
+    for name in _input_name_candidates(cache_filename):
+        if os.path.isabs(name) or ".." in name.split("/"):
+            continue
+        file_path = os.path.join(output_dir, name)
+        if _is_path_within(output_dir, file_path) and os.path.isfile(file_path):
+            matches.append(name)
+    return matches
+
+
+def _input_entries_as_cache_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把原文条目套成缓存条目的字段：只有 pre_src/post_src，译文与问题留空。
+
+    界面与 Agent 都按缓存条目的字段名取值（原文取 post_src || post_jp、译文取 pre_dst || pre_zh），
+    所以原文同时填进 pre_src 与 post_src——post_src 本来是送翻译前的润色文本，还没翻译就没有它，
+    拿原文顶上；pre_dst 给空串，明确表示「还没译文」。
+    """
+    converted: list[dict[str, Any]] = []
+    for entry in entries:
+        text = str(entry.get("pre_src", "") or "")
+        converted.append(
+            {
+                "index": int(entry.get("index", 0) or 0),
+                "name": entry.get("name", ""),
+                "pre_src": text,
+                "post_src": text,
+                "pre_dst": "",
+            }
+        )
+    return converted
+
+
+def _cache_name_bases(cache_names: set[str]) -> set[str]:
+    """把缓存文件名归一成「输入文件的缓存键」：去掉 .append.jsonl 与切块后缀 `_<n>`。
+
+    这样 foo.json（整篇）、foo.json.append.jsonl（增量）、foo.json_1.json（切块，见
+    LLMTranslate._build_runtime_file_maps：切块后缀插在 .json 之后）都归到 foo.json，
+    与输入文件一一对得上，判断「有没有缓存」就只是一次集合查询。
+
+    原名必须一起收：输入文件名本身就可能是 foo_1.json / OPEV_YUU_12_25.json 这种
+    「看着像切块」的名字（缓存也就叫这个名），只收剥掉 `_<n>` 的那个写法会把它们判成
+    「还没缓存」——同一个名字于是同时出现在缓存列表与未翻译列表里（界面按 key 渲染就重复了）。
+    """
+    bases: set[str] = set()
+    for name in cache_names:
+        base = name[: -len(_CACHE_APPEND_SUFFIX)] if name.endswith(_CACHE_APPEND_SUFFIX) else name
+        # ① 原名：输入文件就叫这个名字（含以 `_<n>` 结尾的情况）
+        bases.add(base if base.endswith(".json") else f"{base}.json")
+        # ② 剥掉 .json，再剥掉切块后缀 _<n>，最后按输入文件的规则补回 .json
+        # （切块名是 foo.json_1.json：`_1` 夹在原来那个 .json 与补上的 .json 之间）
+        if base.endswith(".json"):
+            base = base[: -len(".json")]
+        base = re.sub(r"_\d+$", "", base)
+        bases.add(base if base.endswith(".json") else f"{base}.json")
+    return bases
+
+
+def _search_cache_entries(
+    targets: list[tuple[str, list[Any], bool]],
+    *,
+    query: str,
+    pattern: Any,
+    field: str,
+    filter_keys: list[str],
+    context: int,
+    only_preceding: bool,
+    max_results: int | None,
+    offset: int,
+    order: str,
+    conditions: list[CacheSearchCondition] | None = None,
+) -> dict[str, Any]:
+    """跨文件收集命中；界面返回全文，Agent 请求按行数和字符预算续查。"""
+    all_hits: list[dict[str, Any]] = []
+    rows_by_file: dict[str, list[dict[str, Any] | None]] = {}
+    query_lower = query.lower()
+
+    def matches(text: str) -> bool:
+        return bool(pattern.search(text)) if pattern is not None else query_lower in text.lower()
+
+    for filename, entries, has_cache in targets:
+        rows: list[dict[str, Any] | None] = []
+        for pos, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                rows.append(None)
+                continue
+            src = str(
+                entry.get("post_src", "") or entry.get("post_jp", "")
+                or entry.get("pre_src", "") or entry.get("pre_jp", "")
+            )
+            dst = str(
+                entry.get("pre_dst", "") or entry.get("pre_zh", "")
+                or entry.get("proofread_dst", "") or entry.get("proofread_zh", "")
+            )
+            problem = filter_problem_text(entry.get("problem", ""), filter_keys)
+            flags = {"match_src": matches(src), "match_dst": matches(dst), "match_problem": matches(problem)}
+            rows.append({
+                "filename": filename, "index": entry.get("index", 0), "speaker": entry.get("name", ""),
+                "post_src": src, "pre_dst": dst, "problem": problem, "trans_by": entry.get("trans_by", ""),
+                "has_cache": has_cache,
+            })
+            matched = any(flags.values()) if field == "all" else flags.get(f"match_{field}", False)
+            if conditions is not None:
+                texts = {**cache_search_texts(entry), "problem": problem}
+                matched_fields = cache_search_matches(texts, conditions)
+                matched = bool(matched_fields)
+                flags = {"match_src": False, "match_dst": False, "match_problem": False, "match_name": False}
+                for matched_field in matched_fields:
+                    side = matched_field.rsplit("_", 1)[-1]
+                    flags[f"match_{side}"] = True
+                rows[-1]["matched_fields"] = cache_search_match_fragments(texts, conditions) if matched else ""
+                rows[-1].update({key: texts[key] for key in matched_fields if key in ("pre_src", "post_src", "pre_dst", "proofread_dst")})
+            if matched:
+                all_hits.append({"filename": filename, "pos": pos, "flags": flags})
+        rows_by_file[filename] = rows
+    if max_results is None:
+        selected = _sample_search_hits(all_hits, len(all_hits), 0, order)
+        results = _search_context_rows(
+            selected, context=context, only_preceding=only_preceding, file_rows=rows_by_file,
+        )
+        out = {"results": results, "total": len(all_hits), "offset": 0, "order": order,
+               "has_more": False, "next_offset": len(all_hits)}
+        if context:
+            out.update({"context": context, "returned_hits": len(selected), "returned": len(results)})
+        return out
+    candidates = _sample_search_hits(all_hits, min(max_results, CACHE_SEARCH_MAX_ROWS), offset, order)
+    selected: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+    truncated = False
+    context_limited = False
+    limited_by = None
+    # 给计数、续查信息和 Agent 的 Markdown 表头预留空间，正文与元信息一起不超过 10k。
+    row_budget = CACHE_SEARCH_MAX_CHARS - 1000
+    for hit in candidates:
+        candidate_rows = _search_context_rows(
+            [*selected, hit], context=context, only_preceding=only_preceding, file_rows=rows_by_file,
+        )
+        size = len(json.dumps(candidate_rows, ensure_ascii=False))
+        if len(candidate_rows) > CACHE_SEARCH_MAX_ROWS or size > row_budget:
+            limited_by = "rows" if len(candidate_rows) > CACHE_SEARCH_MAX_ROWS else "characters"
+            if selected:
+                break
+            # 一条命中加上下文就超预算：先只给该命中，必要时把长字段变成预览。
+            candidate_rows = _search_context_rows([hit], context=0, only_preceding=True, file_rows=rows_by_file)
+            context_limited = context > 0
+            row = candidate_rows[0]
+            while len(json.dumps(candidate_rows, ensure_ascii=False)) > row_budget:
+                row["truncated"] = True
+                truncated = True
+                if isinstance(row.get("speaker"), list):
+                    row["speaker"] = "/".join(str(part) for part in row["speaker"])
+                key = max((k for k, v in row.items() if isinstance(v, str) and k != "filename"),
+                          key=lambda k: len(row[k]))
+                excess = len(json.dumps(candidate_rows, ensure_ascii=False)) - row_budget
+                row[key] = row[key][:max(0, len(row[key]) - excess - 1)] + "…"
+        selected.append(hit)
+        results = candidate_rows
+    out: dict[str, Any] = {"results": results, "total": len(all_hits), "offset": offset, "order": order}
+    if context:
+        out.update({"context": context, "returned_hits": len(selected), "returned": len(results)})
+    out.update({"has_more": offset + len(selected) < len(all_hits), "next_offset": offset + len(selected)})
+    if limited_by:
+        out["limited_by"] = limited_by
+    if truncated:
+        out["truncated"] = True
+    if context_limited:
+        out["context_limited"] = True
+    return out
+
+
+def _list_uncached_input_files(
+    project_dir: str, config_file_name: str, cache_names: set[str]
+) -> list[dict[str, Any]]:
+    """gt_input 里还没有缓存的输入文件（只列文件插件认得的）。
+
+    「浏览文本」页要能看还没翻译的文件，而这些文件在 Cache/ 里根本没有对应缓存，光看缓存目录
+    是发现不了的。缓存键按运行时的命名规则算（'/' → '-}'、补 .json），切块与增量缓存一并算作
+    「已有缓存」，所以真正列出来的是「一篇都没翻过」的文件。
+    """
+    input_dir = os.path.join(project_dir, INPUT_FOLDERNAME)
+    if not os.path.isdir(input_dir):
+        return []
+
+    from GalTransl.FilePluginDetect import detect_file_plugins
+    from GalTransl.Utils import get_file_list
+
+    bases = _cache_name_bases(cache_names)
+    pending: list[tuple[str, str, str]] = []
+    for file_path in get_file_list(input_dir):
+        relative = os.path.relpath(file_path, input_dir).replace(os.sep, "/")
+        if relative.startswith("..") or "__MACOSX" in relative:
+            continue
+        cache_key = _cache_key_for_input_name(relative)
+        # bases 认切块/增量，cache_names 是缓存目录里的原名：两边都不认才叫「还没缓存」。
+        # 认原名是最后一道保险——同一个名字同时出现在两个列表里，界面就会重复渲染。
+        if cache_key in bases or cache_key in cache_names:
+            continue
+        pending.append((relative, cache_key, file_path))
+    if not pending:
+        return []
+
+    # 认不出格式的文件（没有文件插件的 txt、缩略图之类）当不了输入文件，别列进界面
+    detected = detect_file_plugins([path for _, _, path in pending], project_dir)
+
+    files: list[dict[str, Any]] = []
+    for relative, cache_key, file_path in pending:
+        if not detected.get(file_path):
+            continue
+        stat = os.stat(file_path)
+        files.append(
+            {
+                # name 用缓存键（界面左侧列的一直是缓存名，保持一致），input_name 是 gt_input 里的路径
+                "name": cache_key,
+                "input_name": relative,
+                "is_file": True,
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "has_cache": False,
+            }
+        )
+    return files
+
+
+def _parse_search_offset(payload: dict[str, Any]) -> int:
+    """搜索翻页的 offset：跳过前 N 条命中（前后文行不算）。
+
+    非法值抛 ValueError 由调用方转 400——与 context 的校验风格一致：翻页跳错位置会静默
+    丢掉一批命中，宁可当场报错。
+    """
+    try:
+        return max(0, int(payload.get("offset", 0) or 0))
+    except (TypeError, ValueError):
+        raise ValueError("offset must be a non-negative integer")
+
+
+def _search_context_rows(
+    selected: list[dict[str, Any]],
+    *,
+    context: int,
+    only_preceding: bool,
+    file_rows: dict[str, list[dict[str, Any] | None]],
+) -> list[dict[str, Any]]:
+    """按选中的命中展开上下文，重叠行去重；没有上下文时保持命中排序。"""
+    if not selected:
+        return []
+    if not context:
+        return [{**file_rows[h["filename"]][h["pos"]], **h["flags"]} for h in selected]
+    wanted_by_file: dict[str, set[int]] = {}
+    selected_keys = {(str(h["filename"]), int(h["pos"])) for h in selected}
+    hit_flags = {(str(h["filename"]), int(h["pos"])): h["flags"] for h in selected}
+    file_order: list[str] = []
+    for hit in selected:
+        name = str(hit["filename"])
+        if name not in wanted_by_file:
+            wanted_by_file[name] = set()
+            file_order.append(name)
+        pos = int(hit["pos"])
+        wanted_by_file[name].add(pos)
+        rows = file_rows[name]
+        after = 0 if only_preceding else context
+        for row_pos in range(pos - context, pos + after + 1):
+            if 0 <= row_pos < len(rows):
+                wanted_by_file[name].add(row_pos)
+
+    result: list[dict[str, Any]] = []
+    for name in file_order:
+        rows = file_rows[name]
+        for pos in sorted(wanted_by_file[name]):
+            if rows[pos] is None:
+                continue
+            row = dict(rows[pos])
+            key = (name, pos)
+            if key not in selected_keys:
+                row.update({flag: False for flag in selected[0]["flags"]})
+                row.pop("matched_fields", None)
+            else:
+                row.update(hit_flags[key])
+            result.append(row)
+    return result
+
+
+def _input_repeats(
+    project_dir: str,
+    config_file_name: str,
+    *,
+    query: str = "",
+    min_count: int = 2,
+    min_length: int = 1,
+    max_results: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """统计原文里**整句完全相同**的句子（去掉首尾空白后比较），按出现次数从多到少排。
+
+    用途在翻译之前：重复句（系统文本、选项、口头禅、固定招呼）各批次独立翻译时容易译得
+    不一样，先知道哪些句子重复、重复多少次，才能提前把固定译法写进字典或规范。
+
+    只按正文分组，不区分说话人——同一句话由不同角色说出来时该不该同译，要由读的人
+    结合 speakers 判断，所以把说话人作为信息带出来而不是拆成多组。读的是文件插件解析出
+    的原始条目（文本插件与译前字典还没跑），与 /input/search 同口径；单个文件解析失败
+    照样报在 files_failed 里，不影响其它文件。
+
+    不含任何文字或数字的句子（「……」、！？、♪ 这类纯符号句）不参与分组：它们在哪个
+    项目里都排在最前面，却没有译法可定，只会把真正要看的重复句挤到后面。数量单独报在
+    symbol_only_sentences 里，仍计入 sentences_total。
+    """
+    input_dir = os.path.join(project_dir, INPUT_FOLDERNAME)
+    groups: dict[str, dict[str, Any]] = {}
+    files_failed: list[str] = []
+    sentences_total = 0
+    symbol_only = 0
+    if os.path.isdir(input_dir):
+        names = sorted(
+            os.path.relpath(os.path.join(root, name), input_dir).replace(os.sep, "/")
+            for root, _, files in os.walk(input_dir) for name in files
+        )
+        for name in names:
+            file_path = os.path.join(input_dir, name)
+            if not os.path.isfile(file_path) or not _is_path_within(input_dir, file_path):
+                continue
+            try:
+                entries = _load_input_file_entries(project_dir, config_file_name, name)
+            except Exception:
+                files_failed.append(name)
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                text = str(entry.get("pre_src", "") or "").strip()
+                if not text:
+                    continue
+                sentences_total += 1
+                if not any(char.isalnum() for char in text):
+                    symbol_only += 1
+                    continue
+                group = groups.get(text)
+                if group is None:
+                    group = groups[text] = {
+                        "count": 0, "files": set(), "speakers": {},
+                        "first": f"{name}:{entry.get('index', 0)}",
+                    }
+                group["count"] += 1
+                group["files"].add(name)
+                speaker = str(entry.get("name", "") or "")
+                group["speakers"][speaker] = group["speakers"].get(speaker, 0) + 1
+    repeated = [(text, group) for text, group in groups.items() if group["count"] >= min_count]
+    needle = query.lower()
+    matched = [
+        (text, group) for text, group in repeated
+        if len(text) >= min_length and (not needle or needle in text.lower())
+    ]
+    # 稳定排序：次数相同的保持首次出现的先后（dict 的插入顺序）
+    matched.sort(key=lambda item: -item[1]["count"])
+    results: list[dict[str, Any]] = []
+    for text, group in matched[offset:offset + max_results]:
+        speakers = sorted(group["speakers"].items(), key=lambda item: -item[1])
+        results.append({
+            "src": text,
+            "count": group["count"],
+            "files": len(group["files"]),
+            # 最多列 3 个说话人，空串是旁白/无 name 的条目
+            "speakers": [{"name": speaker, "count": count} for speaker, count in speakers[:3]],
+            "speakers_total": len(speakers),
+            "first": group["first"],
+        })
+    out: dict[str, Any] = {
+        "results": results,
+        "total": len(matched),
+        "offset": offset,
+        "sentences_total": sentences_total,
+        "unique_sentences": len(groups),
+        "symbol_only_sentences": symbol_only,
+        # 全项目口径（不受 query/min_length 影响）：重复句一共占了多少条原文
+        "repeated_sentences": len(repeated),
+        "repeated_occurrences": sum(group["count"] for _, group in repeated),
+    }
+    if files_failed:
+        out["files_failed"] = files_failed
+    return out
+
+
+def _search_input_dir(
+    project_dir: str,
+    config_file_name: str,
+    *,
+    query: str,
+    field: str = "all",
+    filename: str = "",
+    context: int = 0,
+    max_results: int = 500,
+    offset: int = 0,
+    only_preceding: bool = False,
+    pattern: Any = None,
+    order: str = "name",
+    folder: str = INPUT_FOLDERNAME,
+) -> dict[str, Any]:
+    """在原文或最终输出中搜索关键词（默认原文，输出由 _search_output_dir 调用）。
+
+    与 /cache/search 同一套语义：命中上限只算命中本身（前后文是搭着给的，不占配额）、
+    context 是"顺带带出来的前后文"、only_preceding 只给上文（Agent 默认开，省 token；
+    界面那边不传，仍给两边）、total 照实报全部命中数、offset 是跳过的命中数
+    （翻页用，跳过的那几条命中连同它们的上下文都不带）。区别只在搜的对象——原文要过
+    文件插件解析（见 _load_input_file_entries），每次搜索都得把涉及的输入文件读一遍，
+    所以比搜缓存慢，这也正是 filename 参数的意义。
+
+    field：all | src（原文正文，输出用 dst）| name（说话人）。pattern 非空时按正则匹配，
+    否则按大小写不敏感的子串匹配（与缓存搜索一致）。
+    """
+
+    def _hit(text: str) -> bool:
+        if pattern is not None:
+            return bool(pattern.search(text))
+        return query.lower() in text.lower()
+
+    input_dir = os.path.join(project_dir, folder)
+    is_output = folder == OUTPUT_FOLDERNAME
+    text_field = "dst" if is_output else "src"
+    all_hits: list[dict[str, Any]] = []
+    file_rows: dict[str, list[dict[str, Any] | None]] = {}
+    files_failed: list[str] = []
+    if os.path.isdir(input_dir):
+        # 输出可能保留子目录结构；返回相对路径，能直接交给 read_output。
+        names = (
+            sorted(os.path.relpath(os.path.join(root, name), input_dir).replace(os.sep, "/")
+                   for root, _, files in os.walk(input_dir) for name in files)
+        )
+        for name in names:
+            if filename and name != filename:
+                continue
+            file_path = os.path.join(input_dir, name)
+            if not os.path.isfile(file_path) or not _is_path_within(input_dir, file_path):
+                continue
+            try:
+                entries = (
+                    _load_input_file_entries(project_dir, config_file_name, name, folder=OUTPUT_FOLDERNAME)
+                    if is_output else _load_input_file_entries(project_dir, config_file_name, name)
+                )
+            except Exception:
+                # 单个文件解析不了（插件/格式问题）不影响其它文件：搜索是只读的辅助手段，
+                # 尽量给出能给的，别整个失败。但**必须报上去**——静默跳过会让"这个文件里
+                # 没有"和"这个文件根本没读"看起来一样。要诊断它用 GET /input/:filename。
+                files_failed.append(name)
+                continue
+            normalized_rows: list[dict[str, Any] | None] = []
+            for pos, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    normalized_rows.append(None)
+                    continue
+                src_text = str(entry.get("pre_src", "") or "")
+                name_text = str(entry.get("name", "") or "")
+                match_src = _hit(src_text)
+                match_name = bool(name_text) and _hit(name_text)
+                normalized_rows.append({
+                    "filename": name,
+                    "index": entry.get("index", 0),
+                    "speaker": entry.get("name", ""),
+                    text_field: entry.get("pre_src", ""),
+                })
+                if field == text_field and not match_src:
+                    continue
+                if field == "name" and not match_name:
+                    continue
+                if field == "all" and not match_src and not match_name:
+                    continue
+                all_hits.append({
+                    "filename": name,
+                    "pos": pos,
+                    "flags": {f"match_{text_field}": match_src, "match_name": match_name},
+                })
+            file_rows[name] = normalized_rows
+    selected = _sample_search_hits(all_hits, max_results, offset, order)
+    results = _search_context_rows(
+        selected, context=context, only_preceding=only_preceding, file_rows=file_rows,
+    )
+    out: dict[str, Any] = {"results": results, "total": len(all_hits), "offset": offset, "order": order}
+    if context > 0:
+        out.update({"context": context, "returned_hits": len(selected), "returned": len(results)})
+    if files_failed:
+        out["files_failed"] = files_failed
+    if is_output:
+        out["source"] = "output"
+        if not file_rows and not files_failed:
+            out["note"] = (
+                f"输出文件 {filename} 不存在；请使用 gt_output 中的实际相对路径。"
+                if filename else "gt_output 是空的，请用 rebuild 重建结果。"
+            )
+    return out
+
+
+def _search_output_dir(project_dir: str, config_file_name: str, **kwargs: Any) -> dict[str, Any]:
+    """在实际交付物中搜索；与原文搜索共用分页、采样与上下文规则。"""
+    return _search_input_dir(project_dir, config_file_name, folder=OUTPUT_FOLDERNAME, **kwargs)
+
+
+def _count_input_file_sentences(
+    project_dir: str, config_file_name: str, filenames: list[str]
+) -> dict[str, int | None]:
+    """统计每个输入文件解析后的条数（GET /files?counts=1 用；失败给 None）。
+
+    这里的条数是文件插件解析出的**原始条目数**——文本插件（如 skipNoJP 跳过没有
+    日文的句子）还没跑，所以它通常**大于**真正会送去翻译的句数。只作工作量估计用；
+    已经有缓存的文件由调用方（Agent）改用缓存条数（与进度/ETA 同口径）。
+    """
+    counts: dict[str, int | None] = {name: None for name in filenames}
+    try:
+        plugins = _ProjectFilePlugins(project_dir, config_file_name)
+    except Exception:
+        return counts
+    for name in filenames:
+        try:
+            file_path = os.path.join(project_dir, INPUT_FOLDERNAME, name)
+            plugin_object, _fname = plugins.get(file_path)
+            result = plugin_object.load_file(file_path)
+            if isinstance(result, tuple):
+                result = result[0]
+            counts[name] = len(result) if isinstance(result, list) else None
+        except Exception:
+            counts[name] = None
+    return counts
+
+
+def _scan_plugins(project_dir: str = "") -> list[dict[str, Any]]:
+    """Scan the plugins directory and return plugin metadata."""
+    from GalTransl.PluginSettings import normalize_settings_schema
+    plugins_dir = str(get_plugins_dir())
+    result = []
+    candidates = {}
+    roots = [plugins_dir]
+    if project_dir:
+        roots.append(os.path.join(project_dir, "plugins"))
+    for root in roots:
+        if os.path.isdir(root):
+            for name in os.listdir(root):
+                path = os.path.join(root, name, f"{name}.yaml")
+                if os.path.isfile(path):
+                    candidates[name] = path
+    for name, yaml_path in sorted(candidates.items()):
         try:
             info = _read_yaml_file(yaml_path)
             core = info.get("Core", {})
+            documentation = info.get("Documentation") or {}
             settings = info.get("Settings", {})
             result.append({
                 "name": name,
                 "display_name": core.get("Name", name),
                 "version": core.get("Version", ""),
                 "author": core.get("Author", ""),
-                "description": core.get("Description", ""),
+                "description": documentation.get("Description", core.get("Description", "")),
                 "type": core.get("Type", "unknown").lower(),
                 "module": core.get("Module", name),
+                "project_local": bool(project_dir) and os.path.normcase(os.path.abspath(os.path.dirname(os.path.dirname(yaml_path)))) == os.path.normcase(os.path.abspath(os.path.join(project_dir, "plugins"))),
                 "settings": settings,
+                "settings_schema": normalize_settings_schema(settings, info.get("SettingsSchema")),
             })
         except Exception:
             continue
@@ -785,6 +1767,11 @@ INDEX_HTML = """<!DOCTYPE html>
 """
 
 
+# Global Agent runtime registry. One per process (single server instance);
+# does not need the per-server config that JobRegistry carries.
+AGENT_REGISTRY: AgentRuntime = AgentRuntime()
+
+
 class JobRegistry:
     def __init__(self, max_workers: int | None = None) -> None:
         self._jobs: dict[str, JobState] = {}
@@ -855,6 +1842,15 @@ class JobRegistry:
         translator = str(payload.get("translator", "")).strip()
         backend_profile = str(payload.get("backend_profile", "")).strip()
         backend_profile_data = payload.get("backend_profile_data")
+        input_files = payload.get("input_files")
+        if input_files is not None and not isinstance(input_files, list):
+            raise ValueError("input_files must be a list of filenames")
+        if input_files:
+            input_files = [str(f).strip() for f in input_files if str(f).strip()]
+
+        from GalTransl.TranslationScope import parse_sentence_range
+
+        sentence_range = parse_sentence_range(payload.get("sentence_range"), input_files or [], translator)
 
         if not project_dir:
             raise ValueError("project_dir is required")
@@ -884,6 +1880,8 @@ class JobRegistry:
                 translator=translator,
                 backend_profile=backend_profile,
                 backend_profile_data=backend_profile_data if isinstance(backend_profile_data, dict) else {},
+                input_files=input_files or [],
+                sentence_range=sentence_range,
             )
             state = create_job_state(spec)
             reset_runtime_project(project_dir)
@@ -898,6 +1896,213 @@ class JobRegistry:
             run_job(spec, state, stop_event=stop_event)
         finally:
             self.clear_project_stop(spec.project_dir)
+
+
+def _cache_entries_to_trans_list(entries, filename, white_index):
+    """把缓存条目转成 CSentense 列表，供问题检测使用。
+
+    两个跳过检查的来源在这里合流：条目自己存的 skip_check，以及项目白名单
+    （common.problemWhiteList）里点名了 (filename, index) 的条目——白名单等价于
+    给该条勾上 skip_check，find_problems 会清空其 problem。
+    """
+    from GalTransl.CSentense import CSentense
+
+    trans_list = []
+    for e in entries:
+        speaker = e.get("name", "")
+        if isinstance(speaker, list):
+            speaker = "/".join(speaker)
+        pre_src = e.get("pre_src", "") or e.get("pre_jp", "")
+        post_src = e.get("post_src", "") or e.get("post_jp", "")
+        pre_dst = e.get("pre_dst", "") or e.get("pre_zh", "")
+        proofread_dst = e.get("proofread_dst", "") or e.get("proofread_zh", "")
+        if post_src == "":
+            continue
+        s = CSentense(pre_src, speaker if speaker else "", e.get("index", 0))
+        s.post_src = pre_src
+        s.pre_dst = pre_dst
+        s.proofread_zh = proofread_dst
+        s.post_dst = proofread_dst if proofread_dst else pre_dst
+        s.trans_by = e.get("trans_by", "")
+        s.proofread_by = e.get("proofread_by", "")
+        s.trans_conf = e.get("trans_conf", 0)
+        s.proofread_comment = e.get("proofread_comment", e.get("doub_content", "")) or ""
+        s.unknown_proper_noun = e.get("unknown_proper_noun", "")
+        s.skip_check = bool(e.get("skip_check", False)) or is_problem_whitelisted(
+            white_index, filename, e.get("index", "")
+        )
+        trans_list.append(s)
+    return trans_list
+
+
+def _problem_revision(project_dir: str, config_name: str) -> str | None:
+    """流式核对数据源内容，未变化时跳过 JSON 解析及问题清单重建。
+
+    文件时间戳可能粒度不足；Windows 的 ctime 还是创建时间，不能用于
+    可靠区分连续的同大小改写。内容摘要不依赖文件系统的时间精度。
+    """
+    cache_dir = os.path.join(project_dir, CACHE_FOLDERNAME)
+    try:
+        names = sorted(name for name in os.listdir(cache_dir) if name.endswith(".json"))
+    except FileNotFoundError:
+        names = []
+    except OSError:
+        return None
+    sources = [("config", os.path.join(project_dir, config_name))]
+    sources.extend((name, os.path.join(cache_dir, name)) for name in names)
+    signature = []
+    for name, path in sources:
+        try:
+            stat = os.stat(path)
+        except FileNotFoundError:
+            signature.append((name, None))
+            continue
+        except OSError:
+            return None  # 无法确认数据源时，不能把旧清单当成仍有效。
+        digest = hashlib.sha256()
+        try:
+            with open(path, "rb") as source:
+                while chunk := source.read(1024 * 1024):
+                    digest.update(chunk)
+        except OSError:
+            return None  # 删除或读取失败时不能沿用旧版本。
+        signature.append((name, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino, digest.hexdigest()))
+    return hashlib.sha256(json.dumps(signature).encode("utf-8")).hexdigest()
+
+
+def _iter_problem_cache_entries(project_dir, white_index):
+    """扫缓存目录，逐个产出未被问题白名单豁免的条目 (缓存文件名, 条目 dict)。
+
+    /problems 与 /problem_filter_stats 共用同一个扫描口径：白名单命中的条目等价于给该条
+    勾了 skip_check，任何「问题」出口都不该再看到它——两处各写一遍迟早会走偏。
+    读不动的缓存文件直接跳过（文件刚被删/正在写），不因此让整次扫描失败。
+    """
+    import orjson
+
+    cache_dir = os.path.join(project_dir, CACHE_FOLDERNAME)
+    if not os.path.isdir(cache_dir):
+        return
+    for name in sorted(os.listdir(cache_dir)):
+        fp = os.path.join(cache_dir, name)
+        if not os.path.isfile(fp) or not fp.endswith(".json"):
+            continue
+        try:
+            with open(fp, "rb") as f:
+                entries = orjson.loads(f.read())
+        except Exception:
+            continue
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            if is_problem_whitelisted(white_index, name, e.get("index", "")):
+                continue
+            yield name, e
+
+
+def _save_cache_entries(project_dir, filename, entries, config_name):
+    file_path = os.path.join(project_dir, CACHE_FOLDERNAME, filename)
+    import orjson
+    with open(file_path, "wb") as f:
+        f.write(orjson.dumps(entries, option=orjson.OPT_INDENT_2))
+
+    # Rebuild: re-derive problem and post_dst_preview fields
+    try:
+        from GalTransl.Problem import find_problems, finalize_problem_plugins
+        from GalTransl.Frontend.LLMTranslate import preprocess_trans_list, postprocess_trans_list
+
+        # Load project config and dictionaries for rebuild
+        proj_config = None
+        pre_dic = None
+        post_dic = None
+        gpt_dic = None
+        tPlugins = []
+        try:
+            from GalTransl.ConfigHelper import CProjectConfig, initDictList
+            from GalTransl.Dictionary import CNormalDic, CGptDict
+            proj_config = CProjectConfig(project_dir, config_name)
+            dict_cfg = proj_config.getDictCfgSection()
+            pre_dic_list = dict_cfg.get("preDict", [])
+            post_dic_list = dict_cfg.get("postDict", [])
+            gpt_dic_list = dict_cfg.get("gpt.dict", [])
+            default_dic_dir = dict_cfg.get("defaultDictFolder", "")
+            pre_dic = CNormalDic(
+                initDictList(pre_dic_list, default_dic_dir, project_dir)
+            )
+            post_dic = CNormalDic(
+                initDictList(post_dic_list, default_dic_dir, project_dir)
+            )
+            gpt_dic = CGptDict(
+                initDictList(gpt_dic_list, default_dic_dir, project_dir)
+            )
+            if dict_cfg.get("sortDict", True):
+                pre_dic.sort_dic()
+                post_dic.sort_dic()
+                gpt_dic.sort_dic()
+            # Load text plugins
+            try:
+                tPlugins = proj_config.tPlugins
+            except Exception:
+                tPlugins = []
+        except Exception:
+            pass  # If config loading fails, skip dict processing
+
+        # Build CSentense list from saved entries
+        # 白名单命中的条目等价于勾了 skip_check：重建问题时不检测、并清掉旧 problem
+        white_index = build_problem_white_list_index(
+            RUNTIME_PROGRESS_CACHE.get_problem_white_list(project_dir, config_name)
+        )
+        trans_list = _cache_entries_to_trans_list(entries, filename, white_index)
+
+        # Link prev/next
+        for i, s in enumerate(trans_list):
+            if i > 0:
+                s.prev_tran = trans_list[i - 1]
+            if i < len(trans_list) - 1:
+                s.next_tran = trans_list[i + 1]
+
+        # Pre-processing and post-processing (shared with LLMTranslate)
+        if pre_dic and proj_config:
+            preprocess_trans_list(trans_list, proj_config, pre_dic, tPlugins or None)
+        if post_dic and proj_config:
+            postprocess_trans_list(trans_list, proj_config, post_dic, tPlugins or None)
+
+        # Run find_problems
+        verification = "unknown"
+        if trans_list:
+            try:
+                find_problems(trans_list, proj_config, gpt_dic)
+                if proj_config is not None:
+                    verification = "checked"
+            except Exception:
+                pass  # If problem detection fails, skip
+            finally:
+                if proj_config is not None:
+                    finalize_problem_plugins(proj_config)
+
+        # Update entries with problem and post_dst_preview
+        idx = 0
+        for e in entries:
+            post_src_val = e.get("post_src", "") or e.get("post_jp", "")
+            if post_src_val == "":
+                continue
+            if idx < len(trans_list):
+                tran = trans_list[idx]
+                if verification == "checked":
+                    if tran.problem:
+                        e["problem"] = tran.problem
+                    elif "problem" in e:
+                        del e["problem"]
+                e["post_dst_preview"] = tran.post_dst
+                idx += 1
+
+        # Re-save with updated fields
+        with open(file_path, "wb") as f:
+            f.write(orjson.dumps(entries, option=orjson.OPT_INDENT_2))
+
+        return {"success": True, "filename": filename, "entries": entries, "verification": verification}
+    except Exception:
+        # Rebuild failed, but original save succeeded
+        return {"success": True, "filename": filename, "verification": "unknown"}
 
 
 def build_handler(registry: JobRegistry):
@@ -916,7 +2121,111 @@ def build_handler(registry: JobRegistry):
         # Routing helpers
         # -----------------------------------------------------------------
 
+        def _route_memories(self, method: str) -> bool:
+            parsed = urlparse(self.path)
+            if (method, parsed.path) not in (("GET", "/api/agent/memories"), ("POST", "/api/agent/memories/delete"),
+                    ("POST", "/api/agent/memories/save")):
+                return False
+            from contextlib import closing
+            import sqlite3
+            from GalTransl.Agent.mnemon_store import Forget, MnemonStore, Remember, memory_directory
+            from GalTransl.Agent.models import AgentToolError
+            from GalTransl.Extraction.http import trusted_request
+
+            if not trusted_request(self):
+                self._send_json({"error": "Memory management is only available to the local desktop client"}, status=HTTPStatus.FORBIDDEN)
+                return True
+            try:
+                payload = {key: values[0] for key, values in parse_qs(parsed.query).items()} if method == "GET" else self._read_json_body()
+                if not isinstance(payload, dict):
+                    raise ValueError("request must be an object")
+                agent = payload.get("agent")
+                if agent not in ("translation", "extraction"):
+                    raise ValueError("agent must be translation or extraction")
+                project_dir = payload.get("project_dir", "")
+                if not isinstance(project_dir, str):
+                    raise ValueError("project_dir must be a string")
+                if project_dir and not Path(project_dir).is_dir():
+                    raise ValueError("project_dir must be an existing directory")
+                if method == "GET":
+                    entries = []
+                    for scope in (["global", "project"] if project_dir else ["global"]):
+                        with closing(MnemonStore(memory_directory(project_dir if scope == "project" else "", agent=agent), scope=scope)) as store:
+                            entries.extend(store.entries())
+                    self._send_json({"entries": entries})
+                    return True
+                saving = parsed.path == "/api/agent/memories/save"
+                memory_id = payload.get("id", "" if saving else None)
+                if not isinstance(memory_id, str) or ("id" in payload or not saving) and not 1 <= len(memory_id.strip()) <= 100:
+                    raise ValueError("id must be a nonempty string of at most 100 characters")
+                memory_id = memory_id.strip()
+                scope = ("global" if memory_id.startswith("global-") else "project") if memory_id else payload.get("scope", "project")
+                if scope not in ("global", "project"):
+                    raise ValueError("scope must be global or project")
+                if saving and "scope" in payload and payload["scope"] != scope:
+                    raise ValueError("Memory scope cannot be changed when updating an existing id")
+                if scope == "project" and not project_dir:
+                    raise ValueError("project_dir is required for project memory")
+                if saving:
+                    content = payload.get("content")
+                    if not isinstance(content, str) or not 1 <= len(content.strip()) <= 1000:
+                        raise ValueError("content must be a nonempty string of at most 1000 characters")
+                    importance = payload.get("importance")
+                    if "importance" in payload and importance not in ("normal", "critical"):
+                        raise ValueError("importance must be normal or critical")
+                command = Remember(content.strip(), id=memory_id, importance=importance) if saving else Forget(memory_id)
+                with closing(MnemonStore(memory_directory(project_dir if scope == "project" else "", agent=agent), scope=scope)) as store:
+                    result = store.mutate(command)
+                    if saving:
+                        result["entry"] = next(entry for entry in store.entries() if entry["id"] == result["id"])
+                    self._send_json(result)
+            except (ValueError, AgentToolError) as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            except (OSError, sqlite3.Error) as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return True
+
         def _route_project_api(self, project_id: str, sub_path: str) -> None:
+            if sub_path == "/cache/history":
+                if self.command != "POST":
+                    self._send_json({"error": "method not allowed"}, status=HTTPStatus.METHOD_NOT_ALLOWED)
+                    return
+                try:
+                    project_dir = _safe_project_dir(project_id)
+                    result = cache_history_action(project_dir, self._read_json_body(), _save_cache_entries)
+                    self._send_json(result)
+                except (ValueError, KeyError) as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                except OSError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            if self.command != "POST" or sub_path not in ("/cache/save", "/cache/delete-entry", "/cache/delete-file"):
+                self._route_project_api_inner(project_id, sub_path)
+                return
+            try:
+                project_dir = _safe_project_dir(project_id)
+                payload = self._read_json_body()
+                if sub_path == "/cache/save":
+                    indexed_entries(payload.get("entries", []))
+                filenames = payload.get("filenames", []) if sub_path == "/cache/delete-file" else [payload.get("filename", "")]
+                if not isinstance(filenames, list) or any(not isinstance(name, str) for name in filenames):
+                    raise ValueError("filenames 必须是字符串数组")
+                metadata = payload.get("_cache_edit", {})
+                if not isinstance(metadata, dict):
+                    raise ValueError("无效的缓存编辑来源")
+                with project_lock(project_dir):
+                    self._cached_json_body = payload
+                    self._cache_edit = (project_dir, begin_edit(
+                        project_dir, filenames, metadata, metadata.get("operation") or sub_path.rsplit("/", 1)[-1],
+                        str(payload.get("config_file_name") or "config.yaml"),
+                    ))
+                    self._route_project_api_inner(project_id, sub_path)
+            except (ValueError, KeyError) as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            except OSError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        def _route_project_api_inner(self, project_id: str, sub_path: str) -> None:
             """Handle /api/projects/:id/* routes."""
             try:
                 project_dir = _safe_project_dir(project_id)
@@ -924,7 +2233,38 @@ def build_handler(registry: JobRegistry):
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
 
+            def config_name_from_query(handler) -> str:
+                return parse_qs(urlparse(handler.path).query).get("config", ["config.yaml"])[0]
+
             # GET /api/projects/:id/config
+            if sub_path == "/plugins":
+                self._send_json({"plugins": _scan_plugins(project_dir)})
+                return
+
+            if sub_path == "/problem-types":
+                self._send_json({"problem_types": _list_problem_types(project_dir)})
+                return
+
+            # POST /api/projects/:id/config/preview — 把（可能未保存的）配置按保存时的格式渲染成 YAML 文本
+            if sub_path == "/config/preview":
+                if self.command != "POST":
+                    self._send_json({"error": "method not allowed"}, status=HTTPStatus.METHOD_NOT_ALLOWED)
+                    return
+                try:
+                    payload = self._read_json_body()
+                except json.JSONDecodeError:
+                    self._send_json({"error": "invalid json body"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                config_data = payload.get("config") if isinstance(payload, dict) else None
+                if not isinstance(config_data, dict):
+                    self._send_json({"error": "config field must be an object"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                try:
+                    self._send_json({"yaml": _dump_yaml_text(config_data)})
+                except Exception as exc:
+                    self._send_json({"error": f"failed to render yaml: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
             if sub_path == "/config":
                 config_name = parse_qs(urlparse(self.path).query).get("config", ["config.yaml"])[0]
                 config_path = os.path.join(project_dir, config_name)
@@ -938,29 +2278,259 @@ def build_handler(registry: JobRegistry):
                     self._send_json({"error": f"failed to read config: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
 
-            # GET /api/projects/:id/files
+            # GET /api/projects/:id/guideline — 项目翻译规范（项目目录里的那一个文件）
+            if sub_path == "/guideline":
+                path = project_guideline_path(project_dir)
+                content = read_project_guideline(project_dir)
+                self._send_json({
+                    "project_dir": project_dir,
+                    "filename": PROJECT_GUIDELINE_FILENAME,
+                    "path": path,
+                    "exists": os.path.isfile(path),
+                    "content": content,
+                })
+                return
+
+            # GET /api/projects/:id/detect-file-plugin — 按 gt_input 里的文件推荐文件插件
+            if sub_path == "/detect-file-plugin":
+                from GalTransl.Utils import get_file_list
+                from GalTransl.FilePluginDetect import detect_file_plugins, summarize_detection
+
+                input_dir = os.path.join(project_dir, INPUT_FOLDERNAME)
+                files = get_file_list(input_dir) if os.path.isdir(input_dir) else []
+                detected = detect_file_plugins(files, project_dir)
+                result = summarize_detection(detected)
+                result["files"] = {
+                    os.path.relpath(path, input_dir).replace(os.sep, "/"): plugin
+                    for path, plugin in detected.items()
+                }
+                self._send_json(result)
+                return
+
+            # GET /api/projects/:id/files[?counts=1]
             if sub_path == "/files":
                 input_dir = os.path.join(project_dir, INPUT_FOLDERNAME)
                 output_dir = os.path.join(project_dir, OUTPUT_FOLDERNAME)
                 cache_dir = os.path.join(project_dir, CACHE_FOLDERNAME)
+                input_entries = _list_dir_entries(input_dir, recursive=True)
+                # counts=1：额外给每个输入文件附上句数（要解析原文，稍慢）。
+                # 界面不需要，所以做成可选参数：只有 Agent 的 list_input_files 用。
+                want_counts = parse_qs(urlparse(self.path).query).get("counts", ["0"])[0].lower() not in {
+                    "", "0", "false",
+                }
+                if want_counts:
+                    counts = _count_input_file_sentences(
+                        project_dir,
+                        config_name_from_query(self),
+                        [str(e.get("name") or "") for e in input_entries if e.get("is_file", True)],
+                    )
+                    for entry in input_entries:
+                        entry["sentences"] = counts.get(str(entry.get("name") or ""))
                 self._send_json({
                     "project_dir": project_dir,
                     "input_dir": input_dir,
                     "output_dir": output_dir,
                     "cache_dir": cache_dir,
-                    "input_files": _list_dir_entries(input_dir),
-                    "output_files": _list_dir_entries(output_dir),
-                    "cache_files": _list_dir_entries(cache_dir, count_json_entries=True),
+                    "input_files": input_entries,
+                    "output_files": _list_dir_entries(output_dir, recursive=True),
+                    "cache_files": _list_dir_entries(
+                        cache_dir, count_json_entries=True, skip_suffixes=(CACHE_TEMP_SUFFIX,)
+                    ),
                 })
+                return
+
+            # POST /api/projects/:id/input/repeats — 统计原文里整句重复的句子。
+            # 与下面的 search 一样必须排在 /input/:filename 之前。
+            if sub_path == "/input/repeats" and self.command == "POST":
+                try:
+                    payload = self._read_json_body()
+                    try:
+                        min_count = max(2, int(payload.get("min_count", 2) or 2))
+                        min_length = max(1, int(payload.get("min_length", 1) or 1))
+                        max_results = max(1, min(int(payload.get("max_results", 50) or 50), 500))
+                        offset = _parse_search_offset(payload)
+                    except (TypeError, ValueError) as exc:
+                        self._send_json({"error": f"invalid paging or threshold: {exc}"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    self._send_json(_input_repeats(
+                        project_dir,
+                        str(payload.get("config_file_name", "config.yaml") or "config.yaml"),
+                        query=str(payload.get("query", "") or "").strip(),
+                        min_count=min_count,
+                        min_length=min_length,
+                        max_results=max_results,
+                        offset=offset,
+                    ))
+                except json.JSONDecodeError:
+                    self._send_json({"error": "invalid json body"}, status=HTTPStatus.BAD_REQUEST)
+                except Exception as exc:
+                    self._send_json(
+                        {"error": f"failed to count repeated input sentences: {exc}"},
+                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                return
+
+            # POST /api/projects/:id/{input,output}/search — 搜索原文或实际交付物。
+            # **必须排在下面的 /input/:filename 与 /output/:filename 之前**：按前缀匹配时
+            # 会被当成"读一个名叫 search 的输入文件"。也因此这里多带一个 POST 判断——GET
+            # 落到前缀分支去，读同名文件仍然走得通。
+            if sub_path in ("/input/search", "/output/search") and self.command == "POST":
+                is_output = sub_path == "/output/search"
+                try:
+                    import re as _re
+
+                    payload = self._read_json_body()
+                    raw_options = payload.get("options", {})
+                    query = str(payload.get("query", ""))
+                    # 正则保留首尾空白（要找的可能正是行首缩进）；字面搜索照旧去掉
+                    if not (isinstance(raw_options, dict) and bool(raw_options.get("re", False))):
+                        query = query.strip()
+                    if not query.strip():
+                        self._send_json({"results": [], "total": 0})
+                        return
+                    # 输出正文用 dst，原文正文用 src；两侧都能搜说话人。
+                    field = str(payload.get("field", "all")).strip() or "all"
+                    fields = ("all", "dst" if is_output else "src", "name")
+                    if field not in fields:
+                        self._send_json(
+                            {"error": f"field must be one of: {', '.join(fields)}"},
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+                    options = payload.get("options", {})
+                    if not isinstance(options, dict):
+                        self._send_json({"error": "options must be an object"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    # 大小写与缓存搜索同口径：默认忽略，match_case=true 才区分，字面与正则都适用
+                    match_case = options.get("match_case", False)
+                    if not isinstance(match_case, bool):
+                        self._send_json({"error": "match_case must be a boolean"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    pattern = None
+                    if bool(options.get("re", False)):
+                        try:
+                            pattern = _re.compile(query, 0 if match_case else _re.IGNORECASE)
+                        except _re.error as exc:
+                            self._send_json(
+                                {"error": f"invalid regular expression: {exc}"},
+                                status=HTTPStatus.BAD_REQUEST,
+                            )
+                            return
+                    elif match_case:
+                        pattern = _re.compile(_re.escape(query))
+                    try:
+                        context = max(0, min(int(payload.get("context", 0) or 0), 20))
+                    except (TypeError, ValueError):
+                        self._send_json(
+                            {"error": "context must be an integer 0-20"},
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+                    try:
+                        offset = _parse_search_offset(payload)
+                    except ValueError as exc:
+                        self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    try:
+                        order = _parse_search_order(payload)
+                    except ValueError as exc:
+                        self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    search_files = _search_output_dir if is_output else _search_input_dir
+                    result = search_files(
+                        project_dir,
+                        str(payload.get("config_file_name", "config.yaml") or "config.yaml"),
+                        query=query,
+                        field=field,
+                        filename=str(payload.get("filename", "")).strip(),
+                        context=context,
+                        max_results=min(int(payload.get("max_results", 500) or 500), 2000),
+                        offset=offset,
+                        only_preceding=bool(payload.get("preceding_only", False)),
+                        pattern=pattern,
+                        order=order,
+                    )
+                    self._send_json(result)
+                except json.JSONDecodeError:
+                    self._send_json({"error": "invalid json body"}, status=HTTPStatus.BAD_REQUEST)
+                except Exception as exc:
+                    self._send_json(
+                        {"error": f"failed to search {'output' if is_output else 'input'} files: {exc}"},
+                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                return
+
+            # GET /api/projects/:id/input/:filename — 用文件插件解析待翻译原文
+            if sub_path.startswith("/input/"):
+                filename = unquote(sub_path[len("/input/"):]).replace("\\", "/")
+                input_dir = os.path.join(project_dir, INPUT_FOLDERNAME)
+                file_path = os.path.join(input_dir, filename)
+                if (not filename or os.path.isabs(filename) or ".." in filename.split("/")
+                        or not _is_path_within(input_dir, file_path)):
+                    self._send_json({"error": "invalid input filename"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                if not os.path.isfile(file_path):
+                    self._send_json({"error": f"input file not found: {filename}"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                try:
+                    entries = _load_input_file_entries(project_dir, config_name_from_query(self), filename)
+                    self._send_json({"filename": filename, "count": len(entries), "entries": entries})
+                except Exception as exc:
+                    self._send_json({"error": f"failed to parse input file: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            # GET /api/projects/:id/output/:filename — 用文件插件解析最终输出文件
+            if sub_path.startswith("/output/"):
+                filename = unquote(sub_path[len("/output/"):])
+                output_dir = os.path.join(project_dir, OUTPUT_FOLDERNAME)
+                file_path = os.path.join(output_dir, filename)
+                if (not filename or os.path.isabs(filename)
+                        or ".." in filename.replace("\\", "/").split("/")
+                        or not _is_path_within(output_dir, file_path)):
+                    self._send_json({"error": "invalid output filename"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                requested_filename = filename
+                if not os.path.isfile(file_path):
+                    candidates = _output_files_for_cache_name(project_dir, filename)
+                    if not candidates:
+                        has_output_files = any(files for _, _, files in os.walk(output_dir))
+                        error = (f"output file not found: {filename}" if has_output_files
+                                 else "gt_output 是空的，请用rebuild重建结果。")
+                        self._send_json({"error": error}, status=HTTPStatus.NOT_FOUND)
+                        return
+                    if len(candidates) > 1:
+                        self._send_json({
+                            "error": f"缓存文件名 {filename} 对应多个输出文件，你是不是想读取其中之一：{candidates}？请指定实际输出文件名。",
+                            "candidates": candidates,
+                        }, status=HTTPStatus.CONFLICT)
+                        return
+                    filename = candidates[0]
+                try:
+                    entries = _load_input_file_entries(project_dir, config_name_from_query(self), filename, folder=OUTPUT_FOLDERNAME)
+                    result = {"filename": filename, "count": len(entries), "entries": entries}
+                    if requested_filename != filename:
+                        result["requested_filename"] = requested_filename
+                    self._send_json(result)
+                except Exception as exc:
+                    self._send_json({"error": f"failed to parse output file: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
 
             # GET /api/projects/:id/cache
             if sub_path == "/cache":
                 cache_dir = os.path.join(project_dir, CACHE_FOLDERNAME)
+                files = _list_dir_entries(
+                    cache_dir, count_json_entries=True, skip_suffixes=(CACHE_TEMP_SUFFIX,)
+                )
+                cache_names = {str(entry.get("name") or "") for entry in files if entry.get("is_file")}
                 self._send_json({
                     "project_dir": project_dir,
                     "cache_dir": cache_dir,
-                    "files": _list_dir_entries(cache_dir, count_json_entries=True),
+                    "files": files,
+                    # 还没翻译的输入文件：Cache/ 里没有它们的缓存，单独一列给界面用
+                    # （打开时读原文，见下面的 /cache/:filename 回落）
+                    "uncached_files": _list_uncached_input_files(
+                        project_dir, config_name_from_query(self), cache_names
+                    ),
                 })
                 return
 
@@ -985,119 +2555,7 @@ def build_handler(registry: JobRegistry):
                         self._send_json({"error": f"cache file not found: {filename}"}, status=HTTPStatus.NOT_FOUND)
                         return
 
-                    import orjson
-                    with open(file_path, "wb") as f:
-                        f.write(orjson.dumps(entries, option=orjson.OPT_INDENT_2))
-
-                    # Rebuild: re-derive problem and post_dst_preview fields
-                    try:
-                        from GalTransl.CSentense import CSentense
-                        from GalTransl.Problem import find_problems
-                        from GalTransl.Frontend.LLMTranslate import preprocess_trans_list, postprocess_trans_list
-
-                        # Load project config and dictionaries for rebuild
-                        proj_config = None
-                        pre_dic = None
-                        post_dic = None
-                        gpt_dic = None
-                        tPlugins = []
-                        try:
-                            from GalTransl.ConfigHelper import CProjectConfig, initDictList
-                            from GalTransl.Dictionary import CNormalDic, CGptDict
-                            proj_config = CProjectConfig(project_dir, config_name)
-                            dict_cfg = proj_config.getDictCfgSection()
-                            pre_dic_list = dict_cfg.get("preDict", [])
-                            post_dic_list = dict_cfg.get("postDict", [])
-                            gpt_dic_list = dict_cfg.get("gpt.dict", [])
-                            default_dic_dir = dict_cfg.get("defaultDictFolder", "")
-                            pre_dic = CNormalDic(
-                                initDictList(pre_dic_list, default_dic_dir, project_dir)
-                            )
-                            post_dic = CNormalDic(
-                                initDictList(post_dic_list, default_dic_dir, project_dir)
-                            )
-                            gpt_dic = CGptDict(
-                                initDictList(gpt_dic_list, default_dic_dir, project_dir)
-                            )
-                            if dict_cfg.get("sortDict", True):
-                                pre_dic.sort_dic()
-                                post_dic.sort_dic()
-                                gpt_dic.sort_dic()
-                            # Load text plugins
-                            try:
-                                tPlugins = proj_config.tPlugins
-                            except Exception:
-                                tPlugins = []
-                        except Exception:
-                            pass  # If config loading fails, skip dict processing
-
-                        # Build CSentense list from saved entries
-                        trans_list = []
-                        for e in entries:
-                            speaker = e.get("name", "")
-                            if isinstance(speaker, list):
-                                speaker = "/".join(speaker)
-                            pre_src = e.get("pre_src", "") or e.get("pre_jp", "")
-                            post_src = e.get("post_src", "") or e.get("post_jp", "")
-                            pre_dst = e.get("pre_dst", "") or e.get("pre_zh", "")
-                            proofread_dst = e.get("proofread_dst", "") or e.get("proofread_zh", "")
-                            if post_src == "":
-                                continue
-                            s = CSentense(pre_src, speaker if speaker else "", e.get("index", 0))
-                            s.post_src = pre_src
-                            s.pre_dst = pre_dst
-                            s.proofread_zh = proofread_dst
-                            s.post_dst = proofread_dst if proofread_dst else pre_dst
-                            s.trans_by = e.get("trans_by", "")
-                            s.proofread_by = e.get("proofread_by", "")
-                            s.trans_conf = e.get("trans_conf", 0)
-                            s.doub_content = e.get("doub_content", "")
-                            s.unknown_proper_noun = e.get("unknown_proper_noun", "")
-                            trans_list.append(s)
-
-                        # Link prev/next
-                        for i, s in enumerate(trans_list):
-                            if i > 0:
-                                s.prev_tran = trans_list[i - 1]
-                            if i < len(trans_list) - 1:
-                                s.next_tran = trans_list[i + 1]
-
-                        # Pre-processing and post-processing (shared with LLMTranslate)
-                        if pre_dic and proj_config:
-                            preprocess_trans_list(trans_list, proj_config, pre_dic, tPlugins or None)
-                        if post_dic and proj_config:
-                            postprocess_trans_list(trans_list, proj_config, post_dic, tPlugins or None)
-
-                        # Run find_problems
-                        if trans_list:
-                            try:
-                                find_problems(trans_list, proj_config, gpt_dic)
-                            except Exception:
-                                pass  # If problem detection fails, skip
-
-                        # Update entries with problem and post_dst_preview
-                        idx = 0
-                        for e in entries:
-                            post_src_val = e.get("post_src", "") or e.get("post_jp", "")
-                            if post_src_val == "":
-                                continue
-                            if idx < len(trans_list):
-                                tran = trans_list[idx]
-                                if tran.problem:
-                                    e["problem"] = tran.problem
-                                elif "problem" in e:
-                                    del e["problem"]
-                                e["post_dst_preview"] = tran.post_dst
-                                idx += 1
-
-                        # Re-save with updated fields
-                        with open(file_path, "wb") as f:
-                            f.write(orjson.dumps(entries, option=orjson.OPT_INDENT_2))
-
-                        self._send_json({"success": True, "filename": filename, "entries": entries})
-                    except Exception:
-                        # Rebuild failed, but original save succeeded
-                        self._send_json({"success": True, "filename": filename})
+                    self._send_json(_save_cache_entries(project_dir, filename, entries, config_name))
                 except json.JSONDecodeError:
                     self._send_json({"error": "invalid json body"}, status=HTTPStatus.BAD_REQUEST)
                 except Exception as exc:
@@ -1183,62 +2641,129 @@ def build_handler(registry: JobRegistry):
                     return
                 try:
                     payload = self._read_json_body()
-                    query = str(payload.get("query", "")).strip()
+                    raw_query = str(payload.get("query", ""))
                     field = str(payload.get("field", "all")).strip()  # all | src | dst
-                    max_results = min(int(payload.get("max_results", 500)), 2000)
+                    options = payload.get("options", {})
+                    result_mode = payload.get("result_mode", "bounded")
+                    if result_mode not in ("bounded", "all"):
+                        self._send_json({"error": "result_mode must be bounded or all"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    # 界面显式请求完整结果；Agent 默认保持 100 句 / 10k 字符预算。
+                    max_results = None if result_mode == "all" else max(
+                        1, min(int(payload.get("max_results", CACHE_SEARCH_MAX_ROWS)), CACHE_SEARCH_MAX_ROWS),
+                    )
+                    # 可选文件过滤：只搜这个缓存文件（Agent 修单文件问题时用）
+                    search_filename = str(payload.get("filename", "")).strip()
+                    search_filenames = payload.get("filenames")
+                    if search_filenames is not None and (
+                        not isinstance(search_filenames, list) or not search_filenames
+                        or any(not isinstance(name, str) or not name for name in search_filenames)
+                    ):
+                        self._send_json({"error": "filenames must be a non-empty string array"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    if not isinstance(options, dict):
+                        self._send_json({"error": "options must be an object"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    query = raw_query if options.get("re", False) else raw_query.strip()
+                    config_name = str(payload.get("config_file_name", "config.yaml")) or "config.yaml"
+                    filter_keys = RUNTIME_PROGRESS_CACHE.get_problem_filter_keys(
+                        project_dir, config_name
+                    )
 
-                    if not query:
+                    pattern = None
+                    try:
+                        conditions = parse_cache_search_conditions(payload)
+                    except ValueError as exc:
+                        self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    if not conditions:
                         self._send_json({"results": [], "total": 0})
                         return
 
                     cache_dir = os.path.join(project_dir, CACHE_FOLDERNAME)
-                    results = []
-                    total_matches = 0
+                    # context=N：命中条目前后各带 N 句。判断"这个译名该用哪个写法"要看
+                    # 上下文，只看命中行常常不够（与 read_transl_cache 的 context 同一语义）。
+                    try:
+                        context = max(0, min(int(payload.get("context", 0) or 0), 20))
+                    except (TypeError, ValueError):
+                        self._send_json(
+                            {"error": "context must be an integer 0-20"},
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+                    try:
+                        offset = _parse_search_offset(payload)
+                    except ValueError as exc:
+                        self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    try:
+                        order = _parse_search_order(payload)
+                    except ValueError as exc:
+                        self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    # preceding_only：只带上文（Agent 默认开，省 token）；不传/给 false 就两边都给
+                    only_preceding = bool(payload.get("preceding_only", False))
+                    # include_uncached：把「还没翻译的输入文件」的原文也搜进来（界面默认开）。
+                    # Agent 的 search_transl_cache 不传它——那边有 search_input 专门搜原文，
+                    # 混进来的原文命中只会稀释译文/问题侧的结果。
+                    include_uncached = bool(payload.get("include_uncached", False))
+
+                    targets: list[tuple[str, list[Any], bool]] = []
+                    cache_names: set[str] = set()
                     if os.path.isdir(cache_dir):
-                        for name in sorted(os.listdir(cache_dir)):
-                            if not name.endswith(".json"):
+                        for name in os.listdir(cache_dir):
+                            if os.path.isfile(os.path.join(cache_dir, name)):
+                                cache_names.add(name)
+                    for name in sorted(cache_names):
+                        if not name.endswith(".json"):
+                            continue
+                        if search_filename and name != search_filename:
+                            continue
+                        if search_filenames is not None and name not in search_filenames:
+                            continue
+                        try:
+                            import orjson
+                            with open(os.path.join(cache_dir, name), "rb") as f:
+                                file_entries = orjson.loads(f.read())
+                        except Exception:
+                            continue
+                        if isinstance(file_entries, list):
+                            targets.append((name, file_entries, True))
+                    if include_uncached:
+                        # 原文条目的 filename 用它「本该有的缓存键」：点开结果时前端就是按这个名字
+                        # 读的，读缓存接口会回落到读原文（见 /cache/:filename）
+                        for meta in _list_uncached_input_files(project_dir, config_name, cache_names):
+                            cache_key = str(meta.get("name") or "")
+                            input_name = str(meta.get("input_name") or "")
+                            if not cache_key:
                                 continue
-                            fp = os.path.join(cache_dir, name)
-                            if not os.path.isfile(fp):
+                            # 指名搜某个文件时，缓存键与原文路径都认（界面给的是缓存键）
+                            if search_filename and search_filename not in (cache_key, input_name):
                                 continue
                             try:
-                                import orjson
-                                with open(fp, "rb") as f:
-                                    entries = orjson.loads(f.read())
-                                for e in entries:
-                                    if not isinstance(e, dict):
-                                        continue
-                                    src_text = e.get("post_src", "") or e.get("post_jp", "") or e.get("pre_src", "") or e.get("pre_jp", "")
-                                    dst_text = e.get("pre_dst", "") or e.get("pre_zh", "") or e.get("proofread_dst", "") or e.get("proofread_zh", "")
-                                    problem_text = e.get("problem", "")
-                                    match_src = query.lower() in src_text.lower()
-                                    match_dst = query.lower() in dst_text.lower()
-                                    match_problem = query.lower() in problem_text.lower()
-                                    if field == "src" and not match_src:
-                                        continue
-                                    if field == "dst" and not match_dst:
-                                        continue
-                                    if field == "problem" and not match_problem:
-                                        continue
-                                    if field == "all" and not match_src and not match_dst and not match_problem:
-                                        continue
-                                    total_matches += 1
-                                    if len(results) < max_results:
-                                        results.append({
-                                            "filename": name,
-                                            "index": e.get("index", 0),
-                                            "speaker": e.get("name", ""),
-                                            "post_src": src_text,
-                                            "pre_dst": dst_text,
-                                            "match_src": match_src,
-                                            "match_dst": match_dst,
-                                            "match_problem": match_problem,
-                                            "problem": e.get("problem", ""),
-                                            "trans_by": e.get("trans_by", ""),
-                                        })
+                                source_entries = _load_input_file_entries(
+                                    project_dir, config_name, input_name
+                                )
                             except Exception:
                                 continue
-                    self._send_json({"results": results, "total": total_matches})
+                            targets.append((cache_key, _input_entries_as_cache_entries(source_entries), False))
+                    # 缓存与原文混在一张表里按文件名排：与左侧文件列表同一个顺序
+                    targets.sort(key=lambda item: item[0])
+
+                    payload_out = _search_cache_entries(
+                        targets,
+                        query=query,
+                        pattern=pattern,
+                        field=field,
+                        filter_keys=filter_keys,
+                        context=context,
+                        only_preceding=only_preceding,
+                        max_results=max_results,
+                        offset=offset,
+                        order=order,
+                        conditions=conditions,
+                    )
+                    self._send_json(payload_out)
                 except json.JSONDecodeError:
                     self._send_json({"error": "invalid json body"}, status=HTTPStatus.BAD_REQUEST)
                 except Exception as exc:
@@ -1326,6 +2851,28 @@ def build_handler(registry: JobRegistry):
                     self._send_json({"error": f"failed to replace in cache: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
 
+            # POST /api/projects/:id/cache/dictionary-matches (read-only, bounded batch)
+            if sub_path == "/cache/dictionary-matches":
+                if self.command != "POST":
+                    self._send_json({"error": "method not allowed"}, status=HTTPStatus.METHOD_NOT_ALLOWED)
+                    return
+                try:
+                    from GalTransl.CacheDictionary import inspect_cache_dictionaries
+                    payload = self._read_json_body()
+                    result = inspect_cache_dictionaries(
+                        project_dir,
+                        str(payload.get("config_file_name", "config.yaml")) or "config.yaml",
+                        payload.get("entries"),
+                        details=payload.get("details", False),
+                        offset=payload.get("offset", 0),
+                    )
+                    self._send_json(result)
+                except (ValueError, TypeError) as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                except Exception as exc:
+                    self._send_json({"error": f"failed to inspect dictionaries: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
             # GET /api/projects/:id/cache/:filename (catch-all, must be after specific /cache/* routes)
             if sub_path.startswith("/cache/"):
                 filename = unquote(sub_path[len("/cache/"):])
@@ -1334,20 +2881,67 @@ def build_handler(registry: JobRegistry):
                     return
                 cache_dir = os.path.join(project_dir, CACHE_FOLDERNAME)
                 file_path = os.path.join(cache_dir, filename)
-                if not os.path.isfile(file_path):
+                if os.path.isfile(file_path):
+                    try:
+                        import orjson
+                        with open(file_path, "rb") as f:
+                            data = orjson.loads(f.read())
+                        self._send_json({
+                            "project_dir": project_dir,
+                            "filename": filename,
+                            "entries": data,
+                            "has_cache": True,
+                        })
+                    except Exception as exc:
+                        self._send_json({"error": f"failed to read cache: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+
+                # 没有缓存文件：这是还没翻译的文件，回落去读它的原文。条目按缓存条目的形状给
+                # （pre_src/post_src 是原文、译文为空），界面和 Agent 的读取工具都能照旧渲染。
+                input_name = _resolve_input_file_for_cache_name(project_dir, filename)
+                if not input_name:
                     self._send_json({"error": f"cache file not found: {filename}"}, status=HTTPStatus.NOT_FOUND)
                     return
                 try:
-                    import orjson
-                    with open(file_path, "rb") as f:
-                        data = orjson.loads(f.read())
-                    self._send_json({"project_dir": project_dir, "filename": filename, "entries": data})
+                    refresh_input = parse_qs(urlparse(self.path).query).get("refresh_input", [""])[0] == "1"
+                    source_entries = _load_input_file_entries(
+                        project_dir, config_name_from_query(self), input_name,
+                        **({"force_reload": True} if refresh_input else {}),
+                    )
                 except Exception as exc:
-                    self._send_json({"error": f"failed to read cache: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    self._send_json(
+                        {"error": f"failed to read source file {input_name}: {exc}"},
+                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    return
+                self._send_json({
+                    "project_dir": project_dir,
+                    "filename": filename,
+                    "input_name": input_name,
+                    "entries": _input_entries_as_cache_entries(source_entries),
+                    "has_cache": False,
+                })
+                return
+
+            # GET /api/projects/:id/cache-output
+            if sub_path == "/cache-output" and self.command == "GET":
+                from GalTransl.CacheOutput import check_cache_output
+
+                config_name = parse_qs(urlparse(self.path).query).get("config", ["config.yaml"])[0]
+                try:
+                    plugins = _ProjectFilePlugins(project_dir, config_name)
+                    self._send_json(check_cache_output(plugins.cfg, plugins.get))
+                except Exception as exc:
+                    self._send_json({"error": f"无法核对缓存与最终输出：{exc}"}, status=HTTPStatus.BAD_REQUEST)
                 return
 
             # GET /api/projects/:id/progress
             if sub_path == "/progress":
+                config_name = parse_qs(urlparse(self.path).query).get("config", ["config.yaml"])[0]
+                filter_keys = RUNTIME_PROGRESS_CACHE.get_problem_filter_keys(project_dir, config_name)
+                white_index = build_problem_white_list_index(
+                    RUNTIME_PROGRESS_CACHE.get_problem_white_list(project_dir, config_name)
+                )
                 cache_dir = os.path.join(project_dir, CACHE_FOLDERNAME)
                 total = 0
                 translated = 0
@@ -1355,18 +2949,50 @@ def build_handler(registry: JobRegistry):
                 failed = 0
                 file_progress = []
                 if os.path.isdir(cache_dir):
-                    for name in sorted(os.listdir(cache_dir)):
+                    # 翻译中（或中途崩溃后）新译文先进 .append.jsonl，压实后才并回 .json；
+                    # 只看 .json 会把这些句子算成没翻
+                    cache_names = sorted({
+                        name.removesuffix(_CACHE_APPEND_SUFFIX)
+                        for name in os.listdir(cache_dir)
+                        if os.path.isfile(os.path.join(cache_dir, name))
+                        and (name.endswith(".json") or name.endswith(_CACHE_APPEND_SUFFIX))
+                    })
+                    for name in cache_names:
                         fp = os.path.join(cache_dir, name)
-                        if not os.path.isfile(fp) or not fp.endswith(".json"):
-                            continue
                         try:
                             import orjson
-                            with open(fp, "rb") as f:
-                                entries = orjson.loads(f.read())
+                            entries: list[Any] = []
+                            if os.path.isfile(fp):
+                                with open(fp, "rb") as f:
+                                    loaded = orjson.loads(f.read())
+                                entries = loaded if isinstance(loaded, list) else []
+                            append_path = fp + _CACHE_APPEND_SUFFIX
+                            if os.path.isfile(append_path):
+                                # 与压实同一口径：按 index 合并，追加行的字段覆盖快照（快照的 problem 等保留）
+                                by_index = {
+                                    str(e.get("index", "")): pos
+                                    for pos, e in enumerate(entries)
+                                    if isinstance(e, dict) and str(e.get("index", ""))
+                                }
+                                for row in _read_cache_append_rows(append_path):
+                                    pos = by_index.get(str(row.get("index", "")))
+                                    if pos is None:
+                                        by_index[str(row.get("index", ""))] = len(entries)
+                                        entries.append(row)
+                                    else:
+                                        entries[pos] = {**entries[pos], **row}
                             f_total = len(entries)
-                            f_translated = sum(1 for e in entries if isinstance(e, dict) and (e.get("pre_dst", "") or e.get("pre_zh", "")))
-                            f_problems = sum(1 for e in entries if isinstance(e, dict) and e.get("problem", ""))
-                            f_failed = sum(1 for e in entries if isinstance(e, dict) and "(Failed)" in str(e.get("problem", "")))
+                            f_translated = sum(1 for e in entries if _cache_entry_is_translated(e))
+                            # 白名单命中的条目等价于勾了 skip_check：问题与失败都不计
+                            live = [
+                                e for e in entries
+                                if isinstance(e, dict)
+                                and not is_problem_whitelisted(white_index, name, e.get("index", ""))
+                            ]
+                            live_problems = [filter_problem_text(e.get("problem", ""), filter_keys) for e in live]
+                            f_problems = sum(1 for text in live_problems if text)
+                            # 失败时 problem 写「翻译失败」、译文以 (Failed) 开头，与 /runtime 同一判定
+                            f_failed = sum(1 for e, text in zip(live, live_problems) if _cache_entry_is_failed(e, text))
                             total += f_total
                             translated += f_translated
                             problems += f_problems
@@ -1395,6 +3021,7 @@ def build_handler(registry: JobRegistry):
                 runtime = RUNTIME_REGISTRY.get_runtime_snapshot(project_dir)
                 file_totals = runtime.get("file_totals", {})
                 cache_file_display_map = runtime.get("cache_file_display_map", {})
+                activity = runtime.get("activity", {})
                 config_file_name = "config.yaml"
                 job = registry.get_project_job(project_dir)
                 if job:
@@ -1402,17 +3029,23 @@ def build_handler(registry: JobRegistry):
                 config_retran_key = RUNTIME_PROGRESS_CACHE.get_retran_key(project_dir, config_file_name)
                 retran_terms = _normalize_retran_terms(config_retran_key)
                 retran_key = ""
+                retry_failed = False
                 current_job_started_at_ns = None
                 if job and job.status in {"pending", "running"}:
                     retran_key = config_retran_key
+                    retry_failed = RUNTIME_PROGRESS_CACHE.get_retransl_fail(project_dir, config_file_name)
                     current_job_started_at_ns = _parse_runtime_job_started_at_ns(job.started_at)
                 progress_payload = RUNTIME_PROGRESS_CACHE.get_progress(
                     project_dir,
                     file_totals=file_totals,
                     cache_file_display_map=cache_file_display_map,
+                    cache_file_selected_indexes=runtime.get("cache_file_selected_indexes", {}),
                     retran_key=retran_key,
                     retran_terms=retran_terms,
+                    retry_failed=retry_failed,
                     current_job_started_at_ns=current_job_started_at_ns,
+                    problem_filter_keys=RUNTIME_PROGRESS_CACHE.get_problem_filter_keys(project_dir, config_file_name),
+                    problem_white_list=RUNTIME_PROGRESS_CACHE.get_problem_white_list(project_dir, config_file_name),
                 )
                 total = progress_payload["total"]
                 translated = progress_payload["translated"]
@@ -1420,6 +3053,10 @@ def build_handler(registry: JobRegistry):
                 speed = runtime["translation_speed_lpm"]
                 remaining = max(total - translated, 0)
                 eta_seconds = round((remaining / speed) * 60) if speed > 0 and remaining > 0 else None
+                # 翻译引擎按调度模拟估的剩余时间优先：它把收尾阶段并发变少算了进去
+                engine_eta = runtime.get("eta_seconds")
+                if engine_eta is not None and job and job.status in {"pending", "running"} and remaining > 0:
+                    eta_seconds = round(engine_eta)
                 self._send_json({
                     "project_dir": project_dir,
                     "job": None if job is None else {
@@ -1439,6 +3076,8 @@ def build_handler(registry: JobRegistry):
                         "problems": progress_payload["problems"],
                         "failed": progress_payload["failed"],
                         "percent": percent,
+                        # total 里有多少是分块交叉句（相邻两块各翻一次），界面在进度旁单独标出
+                        "cross_total": runtime.get("cross_total", 0),
                         "workers_active": runtime["workers_active"],
                         "workers_configured": runtime["workers_configured"],
                         "translation_speed_lpm": speed,
@@ -1447,10 +3086,20 @@ def build_handler(registry: JobRegistry):
                     },
                     "stage": runtime["stage"],
                     "current_file": runtime["current_file"],
+                    # 本次任务累计的 token 用量（输入/缓存命中/输出/思考），见 RuntimeRegistry.record_usage
+                    "usage": runtime["usage"],
                     "recent_errors": runtime["recent_errors"],
                     "recent_successes": runtime["recent_successes"],
                     "retransl_stats": progress_payload["retransl_stats"],
-                    "files": progress_payload["files"],
+                    # files 是缓存算出来的静态进度，这里给此刻有请求在跑的那几行补上实时状态
+                    # （{phase: waiting|thinking|writing|retrying, cps: 字/秒, requests: 请求数}），
+                    # 界面拿它点那颗小灯
+                    "files": [
+                        {**row, "activity": activity[row["filename"]]}
+                        if row.get("filename") in activity
+                        else row
+                        for row in progress_payload["files"]
+                    ],
                 })
                 return
 
@@ -1489,10 +3138,26 @@ def build_handler(registry: JobRegistry):
                     data = _read_yaml_file(config_path)
                     dict_cfg = data.get("dictionary", {})
                     default_folder = dict_cfg.get("defaultDictFolder", "Dict")
-                    if os.path.isabs(default_folder):
-                        dict_base = default_folder
-                    else:
-                        dict_base = os.path.abspath(default_folder)
+                    dict_base = str(resolve_dict_dir(default_folder))
+                    summary = parse_qs(urlparse(self.path).query).get("summary", ["false"])[0] == "true"
+                    if summary:
+                        from GalTransl.ConfigHelper import initDictList
+
+                        files = []
+                        for category, key in (("pre", "preDict"), ("gpt", "gpt.dict"), ("post", "postDict")):
+                            configured = dict_cfg.get(key, [])
+                            paths = initDictList(configured, default_folder, project_dir)
+                            for file_key, path in zip(configured, paths):
+                                payload = _read_dict_file_payload(path)
+                                files.append({"category": category, "file_key": file_key,
+                                              "count": None if payload.get("error") else payload["count"],
+                                              **({"error": payload["error"]} if payload.get("error") else {})})
+                        self._send_json({
+                            "default_dict_folder": default_folder,
+                            "files": files,
+                            "note": "只列当前配置启用的译前/GPT/译后字典，包含公共与项目字典；count 是有效词条数，不计空行、注释和分区标题。文件缺失或读取失败时 count 为 null，并返回 error。",
+                        })
+                        return
                     result = {
                         "project_dir": project_dir,
                         "default_dict_folder": default_folder,
@@ -1527,8 +3192,9 @@ def build_handler(registry: JobRegistry):
                 if not _is_safe_config_filename(config_name):
                     self._send_json({"error": "invalid config filename"}, status=HTTPStatus.BAD_REQUEST)
                     return
+                include_common = parse_qs(urlparse(self.path).query).get("include_common", [""])[0] in ("1", "true")
                 try:
-                    self._send_json(_collect_project_dict_payload(project_dir, config_name))
+                    self._send_json(_collect_project_dict_payload(project_dir, config_name, include_common))
                 except FileNotFoundError as exc:
                     self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
                 except ValueError as exc:
@@ -1634,6 +3300,52 @@ def build_handler(registry: JobRegistry):
                     self._send_json({"error": "invalid json body"}, status=HTTPStatus.BAD_REQUEST)
                 except Exception as exc:
                     self._send_json({"error": f"failed to save project dictionary file: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            # POST /api/projects/:id/dictionary/common/save
+            # 写当前配置启用的通用字典（Agent 用）：只能改配置里列出的、已存在的文件。
+            if sub_path == "/dictionary/common/save":
+                if self.command != "POST":
+                    self._send_json({"error": "method not allowed"}, status=HTTPStatus.METHOD_NOT_ALLOWED)
+                    return
+                try:
+                    payload = self._read_json_body()
+                    config_name = str(payload.get("config_file_name", "config.yaml") or "config.yaml")
+                    file_key = str(payload.get("file_key", "")).strip()
+                    content = _normalize_dict_text(str(payload.get("content", "")))
+
+                    if not _is_safe_config_filename(config_name):
+                        self._send_json({"error": "invalid config filename"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    config_path = os.path.join(project_dir, config_name)
+                    if not os.path.isfile(config_path):
+                        self._send_json({"error": f"config file not found: {config_name}"}, status=HTTPStatus.NOT_FOUND)
+                        return
+
+                    data = _read_yaml_file(config_path)
+                    dict_cfg = data.get("dictionary", {})
+                    listed = set(str(x) for x in dict_cfg.get("preDict", []))
+                    listed.update(str(x) for x in dict_cfg.get("gpt.dict", []))
+                    listed.update(str(x) for x in dict_cfg.get("postDict", []))
+                    if file_key not in listed:
+                        self._send_json({"error": "dictionary file is not configured in project dictionary lists"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    try:
+                        file_path = _resolve_common_dict_path(dict_cfg.get("defaultDictFolder", "Dict"), project_dir, file_key)
+                    except ValueError as exc:
+                        self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    if not os.path.isfile(file_path):
+                        self._send_json({"error": f"common dictionary file not found: {file_key}"}, status=HTTPStatus.NOT_FOUND)
+                        return
+
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    self._send_json({"success": True, "file_key": file_key})
+                except json.JSONDecodeError:
+                    self._send_json({"error": "invalid json body"}, status=HTTPStatus.BAD_REQUEST)
+                except Exception as exc:
+                    self._send_json({"error": f"failed to save common dictionary file: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
 
             # POST /api/projects/:id/dictionary/project/delete
@@ -1880,6 +3592,8 @@ def build_handler(registry: JobRegistry):
                     user_prompt = f"请翻译以下人名：\n{names_text}"
 
                     from openai import OpenAI
+                    from GalTransl.Reasoning import build_reasoning_kwargs
+
                     client = OpenAI(api_key=api_key, base_url=base_url)
                     stream = client.chat.completions.create(
                         model=model_name,
@@ -1889,6 +3603,7 @@ def build_handler(registry: JobRegistry):
                         ],
                         timeout=timeout,
                         stream=True,
+                        **build_reasoning_kwargs(oai_section, token_entry),
                     )
 
                     line_buf = ""
@@ -2031,31 +3746,56 @@ def build_handler(registry: JobRegistry):
 
             # GET /api/projects/:id/problems
             if sub_path == "/problems":
-                cache_dir = os.path.join(project_dir, CACHE_FOLDERNAME)
+                query = parse_qs(urlparse(self.path).query)
+                config_name = query.get("config", ["config.yaml"])[0]
+                revision = _problem_revision(project_dir, config_name)
+                if revision is not None and query.get("revision", [None])[0] == revision:
+                    self._send_json({"unchanged": True, "revision": revision})
+                    return
+                filter_keys = RUNTIME_PROGRESS_CACHE.get_problem_filter_keys(project_dir, config_name)
+                white_index = build_problem_white_list_index(
+                    RUNTIME_PROGRESS_CACHE.get_problem_white_list(project_dir, config_name)
+                )
                 all_problems = []
-                if os.path.isdir(cache_dir):
-                    for name in sorted(os.listdir(cache_dir)):
-                        fp = os.path.join(cache_dir, name)
-                        if not os.path.isfile(fp) or not fp.endswith(".json"):
-                            continue
-                        try:
-                            import orjson
-                            with open(fp, "rb") as f:
-                                entries = orjson.loads(f.read())
-                            for e in entries:
-                                if isinstance(e, dict) and e.get("problem", ""):
-                                    all_problems.append({
-                                        "filename": name,
-                                        "index": e.get("index", 0),
-                                        "speaker": e.get("name", ""),
-                                        "post_src": e.get("post_src", "") or e.get("post_jp", ""),
-                                        "pre_dst": e.get("pre_dst", "") or e.get("pre_zh", ""),
-                                        "problem": e.get("problem", ""),
-                                        "trans_by": e.get("trans_by", ""),
-                                    })
-                        except Exception:
-                            continue
-                self._send_json({"project_dir": project_dir, "problems": all_problems, "total": len(all_problems)})
+                # 扫描已排除白名单命中的条目（等价于勾了 skip_check）
+                for name, e in _iter_problem_cache_entries(project_dir, white_index):
+                    problem_text = filter_problem_text(e.get("problem", ""), filter_keys)
+                    if problem_text:
+                        all_problems.append({
+                            "filename": name,
+                            "index": e.get("index", 0),
+                            "speaker": e.get("name", ""),
+                            "post_src": e.get("post_src", "") or e.get("post_jp", ""),
+                            "pre_dst": e.get("pre_dst", "") or e.get("pre_zh", ""),
+                            "problem": problem_text,
+                            "trans_by": e.get("trans_by", ""),
+                        })
+                # 扫描途中有写入时不签发版本，下一次核对必须重新读取。
+                if revision != _problem_revision(project_dir, config_name):
+                    revision = None
+                self._send_json({"project_dir": project_dir, "problems": all_problems, "total": len(all_problems), "filter_keys": filter_keys, "revision": revision})
+                return
+
+            # GET /api/projects/:id/problem_filter_stats
+            # 每条过滤项各挡住了多少条问题（manage_problem_filter 的 list 用）：
+            # 口径与 /problems 一致——先排白名单，再看过滤项命中，只是这里不把问题文本过滤掉，
+            # 而是逐项计数。problem_entries 是当前有问题的条目总数，visible_entries 是过滤后
+            # 仍会出现在问题清单里的条数。
+            if sub_path == "/problem_filter_stats":
+                config_name = parse_qs(urlparse(self.path).query).get("config", ["config.yaml"])[0]
+                filter_keys = RUNTIME_PROGRESS_CACHE.get_problem_filter_keys(project_dir, config_name)
+                white_index = build_problem_white_list_index(
+                    RUNTIME_PROGRESS_CACHE.get_problem_white_list(project_dir, config_name)
+                )
+                problems = [
+                    str(e.get("problem", "") or "")
+                    for _, e in _iter_problem_cache_entries(project_dir, white_index)
+                ]
+                self._send_json({
+                    "project_dir": project_dir,
+                    "filter_keys": filter_keys,
+                    **summarize_problem_filter_hits(problems, filter_keys),
+                })
                 return
 
             # GET /api/projects/:id/logs
@@ -2083,8 +3823,69 @@ def build_handler(registry: JobRegistry):
             self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
         def do_GET(self) -> None:
+            if self._route_memories("GET"):
+                return
+            if route_update(self, "GET", GALTRANSL_VERSION):
+                return
+            if route_extraction(self, "GET"):
+                return
             parsed = urlparse(self.path)
             path = parsed.path
+
+            if path == '/api/agent/image':
+                try:
+                    from GalTransl.Extraction.http import trusted_request
+                    from GalTransl.Agent.images import read_image
+                    from GalTransl.Agent.session_store import SessionStore
+                    if not trusted_request(self):
+                        self._send_json({'error': 'Local client required'}, status=HTTPStatus.FORBIDDEN)
+                        return
+                    query = parse_qs(parsed.query)
+                    sid = query.get('session_id', [''])[0]
+                    if not re.fullmatch(r'[0-9a-f]{32}', sid):
+                        raise ValueError('Invalid session id')
+                    if query.get('agent', [''])[0] == 'extraction':
+                        from GalTransl.Extraction.runtime import EXTRACTION_RUNTIME
+                        session = EXTRACTION_RUNTIME.store.read(sid)
+                        store = SessionStore(session['workspace'], sid, directory=str(EXTRACTION_RUNTIME.store.directory(sid) / 'execution'))
+                    else:
+                        store = SessionStore(query.get('project_dir', [''])[0], sid)
+                    data, mime = read_image(store, query.get('image_id', [''])[0])
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header('Content-Type', mime)
+                    self.send_header('Content-Length', str(len(data)))
+                    self.send_header('Cache-Control', 'private, max-age=86400')
+                    self.send_header('X-Content-Type-Options', 'nosniff')
+                    self.end_headers()
+                    self.wfile.write(data)
+                except FileNotFoundError:
+                    self._send_json({'error': 'Image not found'}, status=HTTPStatus.NOT_FOUND)
+                except ValueError as exc:
+                    self._send_json({'error': str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            if path == "/api/custom-background":
+                try:
+                    self._send_json(load_custom_background())
+                except Exception as exc:
+                    self._send_json({"error": f"failed to load background: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            if path == "/api/custom-background/image":
+                try:
+                    version = parse_qs(parsed.query).get("version", [""])[0]
+                    data, content_type = read_custom_background_image(version)
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    self.wfile.write(data)
+                except FileNotFoundError:
+                    self._send_json({"error": "background image not found"}, status=HTTPStatus.NOT_FOUND)
+                except Exception as exc:
+                    self._send_json({"error": f"failed to read background: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
 
             if path == "/":
                 self._send_html(INDEX_HTML)
@@ -2092,7 +3893,13 @@ def build_handler(registry: JobRegistry):
             if path == "/api/version":
                 self._send_json({"version": GALTRANSL_VERSION})
                 return
+            if path == "/api/program-dir":
+                self._send_json({"path": _program_dir()})
+                return
             if path == "/api/version/check":
+                # The desktop prewarms the backend, so the first check can
+                # arrive before the startup GitHub request has finished.
+                update_thread.join(timeout=10)
                 latest_version = new_version[0] if new_version else None
                 self._send_json(
                     {
@@ -2160,8 +3967,34 @@ def build_handler(registry: JobRegistry):
                 self._send_json({"problem_types": _list_problem_types()})
                 return
 
+            # GET /api/translation-guidelines — 全局规范清单。
+            # guidelines 是纯文件名数组（项目配置的下拉、Agent 的 read_guideline 一直在用，保持原样）；
+            # files/dir/default 是「通用翻译规范管理」页要的细节（大小/修改时间/哪份是兜底）。
             if path == "/api/translation-guidelines":
-                self._send_json({"guidelines": _list_translation_guidelines()})
+                self._send_json({
+                    "guidelines": _list_translation_guidelines(),
+                    "files": _list_translation_guideline_files(),
+                    "dir": _guidelines_dir(),
+                    "default": DEFAULT_GUIDELINE_NAME,
+                })
+                return
+
+            # GET /api/translation-guidelines/:name — 读规范文件内容
+            if path.startswith("/api/translation-guidelines/") and self.command == "GET":
+                name = unquote(path.split("/", 3)[-1])
+                if not _is_safe_guideline_filename(name):
+                    self._send_json({"error": "invalid guideline name"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                file_path = os.path.join(_guidelines_dir(), name)
+                if not os.path.isfile(file_path):
+                    self._send_json({"error": f"guideline not found: {name}", "available": _list_translation_guidelines()}, status=HTTPStatus.NOT_FOUND)
+                    return
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    self._send_json({"name": name, "content": content})
+                except Exception as exc:
+                    self._send_json({"error": f"failed to read guideline: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
 
             if path.startswith("/api/projects/"):
@@ -2182,11 +4015,91 @@ def build_handler(registry: JobRegistry):
                     self._send_json({"error": f"failed to load common dictionaries: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
 
+            # GET /api/agent/status — current agent state + all events (snapshot)
+            if path == "/api/agent/status":
+                params = parse_qs(parsed.query)
+                project_dir = params.get("project_dir", [""])[0]
+                session_id = params.get("session_id", [""])[0] or None
+                if not project_dir:
+                    self._send_json({"error": "project_dir is required"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                self._send_json(AGENT_REGISTRY.status(project_dir, session_id))
+                return
+
+            # GET /api/agent/transcript — replay committed transcript events from the
+            # session log (authoritative history; status().events is a bounded window)
+            if path == "/api/agent/transcript":
+                params = parse_qs(parsed.query)
+                project_dir = params.get("project_dir", [""])[0]
+                session_id = params.get("session_id", [""])[0] or None
+                if not project_dir:
+                    self._send_json({"error": "project_dir is required"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                try:
+                    limit = int(params.get("limit", ["0"])[0])
+                except ValueError:
+                    limit = 0
+                events = AGENT_REGISTRY.transcript(project_dir, session_id, limit or None)
+                self._send_json({"events": events})
+                return
+
+            # GET /api/agent/sessions — list sessions of a project
+            if path == "/api/agent/sessions":
+                project_dir = parse_qs(parsed.query).get("project_dir", [""])[0]
+                if not project_dir:
+                    self._send_json({"error": "project_dir is required"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                self._send_json({"sessions": AGENT_REGISTRY.list_sessions(project_dir)})
+                return
+
+            # GET /api/agent/stream — SSE: stream agent events in real time
+            if path == "/api/agent/stream":
+                params = parse_qs(parsed.query)
+                project_dir = params.get("project_dir", [""])[0]
+                session_id = params.get("session_id", [""])[0] or None
+                if not project_dir:
+                    self._send_json({"error": "project_dir is required"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                # after_step: 只推该 step 之后的事件（续订时避免重放旧回合）
+                try:
+                    after_step = int(params.get("after_step", ["0"])[0])
+                except ValueError:
+                    after_step = 0
+                self._stream_agent(project_dir, after_step=after_step, session_id=session_id)
+                return
+
             self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
+            if self._route_memories("POST"):
+                return
+            if route_update(self, "POST", GALTRANSL_VERSION):
+                return
+            if route_extraction(self, "POST"):
+                return
             parsed = urlparse(self.path)
             path = parsed.path
+
+            if path == "/api/custom-background/image":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > 128 * 1024 * 1024:
+                        self._send_json({"error": "background image must be between 1 byte and 128 MiB"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    data = self.rfile.read(length)
+                    if len(data) != length:
+                        raise ValueError("incomplete background image")
+                    query = parse_qs(parsed.query)
+                    settings = {key: query[key][0] for key in ("opacity", "surfaceOpacity") if key in query}
+                    self._send_json(save_custom_background_image(
+                        data, query.get("name", ["background"])[0],
+                        self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower(), settings,
+                    ))
+                except (ValueError, TypeError) as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                except Exception as exc:
+                    self._send_json({"error": f"failed to save background image: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
 
             if path.startswith("/api/projects/"):
                 parts = path.split("/", 4)
@@ -2198,7 +4111,336 @@ def build_handler(registry: JobRegistry):
                 self._route_project_api(project_id, sub_path)
                 return
 
-            # POST /api/openai-models — query a list of models from an OpenAI-compatible API.
+            # POST /api/translation-guidelines/create | save | delete — 「通用翻译规范管理」页在用。
+            # 逻辑在模块级的 _*_guideline_from_payload 里（do_POST 已经很长，别再往里堆）。
+            if path in _GUIDELINE_WRITE_ROUTES:
+                try:
+                    payload = self._read_json_body()
+                except json.JSONDecodeError:
+                    self._send_json({"error": "invalid json body"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                body, status = _GUIDELINE_WRITE_ROUTES[path](payload)
+                self._send_json(body, status=status)
+                return
+
+            # POST /api/agent/start — start an agent run for a project
+            if path == "/api/agent/start":
+                try:
+                    payload = self._read_json_body()
+                    project_dir = str(payload.get("project_dir", "")).strip()
+                    config_file_name = str(payload.get("config_file_name", "config.yaml") or "config.yaml")
+                    backend_profile_data = payload.get("backend_profile_data")
+                    # 接受旧客户端的字段名，新客户端只发送 first_prompt。
+                    first_prompt = str(payload.get("first_prompt", payload.get("goal", "")) or "")
+                    session_id = str(payload.get("session_id", "") or "") or None
+                    # 两份后端配置的"名字"与（翻译器那份的）内容：名字只存在前端
+                    # localStorage，后端只能随请求拿到，供「了解项目」如实报出实际后端。
+                    backend_profile_name = str(payload.get("backend_profile_name", "") or "")
+                    translator_profile_name = str(payload.get("translator_profile_name", "") or "")
+                    translator_profile_data = payload.get("translator_profile_data")
+                    # 权限模式（档位清单见 Agent/runtime.PERMISSION_MODES）同样只存在前端 localStorage
+                    permission_mode = str(payload.get("permission_mode", "") or "")
+                    if not project_dir:
+                        self._send_json({"error": "project_dir is required"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    if not isinstance(backend_profile_data, dict) or not backend_profile_data:
+                        self._send_json({"error": "backend_profile_data is required (请先选择一个翻译后端配置)"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    status = AGENT_REGISTRY.start(
+                        project_dir=project_dir,
+                        config_file_name=config_file_name,
+                        backend_profile_data=backend_profile_data,
+                        first_prompt=first_prompt,
+                        images=payload.get('images'),
+                        session_id=session_id,
+                        backend_profile_name=backend_profile_name,
+                        translator_profile_name=translator_profile_name,
+                        translator_profile_data=(
+                            translator_profile_data
+                            if isinstance(translator_profile_data, dict)
+                            else None
+                        ),
+                        gendic_profile_name=str(payload.get("gendic_profile_name", "") or ""),
+                        gendic_profile_data=(
+                            payload["gendic_profile_data"]
+                            if isinstance(payload.get("gendic_profile_data"), dict) else None
+                        ),
+                        subagent_profile_name=str(payload.get("subagent_profile_name", "") or ""),
+                        subagent_profile_data=(
+                            payload["subagent_profile_data"]
+                            if isinstance(payload.get("subagent_profile_data"), dict) else None
+                        ),
+                        permission_mode=permission_mode,
+                    )
+                    self._send_json(status)
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": f"failed to start agent: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            # POST /api/agent/sessions/create — create an empty session
+            if path == "/api/agent/sessions/create":
+                try:
+                    payload = self._read_json_body()
+                    project_dir = str(payload.get("project_dir", "")).strip()
+                    title = str(payload.get("title", "") or "")
+                    if not project_dir:
+                        self._send_json({"error": "project_dir is required"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    self._send_json(AGENT_REGISTRY.create_session(project_dir, title))
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": f"failed to create agent session: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            # POST /api/agent/sessions/delete — delete a session
+            if path == "/api/agent/sessions/delete":
+                try:
+                    payload = self._read_json_body()
+                    project_dir = str(payload.get("project_dir", "")).strip()
+                    session_id = str(payload.get("session_id", "")).strip()
+                    if not project_dir or not session_id:
+                        self._send_json({"error": "project_dir and session_id are required"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    self._send_json(AGENT_REGISTRY.delete_session(project_dir, session_id))
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": f"failed to delete agent session: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            # POST /api/agent/answer — 回答 Agent 的 ask_user 提问（唤醒挂起的回合）
+            if path == "/api/agent/answer":
+                try:
+                    payload = self._read_json_body()
+                    project_dir = str(payload.get("project_dir", "")).strip()
+                    session_id = str(payload.get("session_id", "") or "") or None
+                    answers = payload.get("answers")
+                    if not project_dir:
+                        self._send_json({"error": "project_dir is required"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    if not isinstance(answers, list):
+                        self._send_json({"error": "answers must be an array"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    # 后端那边可能已经没在等这道题了（卡在提问上时被关了程序）：兜底会把
+                    # 这次选择当成一条用户消息、**另起一个回合**，所以前端上下文（token 只
+                    # 存在前端，不落盘）要一起带上——同 /api/agent/message。
+                    backend_profile_data = payload.get("backend_profile_data")
+                    translator_profile_data = payload.get("translator_profile_data")
+                    self._send_json(AGENT_REGISTRY.answer_ask(
+                        project_dir,
+                        session_id,
+                        answers,
+                        backend_profile_name=str(payload.get("backend_profile_name", "") or ""),
+                        backend_profile_data=(
+                            backend_profile_data if isinstance(backend_profile_data, dict) else None
+                        ),
+                        translator_profile_name=str(payload.get("translator_profile_name", "") or ""),
+                        translator_profile_data=(
+                            translator_profile_data
+                            if isinstance(translator_profile_data, dict)
+                            else None
+                        ),
+                        gendic_profile_name=str(payload.get("gendic_profile_name", "") or ""),
+                        gendic_profile_data=(
+                            payload["gendic_profile_data"]
+                            if isinstance(payload.get("gendic_profile_data"), dict) else None
+                        ),
+                        subagent_profile_name=str(payload.get("subagent_profile_name", "") or ""),
+                        subagent_profile_data=(
+                            payload["subagent_profile_data"]
+                            if isinstance(payload.get("subagent_profile_data"), dict) else None
+                        ),
+                        permission_mode=str(payload.get("permission_mode", "") or ""),
+                    ))
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": f"failed to answer agent question: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            # POST /api/agent/permission — 回答权限审批卡（allow-once / allow-session / deny）
+            # reason：拒绝时可选的"为什么不要"，随那条工具结果一起回给模型
+            if path == "/api/agent/permission":
+                try:
+                    payload = self._read_json_body()
+                    project_dir = str(payload.get("project_dir", "")).strip()
+                    session_id = str(payload.get("session_id", "") or "") or None
+                    decision = str(payload.get("decision", "") or "")
+                    reason = str(payload.get("reason", "") or "")
+                    if not project_dir:
+                        self._send_json({"error": "project_dir is required"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    # 同 /api/agent/answer：没在等的审批会被兜底成一条用户消息（另起回合），
+                    # 前端上下文要一起带上。
+                    backend_profile_data = payload.get("backend_profile_data")
+                    translator_profile_data = payload.get("translator_profile_data")
+                    self._send_json(AGENT_REGISTRY.answer_permission(
+                        project_dir,
+                        session_id,
+                        decision,
+                        reason,
+                        backend_profile_name=str(payload.get("backend_profile_name", "") or ""),
+                        backend_profile_data=(
+                            backend_profile_data if isinstance(backend_profile_data, dict) else None
+                        ),
+                        translator_profile_name=str(payload.get("translator_profile_name", "") or ""),
+                        translator_profile_data=(
+                            translator_profile_data
+                            if isinstance(translator_profile_data, dict)
+                            else None
+                        ),
+                        gendic_profile_name=str(payload.get("gendic_profile_name", "") or ""),
+                        gendic_profile_data=(
+                            payload["gendic_profile_data"]
+                            if isinstance(payload.get("gendic_profile_data"), dict) else None
+                        ),
+                        subagent_profile_name=str(payload.get("subagent_profile_name", "") or ""),
+                        subagent_profile_data=(
+                            payload["subagent_profile_data"]
+                            if isinstance(payload.get("subagent_profile_data"), dict) else None
+                        ),
+                        permission_mode=str(payload.get("permission_mode", "") or ""),
+                    ))
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": f"failed to answer agent permission: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            # POST /api/agent/permission-mode — 改权限模式（回合跑着也能改：下一次工具调用
+            # 就按新档判，在等的那张卡若已无必要会自动放行）
+            if path == "/api/agent/permission-mode":
+                try:
+                    payload = self._read_json_body()
+                    project_dir = str(payload.get("project_dir", "")).strip()
+                    session_id = str(payload.get("session_id", "") or "") or None
+                    mode = str(payload.get("permission_mode", "") or "")
+                    if not project_dir:
+                        self._send_json({"error": "project_dir is required"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    self._send_json(AGENT_REGISTRY.set_permission_mode(project_dir, session_id, mode))
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": f"failed to set agent permission mode: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            # POST /api/agent/message — send a user message to the project's
+            # agent session: queues as an interjection while running, or starts
+            # a new turn on the persistent conversation when idle.
+            if path == "/api/agent/message":
+                try:
+                    payload = self._read_json_body()
+                    project_dir = str(payload.get("project_dir", "")).strip()
+                    message = str(payload.get("message", "") or "")
+                    session_id = str(payload.get("session_id", "") or "") or None
+                    backend_profile_data = payload.get("backend_profile_data")
+                    if not project_dir:
+                        self._send_json({"error": "project_dir is required"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    if not message.strip() and not payload.get('images'):
+                        self._send_json({"error": "message is required"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    # 同 start：顺带刷新两份后端配置的名字/内容（用户可能中途改了默认）
+                    translator_profile_data = payload.get("translator_profile_data")
+                    status = AGENT_REGISTRY.message(
+                        project_dir,
+                        message,
+                        session_id,
+                        images=payload.get('images'),
+                        backend_profile_name=str(payload.get("backend_profile_name", "") or ""),
+                        backend_profile_data=(
+                            backend_profile_data
+                            if isinstance(backend_profile_data, dict)
+                            else None
+                        ),
+                        translator_profile_name=str(payload.get("translator_profile_name", "") or ""),
+                        translator_profile_data=(
+                            translator_profile_data
+                            if isinstance(translator_profile_data, dict)
+                            else None
+                        ),
+                        gendic_profile_name=str(payload.get("gendic_profile_name", "") or ""),
+                        gendic_profile_data=(
+                            payload["gendic_profile_data"]
+                            if isinstance(payload.get("gendic_profile_data"), dict) else None
+                        ),
+                        subagent_profile_name=str(payload.get("subagent_profile_name", "") or ""),
+                        subagent_profile_data=(
+                            payload["subagent_profile_data"]
+                            if isinstance(payload.get("subagent_profile_data"), dict) else None
+                        ),
+                        permission_mode=str(payload.get("permission_mode", "") or ""),
+                    )
+                    self._send_json(status)
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": f"failed to send agent message: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            # POST /api/agent/reset — stop any run and drop the session history
+            if path == "/api/agent/reset":
+                try:
+                    payload = self._read_json_body()
+                    project_dir = str(payload.get("project_dir", "")).strip()
+                    session_id = str(payload.get("session_id", "") or "") or None
+                    if not project_dir:
+                        self._send_json({"error": "project_dir is required"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    self._send_json(AGENT_REGISTRY.reset(project_dir, session_id))
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": f"failed to reset agent: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            # POST /api/agent/stop — stop a running agent
+            if path == "/api/agent/stop":
+                try:
+                    payload = self._read_json_body()
+                    project_dir = str(payload.get("project_dir", "")).strip()
+                    session_id = str(payload.get("session_id", "") or "") or None
+                    if not project_dir:
+                        self._send_json({"error": "project_dir is required"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    status = AGENT_REGISTRY.stop(project_dir, session_id)
+                    self._send_json(status)
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": f"failed to stop agent: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            # POST /api/agent/queue/delete — 删掉一条排队消息
+            # POST /api/agent/queue/update — 就地改一条排队消息
+            # POST /api/agent/queue/send   — 「立即」：打断当前回合，马上发这条
+            if path in ("/api/agent/queue/delete", "/api/agent/queue/update", "/api/agent/queue/send"):
+                try:
+                    payload = self._read_json_body()
+                    project_dir = str(payload.get("project_dir", "")).strip()
+                    session_id = str(payload.get("session_id", "") or "") or None
+                    item_id = str(payload.get("id", "") or "").strip()
+                    if not project_dir:
+                        self._send_json({"error": "project_dir is required"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    if not item_id:
+                        self._send_json({"error": "id is required"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    if path.endswith("/delete"):
+                        status = AGENT_REGISTRY.queue_delete(project_dir, item_id, session_id)
+                    elif path.endswith("/update"):
+                        status = AGENT_REGISTRY.queue_update(
+                            project_dir, item_id, str(payload.get("message", "") or ""), session_id
+                        )
+                    else:
+                        status = AGENT_REGISTRY.queue_send(project_dir, item_id, session_id)
+                    self._send_json(status)
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json(
+                        {"error": f"failed to handle agent queue: {exc}"},
+                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                return
+
+
             if path == "/api/openai-models":
                 try:
                     payload = self._read_json_body()
@@ -2402,10 +4644,19 @@ def build_handler(registry: JobRegistry):
             parsed = urlparse(self.path)
             path = parsed.path
 
+            if path == "/api/custom-background":
+                try:
+                    self._send_json(save_custom_background_settings(self._read_json_body()))
+                except (ValueError, TypeError) as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                except Exception as exc:
+                    self._send_json({"error": f"failed to save background settings: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
             if path == "/api/app-settings":
                 try:
                     payload = self._read_json_body()
-                    settings = save_app_settings(payload)
+                    settings = save_app_settings({**load_app_settings(), **payload})
                     self._send_json(settings)
                 except json.JSONDecodeError:
                     self._send_json({"error": "invalid json body"}, status=HTTPStatus.BAD_REQUEST)
@@ -2435,6 +4686,43 @@ def build_handler(registry: JobRegistry):
                     self._send_json({"error": "invalid json body"}, status=HTTPStatus.BAD_REQUEST)
                 except Exception as exc:
                     self._send_json({"error": f"failed to write profile: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            # PUT /api/projects/:id/guideline — 写项目翻译规范（覆写 / 增写 / 替换）
+            if path.startswith("/api/projects/") and path.endswith("/guideline"):
+                parts = path.split("/")
+                if len(parts) < 5:
+                    self._send_json({"error": "invalid project path"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                try:
+                    project_dir = _safe_project_dir(parts[3])
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                try:
+                    payload = self._read_json_body()
+                    if "replace_all" in payload:
+                        raise ValueError("replace_all 已移除；replace 自动替换全部匹配，请删除该参数")
+                    mode = str(payload.get("mode", "overwrite") or "overwrite").strip()
+                    result = apply_project_guideline_edit(
+                        project_dir,
+                        mode=mode,
+                        content=str(payload.get("content", "") or ""),
+                        old_text=str(payload.get("old_text", "") or ""),
+                        new_text=str(payload.get("new_text", "") or ""),
+                        # dry_run=1：只算不写，把"会落盘的那份全文"回给调用方（Agent 的
+                        # 审批卡据此提前显示 diff，见 runtime._preview_guideline_write）。
+                        # 走同一个入口是有意的——三种 mode 的拼接规则只有这一份实现。
+                        dry_run=bool(payload.get("dry_run")),
+                    )
+                    self._send_json({"success": True, "filename": PROJECT_GUIDELINE_FILENAME, **result})
+                except ValueError as exc:
+                    # 参数/内容不合法（模式不认识、replace 没命中、超长…）
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                except json.JSONDecodeError:
+                    self._send_json({"error": "invalid json body"}, status=HTTPStatus.BAD_REQUEST)
+                except Exception as exc:
+                    self._send_json({"error": f"failed to write guideline: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
 
             # PUT /api/projects/:id/config
@@ -2474,6 +4762,13 @@ def build_handler(registry: JobRegistry):
             parsed = urlparse(self.path)
             path = parsed.path
 
+            if path == "/api/custom-background":
+                try:
+                    self._send_json(clear_custom_background())
+                except Exception as exc:
+                    self._send_json({"error": f"failed to clear background: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
             # DELETE /api/backend-profiles/:name
             if path.startswith("/api/backend-profiles/"):
                 profile_name = unquote(path.split("/", 3)[-1])
@@ -2496,7 +4791,13 @@ def build_handler(registry: JobRegistry):
             return
 
         def _read_json_body(self) -> dict[str, Any]:
+            cached = getattr(self, "_cached_json_body", None)
+            if cached is not None:
+                self._cached_json_body = None
+                return cached
             content_length = int(self.headers.get("Content-Length", "0"))
+            if urlparse(self.path).path in {'/api/agent/start', '/api/agent/message'} and not 0 <= content_length <= 12 * 1024 * 1024:
+                raise ValueError('Agent request exceeds the 12 MiB budget')
             raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
             data = json.loads(raw_body.decode("utf-8") or "{}")
             if not isinstance(data, dict):
@@ -2504,12 +4805,23 @@ def build_handler(registry: JobRegistry):
             return data
 
         def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+            edit = getattr(self, "_cache_edit", None)
+            if edit is not None:
+                self._cache_edit = None
+                history = finish_edit(*edit)
+                if history is not None:
+                    payload = {**payload, "history": history}
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                # Closing a disclosure or switching pages cancels fetch requests.
+                # The client is gone; do not retry with an error response.
+                self.close_connection = True
 
         def _send_html(self, html: str) -> None:
             body = html.encode("utf-8")
@@ -2519,41 +4831,156 @@ def build_handler(registry: JobRegistry):
             self.end_headers()
             self.wfile.write(body)
 
+        def _stream_agent(self, project_dir: str, after_step: int = 0, session_id: str | None = None) -> None:
+            """SSE stream of agent events. Replays events after after_step then
+            polls new ones until the agent reaches a terminal state, then closes."""
+            import time as _time
+
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            def _sse(event: dict[str, Any]) -> None:
+                msg = f"event: agent\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                self.wfile.write(msg.encode("utf-8"))
+                self.wfile.flush()
+
+            def _heartbeat() -> None:
+                # SSE 注释帧（没有 data:），前端解析器直接忽略。它的用处是探活：客户端早就
+                # 切走/关页的流，服务端这边只有在**写**的时候才会发现对端没了（BrokenPipe）。
+                # 回合长时间没新事件（等 LLM 首字、等工具跑完）就一直不写，这条线程会抱着
+                # 连接空转到回合结束，切几次会话就攒几条——每条每 0.5s 都来 status() 一趟。
+                self.wfile.write(b": ping\n\n")
+                self.wfile.flush()
+
+            try:
+                # 先发一次状态快照，让前端知道当前阶段
+                _sse({"type": "status", **{k: v for k, v in AGENT_REGISTRY.status(project_dir, session_id).items() if k != "events"}})
+                last_step = max(0, after_step)
+                deadline_loops = 0
+                idle_ticks = 0
+                # 启动宽限期：Agent 线程可能略晚于 start() 返回才发出第一个事件，
+                # 在此之前 status 可能仍是 idle，不应据此提前结束流。
+                warmup_grace = 20  # 最多等 20 个 tick (10s) 让首个事件到达
+                # 翻译流程可能很长；最多轮询 6 小时
+                while deadline_loops < 6 * 3600:
+                    events = AGENT_REGISTRY.drain_events(project_dir, after_step=last_step, session_id=session_id)
+                    for ev in events:
+                        _sse(ev)
+                        if ev.get("step", 0) > last_step:
+                            last_step = ev["step"]
+                    if events:
+                        idle_ticks = 0
+                    else:
+                        idle_ticks += 1
+                        if idle_ticks % 4 == 0:  # 约每 2s 探一次活
+                            _heartbeat()
+                    snap = AGENT_REGISTRY.status(project_dir, session_id)
+                    # awaiting_input = 回合结束但会话还活着；对订阅方而言本轮已终态，
+                    # 流自然关闭，用户发下一条消息时前端带 after_step 重订即可。
+                    terminal = snap["status"] in ("done", "awaiting_input", "stopped", "failed")
+                    # idle 仅在宽限期过后才视为结束（避免 start/订阅竞态下空流退出）
+                    idle_expired = snap["status"] == "idle" and deadline_loops >= warmup_grace
+                    if (terminal or idle_expired) and not events:
+                        _sse({"type": "status", "status": snap["status"], "step": snap.get("step", 0)})
+                        break
+                    _time.sleep(0.5)
+                    deadline_loops += 1
+                _sse({"type": "close"})
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # 客户端断开连接（Windows 上对端关闭多报 ConnectionAborted/Reset）
+                pass
+
     return RequestHandler
 
 
-def serve(host: str = "127.0.0.1", port: int = 12333) -> None:
+class BackendHTTPServer(ThreadingHTTPServer):
+    # Windows SO_REUSEADDR permits multiple live listeners on the same port.
+    # Keep POSIX restart behavior, but require an exclusive listener on Windows.
+    allow_reuse_address = os.name != "nt"
+    allow_reuse_port = False
+
+    def server_bind(self) -> None:
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        if (os.name == "nt" or sys.platform == "darwin") and self.server_address[1]:
+            # macOS/legacy Windows listeners can overlap wildcard addresses.
+            # Probe fixed ports while retaining reuse for closed connections.
+            host, port = self.server_address
+            target = "127.0.0.1" if host in ("", "0.0.0.0") else host
+            with socket.socket(self.address_family, socket.SOCK_STREAM) as probe:
+                probe.settimeout(1)
+                if probe.connect_ex((target, port)) == 0:
+                    raise OSError(errno.EADDRINUSE, "Address already in use")
+        # HTTPServer resolves the host's FQDN here, which can block startup on
+        # macOS DNS. The API only needs the bound address and dynamic port.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+def serve(host: str = "127.0.0.1", port: int = 12333, *, ready_file: str | None = None) -> None:
     registry = JobRegistry()
     try:
-        server = ThreadingHTTPServer((host, port), build_handler(registry))
+        server = BackendHTTPServer((host, port), build_handler(registry))
     except OSError as exc:
-        # WinError 10048 / errno 98 (EADDRINUSE) / errno 13 (EACCES on Windows for occupied ports)
         errno_val = getattr(exc, "errno", None)
         winerror = getattr(exc, "winerror", None)
-        if errno_val in (48, 98, 10048, 13) or winerror == 10048:
+        if errno_val in (errno.EADDRINUSE, 10048) or winerror == 10048:
             print(
                 f"[错误] 端口 {port} 已被占用，无法启动 GalTransl 后端服务。\n"
                 f"       请先关闭占用该端口的程序，或使用 --port 指定其他端口，例如：\n"
                 f"       python run_backend.py --host {host} --port {port + 1}"
             )
             raise SystemExit(1)
+        if errno_val in (errno.EACCES, 10013) or winerror == 10013:
+            # Windows can return WSAEACCES when another socket owns the port
+            # exclusively; reserved ports and access restrictions also use it.
+            print(
+                f"[错误] 无法绑定 {host}:{port}：端口已被其他程序独占或被系统限制访问。\n"
+                f"       请检查已有后端实例和系统端口限制，或使用 --port 指定其他端口。\n"
+                f"       系统错误：{exc}"
+            )
+            raise SystemExit(1)
         print(f"[错误] 无法绑定 {host}:{port} —— {exc}")
         raise SystemExit(1)
-    print(f"GalTransl backend mode listening at http://{host}:{port}")
     try:
+        # Agent tool calls (including restored sessions) must stay on this backend.
+        AGENT_REGISTRY.host = "127.0.0.1" if host == "0.0.0.0" else host
+        AGENT_REGISTRY.port = server.server_port
+        if ready_file:
+            ready_path = Path(ready_file)
+            temporary_path = ready_path.with_name(ready_path.name + ".tmp")
+            try:
+                temporary_path.write_text(json.dumps({
+                    "host": host, "port": server.server_port, "pid": os.getpid(),
+                }), encoding="utf-8")
+                os.replace(temporary_path, ready_path)
+            except OSError as exc:
+                print(f"[错误] 无法通知桌面端后端地址：{exc}", flush=True)
+                raise SystemExit(1)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+        print(f"GalTransl backend mode listening at http://{host}:{server.server_port}", flush=True)
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+        from GalTransl.Extraction.runtime import EXTRACTION_RUNTIME
+        EXTRACTION_RUNTIME.close()
+        if ready_file:
+            Path(ready_file).unlink(missing_ok=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser("GalTransl backend mode")
     parser.add_argument("--host", default="127.0.0.1", help="bind host")
-    parser.add_argument("--port", type=int, default=12333, help="bind port")
+    parser.add_argument("--port", type=int, default=12333, help="bind port (0 selects an available port)")
+    parser.add_argument("--ready-file", help="write the bound address as JSON for the desktop launcher")
     args = parser.parse_args()
-    serve(args.host, args.port)
+    serve(args.host, args.port, ready_file=args.ready_file)
 
 
 if __name__ == "__main__":

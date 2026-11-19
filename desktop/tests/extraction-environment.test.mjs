@@ -1,0 +1,297 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { Children, createElement as h, isValidElement } from 'react';
+import { act, create } from 'react-test-renderer';
+import { createTypeScriptLoader } from './helpers/load-typescript.mjs';
+
+const initial = {
+  ready: false, problems: ['skill_missing'], python_version: 'Python 3.11',
+  settings: { skill_dir: '/app/skills', python_path: '', skill_auto_update: true },
+  skill: { installed: false, current_commit: '', latest_commit: '', update_available: false },
+  system_pythons: [
+    { executable: '/usr/bin/python3', version: '3.11.9', architecture: 64, args: [] },
+    { executable: '/project/.venv/bin/python', version: '3.12.1', architecture: 64, args: [] },
+  ],
+};
+const installed = {
+  ...initial, ready: true, problems: [], settings: { skill_dir: '/custom/skills', python_path: '', skill_auto_update: true },
+  skill: { ...initial.skill, installed: true, current_commit: 'b'.repeat(40) },
+};
+const enabled = { ...installed, skill: { ...installed.skill, latest_commit: installed.skill.current_commit } };
+
+function mount(api, environment = initial, refresh = () => Promise.resolve(environment)) {
+  const saved = [], calls = [];
+  const load = createTypeScriptLoader({ document: { body: {}, documentElement: {}, addEventListener() {}, removeEventListener() {} } }, {
+    'react-dom': { createPortal: children => children },
+    '../../features/connection/ConnectionContext': { useConnection: () => ({ backendUrl: 'http://localhost:8000' }) },
+    '../lib/api': {
+      fetchAppSettings: async () => ({ extractionBillionContextEnabled: false }),
+      updateAppSettings: async patch => patch,
+      fetchMemories: async () => ({ entries: [] }),
+    },
+    '../../i18n': { useUiLanguage: () => 'zh-CN' },
+    '@tauri-apps/plugin-dialog': { open: async () => null },
+    './useDirectoryDrop': {},
+    './labels': { x: key => key },
+    './api': {
+      getDisableAnimationsPreference: () => true,
+      extractionApi: (action, params, body) => { calls.push({ action, body }); return api(action, body); },
+    },
+  });
+  const { EnvironmentDialog } = load(new URL('../src/pages/extraction/Dialogs.tsx', import.meta.url));
+  let closed = false, renderer;
+  act(() => { renderer = create(h(EnvironmentDialog, { initial: environment, refresh, saved: value => saved.push(value), close: () => { closed = true; } })); });
+  return { renderer, saved, calls, closed: () => closed,
+    button: key => renderer.root.findAllByType('button').find(node => node.children.includes(key)) };
+}
+
+// Path fields only; the auto-update switch is a checkbox input.
+const textInputs = dialog => dialog.renderer.root.findByType('form').findAllByType('input')
+  .filter(node => node.props.type !== 'checkbox');
+const pythonSelect = renderer => renderer.root.findAllByProps({ 'aria-label': 'pythonInterpreterLabel' })
+  .find(node => typeof node.props.onChange === 'function');
+
+test('runtime skill actions are explicit and downloads activate without losing pending Python edits', async () => {
+  const dialog = mount(async (action, body) => {
+    if (action === 'skill-check') return { ...initial.skill, latest_commit: 'b'.repeat(40), update_available: true };
+    if (action === 'skill-install') return installed;
+    if (action === 'settings') return { ...installed, settings: body };
+    throw Error(`Unexpected action: ${action}`);
+  });
+  await act(async () => {});
+  assert.equal(dialog.calls.length, 0);
+  assert.ok(dialog.button('skillDownload'));
+  act(() => pythonSelect(dialog.renderer).props.onChange({ target: { value: 'custom' } }));
+  act(() => textInputs(dialog)[1].props.onChange({ target: { value: '/custom/python' } }));
+  await act(async () => dialog.button('skillCheck').props.onClick());
+  assert.equal(dialog.calls[0].action, 'skill-check');
+  assert.equal(dialog.calls[0].body.skill_dir, initial.settings.skill_dir);
+  assert.ok(dialog.renderer.root.findAllByType('p').some(node => node.children.includes('skillUpdateAvailable')));
+  assert.equal(dialog.saved.length, 1);
+  assert.equal(dialog.saved[0].skill.update_available, true);
+  assert.equal(dialog.saved[0].settings.python_path, '');
+  await act(async () => dialog.button('skillDownload').props.onClick());
+  assert.equal(dialog.calls.at(-1).body.skill_dir, initial.settings.skill_dir);
+  assert.deepEqual(JSON.parse(JSON.stringify(dialog.saved.at(-1))), enabled);
+  assert.equal(dialog.closed(), false);
+  assert.equal(textInputs(dialog)[0].props.value, installed.settings.skill_dir);
+  assert.equal(textInputs(dialog)[1].props.value, '/custom/python');
+  assert.ok(dialog.renderer.root.findAllByType('p').some(node => node.children.includes('skillUpToDate')));
+  assert.equal(dialog.renderer.root.findAllByType('p').some(node => node.children.includes('missingSkill')), false);
+  assert.equal(dialog.button('skillUpdate').props.disabled, true);
+  act(() => textInputs(dialog)[0].props.onChange({ target: { value: '/custom/skill' } }));
+  assert.equal(dialog.renderer.root.findAllByType('code').length, 0);
+  await act(async () => dialog.renderer.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+  assert.equal(dialog.calls.at(-1).body.skill_dir, '/custom/skill');
+  assert.equal(dialog.calls.at(-1).body.python_path, '/custom/python');
+  assert.equal(dialog.closed(), true);
+  act(() => dialog.renderer.unmount());
+});
+
+test('detected interpreters can be selected and saved while automatic selection stays empty', async () => {
+  const dialog = mount(async (action, body) => ({ ...initial, settings: body }));
+  await act(async () => {});
+  const select = () => pythonSelect(dialog.renderer);
+  assert.equal(select().props.value, '');
+  assert.deepEqual(Children.toArray(select().props.children).filter(isValidElement).map(node => node.props.value),
+    ['', '/usr/bin/python3', '/project/.venv/bin/python', 'custom']);
+  act(() => select().props.onChange({ target: { value: '/project/.venv/bin/python' } }));
+  await act(async () => dialog.renderer.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+  assert.equal(dialog.calls.at(-1).body.python_path, '/project/.venv/bin/python');
+  act(() => dialog.renderer.unmount());
+});
+
+test('checking an unsaved Skill path leaves the sidebar state alone and saving interpreter edits retains the active update notice', async () => {
+  const checked = { ...installed.skill, latest_commit: 'c'.repeat(40), update_available: true };
+  const dialog = mount(async (action, body) => action === 'skill-check' ? checked : { ...installed, settings: body },
+    { ...installed, skill: checked });
+  await act(async () => {});
+  const path = () => textInputs(dialog)[0];
+  act(() => path().props.onChange({ target: { value: '/pending/skill' } }));
+  await act(async () => dialog.button('skillCheck').props.onClick());
+  assert.equal(dialog.saved.length, 0);
+  act(() => path().props.onChange({ target: { value: installed.settings.skill_dir } }));
+  await act(async () => dialog.button('skillCheck').props.onClick());
+  assert.equal(dialog.saved.at(-1).skill.update_available, true);
+  act(() => pythonSelect(dialog.renderer).props.onChange({ target: { value: '/project/.venv/bin/python' } }));
+  await act(async () => dialog.renderer.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+  assert.equal(dialog.saved.at(-1).settings.python_path, '/project/.venv/bin/python');
+  assert.equal(dialog.saved.at(-1).skill.update_available, true);
+  act(() => dialog.renderer.unmount());
+});
+
+test('refreshing interpreters keeps pending paths and makes newly installed Python selectable', async () => {
+  const newer = { executable: '/new/python', version: '3.13.0', architecture: 64, args: [] };
+  const dialog = mount(async action => {
+    assert.equal(action, 'environment');
+    return { ...initial, system_pythons: [newer] };
+  });
+  await act(async () => {});
+  act(() => textInputs(dialog)[0].props.onChange({ target: { value: '/pending/skill' } }));
+  await act(async () => dialog.button('pythonRefresh').props.onClick());
+  assert.equal(textInputs(dialog)[0].props.value, '/pending/skill');
+  assert.deepEqual(Children.toArray(pythonSelect(dialog.renderer).props.children).filter(isValidElement).map(node => node.props.value), ['', newer.executable, 'custom']);
+  assert.equal(dialog.saved.length, 0);
+  act(() => dialog.renderer.unmount());
+});
+
+test('checks and downloads show errors, release disabled controls, and permit retry', async () => {
+  let finish;
+  const dialog = mount(() => new Promise((resolve, reject) => { finish = { resolve, reject }; }), installed);
+  await act(async () => {});
+  act(() => dialog.button('skillCheck').props.onClick());
+  assert.equal(dialog.renderer.root.findByType('fieldset').props.disabled, true);
+  assert.ok(dialog.button('skillChecking'));
+  await act(async () => finish.reject(Error('Network unavailable')));
+  assert.equal(dialog.renderer.root.findByProps({ role: 'alert' }).children.join(''), 'Network unavailable');
+  assert.equal(dialog.renderer.root.findByType('fieldset').props.disabled, false);
+  act(() => dialog.button('skillUpdate').props.onClick());
+  assert.ok(dialog.button('skillInstalling'));
+  await act(async () => finish.reject(Error('Download failed')));
+  assert.equal(dialog.renderer.root.findByProps({ role: 'alert' }).children.join(''), 'Download failed');
+  assert.equal(textInputs(dialog)[0].props.value, installed.settings.skill_dir);
+  assert.equal(dialog.saved.length, 0);
+  act(() => dialog.button('skillUpdate').props.onClick());
+  await act(async () => finish.resolve(installed));
+  assert.equal(dialog.renderer.root.findAllByProps({ role: 'alert' }).length, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(dialog.saved)), [enabled]);
+  act(() => dialog.renderer.unmount());
+});
+
+test('settings display cached information before environment discovery finishes', async () => {
+  let finish;
+  const dialog = mount(async () => initial, initial, () => new Promise(resolve => { finish = resolve; }));
+  assert.equal(dialog.renderer.root.findAll(node => node.type === 'section' && node.props.role === 'dialog').length, 1);
+  assert.equal(textInputs(dialog)[0].props.value, initial.settings.skill_dir);
+  assert.equal(dialog.renderer.root.findByType('fieldset').props.disabled, true);
+  assert.ok(dialog.button('pythonDetecting'));
+  assert.equal(dialog.button('cancel').props.disabled, false);
+  await act(async () => finish(installed));
+  assert.equal(textInputs(dialog)[0].props.value, installed.settings.skill_dir);
+  assert.equal(dialog.renderer.root.findByType('fieldset').props.disabled, false);
+  assert.ok(dialog.button('pythonRefresh'));
+  act(() => dialog.renderer.unmount());
+});
+
+test('settings open before the first environment load, and failed discovery can be retried inside the dialog', async () => {
+  let finish;
+  const dialog = mount(async () => initial, null, () => new Promise((resolve, reject) => { finish = { resolve, reject }; }));
+  assert.equal(dialog.renderer.root.findAll(node => node.type === 'section' && node.props.role === 'dialog').length, 1);
+  assert.equal(dialog.renderer.root.findByProps({ role: 'status', className: 'extract-muted' }).children.join(''), 'loading');
+  assert.equal(dialog.button('save').props.disabled, true);
+  await act(async () => finish.reject(Error('Discovery failed')));
+  assert.equal(dialog.renderer.root.findByProps({ role: 'alert' }).children.join(''), 'Discovery failed');
+  act(() => dialog.button('reload').props.onClick());
+  assert.equal(dialog.renderer.root.findByProps({ role: 'status', className: 'extract-muted' }).children.join(''), 'loading');
+  await act(async () => finish.resolve(installed));
+  assert.equal(dialog.renderer.root.findAllByProps({ role: 'alert' }).length, 0);
+  assert.equal(textInputs(dialog)[0].props.value, installed.settings.skill_dir);
+  assert.equal(dialog.button('save').props.disabled, false);
+  act(() => dialog.renderer.unmount());
+});
+
+test('the extraction settings button opens the dialog without waiting for the environment request', async () => {
+  let finish;
+  const refresh = new Promise(resolve => { finish = resolve; });
+  let renderer;
+  const load = createTypeScriptLoader({
+    document: { body: {}, documentElement: {}, addEventListener() {}, removeEventListener() {} },
+    window: { innerWidth: 1366, matchMedia: () => ({ matches: true }), addEventListener() {}, removeEventListener() {} },
+  }, {
+    'react-dom': { createPortal: children => children },
+    'react-router-dom': { useNavigate: () => () => {} },
+    '../styles/pages/agent.css': {}, '../styles/pages/extraction.css': {},
+    '../lib/api': { fetchAppSettings: async () => ({ extractionBillionContextEnabled: false }), fetchMemories: async () => ({ entries: [] }) },
+    './HomePage': {},
+    './agent/drafts': { useMessageDraft: () => ['', () => {}] },
+    './agent/images': { useImageInput: () => ({ images: [] }) },
+    './extraction/useExtraction': { useExtraction: () => ({
+      selected: '', sessions: { sessions: [], total: 0, next_offset: null }, environment: null,
+      refreshEnvironment: () => refresh, setEnvironment() {},
+    }) },
+    './extraction/useModelProfile': { useModelProfile: () => ({ models: [] }) },
+    './extraction/Composer': { ExtractionComposer: () => null },
+    '../../features/connection/ConnectionContext': { useConnection: () => ({ backendUrl: 'http://localhost:8000' }) },
+    '@tauri-apps/plugin-dialog': { open: async () => null },
+    './useDirectoryDrop': {},
+  });
+  const { ExtractionPage } = load(new URL('../src/pages/ExtractionPage.tsx', import.meta.url));
+  act(() => { renderer = create(h(ExtractionPage)); });
+  assert.equal(renderer.root.findAll(node => node.type === 'section' && node.props.role === 'dialog').length, 0);
+  act(() => renderer.root.findByProps({ className: 'agent-settings-button' }).props.onClick());
+  assert.equal(renderer.root.findAll(node => node.type === 'section' && node.props.role === 'dialog').length, 1);
+  const close = renderer.root.findByProps({ className: 'agent-settings-dialog__header' }).findByType('button');
+  act(() => close.props.onClick());
+  assert.equal(renderer.root.findAll(node => node.type === 'section' && node.props.role === 'dialog').length, 0);
+  await act(async () => finish(installed));
+  assert.equal(renderer.root.findAll(node => node.type === 'section' && node.props.role === 'dialog').length, 0);
+  act(() => renderer.unmount());
+});
+
+
+test('missing extraction Skill shows not ready and blocks buttons, Enter and queued sends', async () => {
+  const session = { id: 'readiness', title: 'Fixture', game_dir: '/game', workspace: '/workspace', status: 'idle' };
+  const requests = [];
+  let environment = { ...initial, ready: true, skill: { ...initial.skill, update_available: true } };
+  const load = createTypeScriptLoader({
+    document: { body: {}, documentElement: {}, addEventListener() {}, removeEventListener() {} },
+    window: { innerWidth: 1366, matchMedia: () => ({ matches: true }) },
+  }, {
+    'react-dom': { createPortal: children => children },
+    'react-router-dom': { useNavigate: () => () => {} },
+    '../styles/pages/agent.css': {}, '../styles/pages/extraction.css': {},
+    '../lib/api': { getBackendProfile: () => ({ type: 'OpenAI-Compatible' }) },
+    './HomePage': {},
+    './agent/drafts': { useMessageDraft: () => ['Inspect a fixture', () => {}] },
+    './agent/images': { useImageInput: () => ({ images: [], processing: false, removeSent() {} }), imageUploads: () => [] },
+    './extraction/useExtraction': { useExtraction: () => ({
+      selected: session.id, sessions: { sessions: [], total: 0 }, environment,
+      view: { session, rows: [], queued: [{ id: 'queued', text: 'Inspect later' }] },
+      mutate: async (...args) => { requests.push(args); return {}; },
+    }) },
+    './extraction/useModelProfile': { useModelProfile: () => ({ models: ['fixture'], profile: 'fixture' }) },
+    './extraction/SessionFolders': { SessionFolders: () => null },
+    './extraction/labels': { x: key => key, statusLabel: value => value },
+    '../agent/ComposerSelect': { ComposerSelect: () => null },
+  });
+  const { ExtractionPage } = load(new URL('../src/pages/ExtractionPage.tsx', import.meta.url));
+  let renderer;
+  act(() => { renderer = create(h(ExtractionPage)); });
+  const send = () => renderer.root.findByProps({ className: 'agent-composer__send' });
+  const queuedSend = () => renderer.root.findByProps({ className: 'agent-queue__act is-primary' });
+  const settings = () => renderer.root.findByProps({ className: 'agent-settings-button' });
+  assert.equal(settings().findByType('span').children.join(''), 'notReady');
+  assert.equal(settings().findByType('i').props.className, '');
+  assert.equal(send().props.disabled, true);
+  assert.equal(queuedSend().props.disabled, true);
+  await act(async () => { send().props.onClick(); queuedSend().props.onClick(); });
+  act(() => renderer.root.findByProps({ className: 'agent-composer__input' }).props.onKeyDown({ key: 'Enter', nativeEvent: {}, preventDefault() {} }));
+  assert.equal(requests.length, 0);
+  environment = installed;
+  act(() => renderer.update(h(ExtractionPage)));
+  assert.equal(settings().findByType('span').children.join(''), 'ready');
+  assert.equal(settings().findByType('i').props.className, 'is-ready');
+  assert.equal(send().props.disabled, false);
+  assert.equal(queuedSend().props.disabled, false);
+  await act(async () => send().props.onClick());
+  assert.equal(requests[0][0], 'message');
+  act(() => renderer.unmount());
+});
+
+test('the auto-update switch is on by default and saves on its own, keeping pending path edits', async () => {
+  const dialog = mount(async (action, body) => {
+    if (action === 'settings') return { ...enabled, settings: { ...enabled.settings, ...body } };
+    throw Error(`Unexpected action: ${action}`);
+  }, enabled);
+  await act(async () => {});
+  const toggle = () => dialog.renderer.root.findByType('form').findByProps({ role: 'switch' });
+  assert.equal(toggle().props.checked, true);
+  act(() => textInputs(dialog)[0].props.onChange({ target: { value: '/pending/skill' } }));
+  await act(async () => toggle().props.onChange({ target: { checked: false } }));
+  assert.equal(JSON.stringify(dialog.calls), JSON.stringify([{ action: 'settings', body: { skill_auto_update: false } }]));
+  assert.equal(toggle().props.checked, false);
+  assert.equal(dialog.saved.at(-1).settings.skill_auto_update, false);
+  assert.equal(dialog.saved.at(-1).settings.skill_dir, enabled.settings.skill_dir);
+  assert.equal(textInputs(dialog)[0].props.value, '/pending/skill');
+  assert.equal(dialog.closed(), false);
+});

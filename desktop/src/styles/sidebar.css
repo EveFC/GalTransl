@@ -8,10 +8,20 @@
   top: 0;
   background: var(--color-surface-strong);
   border-right: 1px solid var(--color-line);
+  /* 折叠/展开用 width 过渡（两种状态的内部布局不同，transform 做不到）。
+     注意别加 contain: layout/paint：侧栏里挂着 position: fixed 的文件夹弹窗、
+     右键菜单和通知，contain 会让它们以侧栏为包含块并被裁剪。 */
   transition: width 240ms cubic-bezier(0.4, 0, 0.2, 1);
   overflow: hidden;
   flex-shrink: 0;
   z-index: 10;
+}
+
+/* The app layout gives all direct children a positioned z-index with a more
+   specific selector. Keep the sidebar (and its viewport-level toast host)
+   above page surfaces such as the translation cockpit. */
+.app-layout > .sidebar {
+  z-index: 30;
 }
 
 .sidebar--expanded {
@@ -20,6 +30,25 @@
 
 .sidebar--collapsed {
   width: 60px;
+}
+
+/* 60px 窄栏里只放图标：去掉左右内边距让图标居中，否则 16px 内边距 + 24px 图标
+   比高亮底块还宽，图标会被挤出底块右侧。 */
+.sidebar--collapsed .sidebar__nav-item {
+  justify-content: center;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+/* 窄栏的项目列表不预留滚动条槽：槽位会吃掉十来个像素，让这一段的高亮底块比上下
+   两段窄、还偏左。列表仍可用滚轮滚动。 */
+.sidebar--collapsed .sidebar__nav {
+  scrollbar-gutter: auto;
+  scrollbar-width: none;
+}
+
+.sidebar--collapsed .sidebar__nav::-webkit-scrollbar {
+  display: none;
 }
 
 .sidebar__header {
@@ -56,12 +85,19 @@
 }
 
 .sidebar__top-nav {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
   padding: var(--space-3) 0 var(--space-1);
   flex-shrink: 0;
+  /* 与下面的项目列表分开：上面是固定入口（首页 / Agent），下面是可滚动的项目。
+     线自己只留 space-1，导航项内边距与项间距一起提供留白。 */
+  border-bottom: 1px solid var(--color-line);
 }
 
 .sidebar__nav {
   flex: 1;
+  /* 与上下两条线各留 space-1（导航项/项目行自带内边距，见 .sidebar__top-nav 注释） */
   padding: var(--space-1) 0;
   display: flex;
   flex-direction: column;
@@ -93,6 +129,7 @@
 }
 
 .sidebar__nav-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -109,6 +146,60 @@
     color var(--transition-fast);
   white-space: nowrap;
   overflow: hidden;
+}
+
+:is(.sidebar__top-nav, .sidebar__bottom-nav) .sidebar__nav-item {
+  padding-block: var(--space-2);
+}
+
+.sidebar__nav-notice-dot {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  width: 8px;
+  height: 8px;
+  border: 2px solid var(--color-surface-strong);
+  border-radius: 50%;
+  background: var(--color-danger);
+  box-sizing: content-box;
+  pointer-events: none;
+}
+
+.sidebar__project-config-notice-dot {
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+/* 运行中的任务用静态蓝点标识，避免在其它页面也持续触发合成。 */
+.sidebar__project-child-running-dot,
+.sidebar__nav-running-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-primary);
+  pointer-events: none;
+}
+
+/* 展开态：跟在「开始翻译」文字后面靠右，与配置未保存红点同位 */
+.sidebar__project-child-running-dot {
+  flex: 0 0 7px;
+  margin-left: auto;
+}
+
+/* 收起态 60px 窄栏：贴在导航项右上角（与 .sidebar__nav-notice-dot 同几何） */
+.sidebar__nav-running-dot {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+}
+
+/* Agent 入口：有会话跑完但还没点开看过（与会话列表里的灯同色），出错结束为橙色 */
+.sidebar__agent-dot--done {
+  background: var(--color-success);
+}
+
+.sidebar__agent-dot--failed {
+  background: var(--color-warning);
 }
 
 .sidebar__nav-item:hover {
@@ -131,6 +222,10 @@
   width: 24px;
   text-align: center;
   font-size: 16px;
+}
+
+:is(.sidebar__top-nav, .sidebar__bottom-nav) .sidebar__nav-icon {
+  font-size: 18px;
 }
 
 .sidebar__nav-item--sub {
@@ -159,14 +254,34 @@
   flex-direction: column;
 }
 
+/* 按下项目行拖拽排序：被拖项跟手，其余项平移让位，松手后才真正重排 */
+.sidebar__nav--dragging {
+  cursor: grabbing;
+}
+
+.sidebar__nav--dragging .sidebar__project-group {
+  pointer-events: none;
+  transition: transform 160ms ease;
+}
+
+.sidebar__nav--dragging .sidebar__project-group--dragging {
+  position: relative;
+  z-index: 2;
+  border-radius: var(--radius-control);
+  background: var(--color-surface-strong);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+  opacity: 0.94;
+  transition: none;
+}
+
 .sidebar__project-header {
   position: relative;
   display: flex;
   align-items: center;
   gap: var(--space-2);
   width: calc(100% - var(--space-4));
+  /* 行高与上方「首页 / Agent」导航项一致：同样的上下内边距，由内容撑高 */
   padding: var(--space-2) var(--space-4);
-  min-height: 48px;
   margin: 0 var(--space-2);
   border: none;
   border-radius: var(--radius-control);
@@ -205,17 +320,34 @@
   min-width: 0;
 }
 
+.sidebar__wizard-header {
+  text-decoration: none;
+}
+
+.sidebar__wizard-header--active,
+.sidebar__wizard-header--active:hover {
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+}
+
+.sidebar__wizard-header:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
+}
+
 .sidebar__project-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 26px;
-  height: 26px;
+  /* 24px = 导航项图标（18px 字号）的行盒高度，项目行因此与导航项等高 */
+  height: 24px;
   border-radius: 6px;
   font-size: 17px;
   flex-shrink: 0;
   color: inherit;
-  transition: width 180ms ease, height 180ms ease, font-size 180ms ease;
+  /* 图标在紧凑/展开态之间改尺寸：不做 transition（宽高/字号都是布局属性，
+     动它们等于给每帧加一次重排），瞬时切换即可 */
 }
 
 .sidebar__project-icon--compact {
@@ -227,24 +359,6 @@
 
 .sidebar__project-icon--open {
   font-size: 18px;
-}
-
-.sidebar__project-icon--link {
-  cursor: pointer;
-  background: none;
-  border: none;
-  padding: 0;
-  color: inherit;
-  transition: background 150ms ease, transform 120ms ease;
-}
-
-.sidebar__project-icon--link:hover {
-  background: var(--color-primary-soft);
-  transform: scale(1.15);
-}
-
-.sidebar__project-icon--link:active {
-  transform: scale(0.95);
 }
 
 .sidebar__project-close {
@@ -259,7 +373,9 @@
   height: 22px;
   border: none;
   border-radius: 6px;
-  background: var(--color-surface-strong);
+  /* 透明的关闭按钮：默认不铺底色（以前是白色圆角块，压在行尾很显眼）。
+     悬停时才给一点淡红底（见下），保留"这是个能点的按钮"的可读性。 */
+  background: transparent;
   color: var(--color-text-muted);
   cursor: pointer;
   font-size: 11px;
@@ -273,6 +389,24 @@
 
 .sidebar__project-header:hover .sidebar__project-close {
   opacity: 1;
+}
+
+/* 新建项目向导条目：复用项目关闭按钮，但按钮在 NavLink 外侧，
+   hover 判定和定位都交给这层 wrapper。 */
+.sidebar__wizard-header-wrap {
+  position: relative;
+}
+
+.sidebar__wizard-header-wrap:hover .sidebar__project-close {
+  opacity: 1;
+}
+
+.sidebar__wizard-header-wrap .sidebar__project-close {
+  right: calc(var(--space-2) + 6px);
+}
+
+.sidebar__wizard-header-wrap .sidebar__project-confirm-bubble {
+  right: var(--space-2);
 }
 
 .sidebar__project-close:hover {
@@ -328,7 +462,7 @@
   font-size: 11px;
   font-weight: 600;
   cursor: pointer;
-  transition: all var(--transition-fast);
+  transition: background-color var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
 }
 
 .sidebar__project-confirm-no:hover {
@@ -349,7 +483,8 @@
     max-height 220ms ease,
     opacity 180ms ease,
     transform 220ms ease;
-  will-change: max-height, opacity, transform;
+  /* 不挂 will-change：max-height 提升不了合成层（白占显存提示），
+     transform/opacity 由浏览器按需提升即可。 */
 }
 
 .sidebar__project-children--expanded {
@@ -407,6 +542,17 @@
   text-overflow: ellipsis;
 }
 
+.sidebar__project-child-notice-dot {
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  margin-left: auto;
+  border-radius: 50%;
+  background: var(--color-danger);
+  box-shadow: 0 0 0 2px var(--color-surface-strong);
+  pointer-events: none;
+}
+
 .sidebar__project-child-separator {
   height: 1px;
   margin: 4px 12px;
@@ -422,7 +568,7 @@
   color: var(--color-text);
 }
 
-@media (prefers-reduced-motion: no-preference) and (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) {
   .sidebar__project-children {
     transition: none;
     transform: none;
@@ -458,6 +604,9 @@
   right: 18px;
   z-index: 110;
   width: min(380px, calc(100vw - 36px));
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .sidebar__toast-host .inline-alert {
@@ -476,7 +625,9 @@
 }
 
 .sidebar__context-menu-item {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
   width: 100%;
   padding: var(--space-2) var(--space-4);
   border: none;
@@ -490,6 +641,27 @@
     background-color var(--transition-fast),
     color var(--transition-fast);
   white-space: nowrap;
+}
+
+/* 图标列定宽：没有图标的项也放一个空的，文字才能和带图标的项对齐 */
+.sidebar__context-menu-icon {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  font-size: 15px;
+  color: var(--color-text-muted);
+}
+
+.sidebar__context-menu-item:hover:not(:disabled) .sidebar__context-menu-icon {
+  color: inherit;
+}
+
+.sidebar__context-menu-separator {
+  height: 1px;
+  margin: var(--space-1) var(--space-3);
+  background: var(--color-line);
 }
 
 .sidebar__context-menu-item:hover:not(:disabled) {
@@ -507,14 +679,15 @@
   color: var(--color-danger);
 }
 
-@media (prefers-reduced-motion: no-preference) and (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) {
   .sidebar__context-menu {
     animation: none;
   }
 }
 
 .sidebar__bottom-nav {
-  padding: var(--space-3) 0;
+  /* 上方 space-1 与顶部导航的分割线留白对齐；下方 space-3 留给底部按钮。 */
+  padding: var(--space-1) 0 var(--space-3);
   display: flex;
   flex-direction: column;
   gap: var(--space-1);

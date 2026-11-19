@@ -1,0 +1,460 @@
+import { t as translate } from "../i18n/core";
+/* 轻量 Markdown 渲染器 + 缓存引用指令（供 Agent 对话和工具结果使用）。
+   覆盖 LLM 常见输出：标题 / 粗斜体 / 行内代码 / 围栏代码块 / 无序有序列表 /
+   引用 / 段落。所有文本先 HTML 转义再做替换，不产生注入面；链接降级为
+   纯文本 + 原始 URL（桌面端 WebView 不外跳）。
+
+   另外解析模型用的缓存引用指令 $transl_cache(文件名, 行号)：它会被切成独立片段，
+   由界面渲染成"某条缓存"的卡片（见 components/AgentCacheRef）。 */
+
+/** $transl_cache("a.json", 12) / $transl_cache(a.json, 12-15) / (a.json, 12,20)。
+ *  文件名可以有引号也可以没有，行号允许逗号与区间。 */
+const CACHE_REF_RE =
+  /\$transl_cache\(\s*(?:"([^"]+)"|'([^']+)'|([^,)]+?))\s*,\s*([0-9][0-9,\-\s]*)\s*\)/g;
+
+export type MarkdownSegment =
+  | { kind: 'text'; text: string }
+  | { kind: 'cacheRef'; filename: string; indexSpec: string };
+
+/** 行号写法 -> 条目 index 列表：12 / 12-15 / 12,20 / 12-14,20。去重排序，最多 limit 条。 */
+export function parseCacheRefIndexes(spec: string, limit = 50): number[] {
+  const out: number[] = [];
+  for (const part of spec.split(',')) {
+    const token = part.trim();
+    if (!token) continue;
+    const range = /^(\d+)\s*-\s*(\d+)$/.exec(token);
+    if (range) {
+      const lo = Number(range[1]);
+      const hi = Number(range[2]);
+      for (let i = Math.min(lo, hi); i <= Math.max(lo, hi); i += 1) out.push(i);
+      continue;
+    }
+    if (/^\d+$/.test(token)) out.push(Number(token));
+  }
+  return [...new Set(out)].sort((a, b) => a - b).slice(0, limit);
+}
+
+/** 把文本切成「普通文本 / 缓存引用」片段；没有引用时返回单段文本（渲染路径不变）。 */
+export function splitMarkdownSegments(text: string): MarkdownSegment[] {
+  const segments: MarkdownSegment[] = [];
+  let last = 0;
+  // 围栏状态扫描器：引用是按位置递增匹配的，游标只前进不回头，整体 O(n)。
+  let scanOffset = 0;
+  let fenceOpen = 0;
+  const insideFence = (index: number): boolean => {
+    const lineStart = text.lastIndexOf('\n', index - 1) + 1;
+    for (;;) {
+      const newline = text.indexOf('\n', scanOffset);
+      if (newline < 0 || newline >= lineStart) break; // 剩下的就是 index 所在行，不能拿半行判围栏
+      const line = text.slice(scanOffset, newline).trimEnd();
+      if (fenceOpen) {
+        const closing = /^\s*(`{3,})\s*$/.exec(line);
+        if (closing && closing[1].length >= fenceOpen) fenceOpen = 0;
+      } else {
+        const opening = /^\s*(`{3,})[^`]*$/.exec(line);
+        if (opening) fenceOpen = opening[1].length;
+      }
+      scanOffset = newline + 1;
+    }
+    return fenceOpen > 0;
+  };
+
+  CACHE_REF_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = CACHE_REF_RE.exec(text)) !== null) {
+    // 围栏代码块里的 $transl_cache(...) 是示例文本：切开会把围栏劈成两半，
+    // 两段都变成"未闭合围栏"，代码内容和闭合行全丢。
+    if (insideFence(m.index)) continue;
+    if (m.index > last) segments.push({ kind: 'text', text: text.slice(last, m.index) });
+    const filename = (m[1] || m[2] || m[3] || '').trim();
+    const indexSpec = (m[4] || '').trim();
+    if (filename && indexSpec) segments.push({ kind: 'cacheRef', filename, indexSpec });
+    else segments.push({ kind: 'text', text: m[0] });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) segments.push({ kind: 'text', text: text.slice(last) });
+  return segments.length ? segments : [{ kind: 'text', text }];
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/** 行内代码被抽走后留下的占位符（U+0001 不会出现在正常文本里）。 */
+const CODE_SLOT = '\u0001';
+const CODE_SLOT_RE = /\u0001(\d+)\u0001/g;
+
+/** 行内元素：行内代码、图片/链接降级、粗体、斜体、删除线。输入须已转义。 */
+function renderInline(escaped: string): string {
+  // 行内代码先整段抽成占位符、最后再还原：否则代码里的 * ~ [ ] 会被下面的规则
+  // 二次改写（`a*b*c` 会渲染成 <code>a<em>b</em>c</code>，`[x](y)` 会变成
+  // <code>x（y）</code>）——模型输出代码片段时非常常见。
+  const codes: string[] = [];
+  let out = escaped.replace(/`([^`]+)`/g, (_, code: string) => {
+    codes.push(code);
+    return `${CODE_SLOT}${codes.length - 1}${CODE_SLOT}`;
+  });
+  // 图片 ![alt](url) -> 「图片」alt
+  out = out.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_, alt: string) =>
+    escapeHtml(translate('common:markdown.imageLabel', { alt: '__GALTRANSL_IMAGE_ALT__' })).replace('__GALTRANSL_IMAGE_ALT__', () => alt));
+  // 链接 [text](url) -> text（url）——不生成可点击链接
+  out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '$1（$2）');
+  // 加粗 / 删除线 / 斜体
+  out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  out = out.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+  out = out.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  return out.replace(CODE_SLOT_RE, (_, index: string) => `<code>${codes[Number(index)]}</code>`);
+}
+
+// 表格行：| a | b |，允许省略首尾竖线
+const TABLE_ROW_STRICT = /^\s*\|.*\|\s*$/;
+const TABLE_ROW_ANY = /^\s*(?:\|)/.source; // 供日志，不使用
+// 宽松判定：含未转义竖线且不像其它块级语法（列表/引用/标题/水平线由前序分支处理）
+function looksLikeTableRow(line: string): boolean {
+  if (TABLE_ROW_STRICT.test(line)) return true;
+  // 无首尾竖线：行内要有至少 2 个未转义单元格分隔
+  if (/^\s*\|/.test(line)) return true;
+  const unescaped = line.replace(/\\\|/g, '\u0000');
+  return unescaped.includes('|') && unescaped.split('|').length >= 2;
+}
+// 分隔行：| --- | :--: | --: |（允许省略首尾竖线）
+function isTableSplit(line: string): boolean {
+  const t = line.trim();
+  if (!/-/.test(t)) return false;
+  // 只由 | : - 空格构成
+  return /^[\s|:-]+$/.test(t) && t.includes('-');
+}
+
+/** 把 | a | b | 拆成单元格数组（trim 每个 cell，保留转义竖线）。 */
+function splitTableRow(line: string): string[] {
+  let inner = line.trim();
+  if (inner.startsWith('|')) inner = inner.slice(1);
+  if (inner.endsWith('|') && !inner.endsWith('\\|')) inner = inner.slice(0, -1);
+  // 单元格内的 \| 转义竖线先占位，避免被误当分隔符
+  const cells = inner.replace(/\\\|/g, '\u0000').split('|');
+  return cells.map((c) => c.trim().replace(/\u0000/g, '|'));
+}
+function renderTableCell(cell: string): string {
+  // 表格中的 <br> 等 HTML 标签按原文显示，不转换为换行。
+  return renderInline(escapeHtml(cell));
+}
+
+/** 短列阈值：按显示宽度算，全角字符记 2（即 8 个汉字或 16 个半角字符）。 */
+const COMPACT_CELL_WIDTH = 16;
+/** 单元格的大致显示宽度：去掉 markdown 标记符号，全角字符记 2。 */
+function cellDisplayWidth(cell: string): number {
+  let width = 0;
+  for (const ch of cell.replace(/[`*~]/g, '')) {
+    width += (ch.codePointAt(0) ?? 0) > 0x2e7f ? 2 : 1;
+  }
+  return width;
+}
+
+function renderTable(header: string, splitLine: string, bodyRows: string[]): string {
+  const headerCells = splitTableRow(header).map(renderTableCell);
+  const aligns = splitTableRow(splitLine).map((c) => {
+    const l = c.startsWith(':');
+    const r = c.endsWith(':');
+    if (l && r) return 'center';
+    if (r) return 'right';
+    return '';
+  });
+  const rawHeader = splitTableRow(header);
+  const rawRows = bodyRows.map(splitTableRow);
+  // 短列（标签 / 序号 / 状态）整列不换行：否则自动布局会把宽度几乎全让给长文本列，
+  // 短列被挤成一字一行。只在同表还有长列时才标，全是短列的表保持原样。
+  const compact = rawHeader.map((_, i) =>
+    [rawHeader, ...rawRows].every((cells) => cellDisplayWidth(cells[i] ?? '') <= COMPACT_CELL_WIDTH),
+  );
+  const mixed = compact.includes(true) && compact.includes(false);
+  const attrs = (i: number) =>
+    (mixed && compact[i] ? ' class="is-compact"' : '') +
+    (aligns[i] ? ` style="text-align:${aligns[i]}"` : '');
+
+  const html: string[] = ['<table>', '<thead><tr>'];
+  headerCells.forEach((c, i) => {
+    html.push(`<th${attrs(i)}>${c}</th>`);
+  });
+  html.push('</tr></thead>');
+  if (rawRows.length) {
+    html.push('<tbody>');
+    for (const row of rawRows) {
+      html.push('<tr>');
+      row
+        .map(renderTableCell)
+        .forEach((c, i) => html.push(`<td${attrs(i)}>${c}</td>`));
+      html.push('</tr>');
+    }
+    html.push('</tbody>');
+  }
+  html.push('</table>');
+  return html.join('');
+}
+
+/** 把一段 markdown 文本渲染成 HTML 片段。 */
+export function renderMarkdown(markdown: string): string {
+  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
+  const html: string[] = [];
+
+  let codeFenceLength = 0;
+  let codeLanguage = '';
+  let codeLines: string[] = [];
+  // 围栏后的语言标记只保留安全字符：它会进 class 属性。
+  const fenceLanguage = (info: string) => (/^[A-Za-z0-9_+#.-]+/.exec(info)?.[0] ?? '').toLowerCase();
+  const codeBlockHtml = () => `<pre><code${codeLanguage ? ` class="language-${codeLanguage}"` : ''}>${escapeHtml(codeLines.join('\n'))}</code></pre>`;
+  let listType: 'ul' | 'ol' | null = null;
+  let quoteLines: string[] = [];
+  let paraLines: string[] = [];
+  // 表格收集：header / 分隔行 / 数据行
+  let tableHeader: string | null = null;
+  let tableSplit: string | null = null;
+  let tableBody: string[] = [];
+
+  const closeList = () => {
+    if (listType) {
+      html.push(`</${listType}>`);
+      listType = null;
+    }
+  };
+  const closeQuote = () => {
+    if (quoteLines.length) {
+      html.push(`<blockquote>${renderInline(escapeHtml(quoteLines.join(' ')))}</blockquote>`);
+      quoteLines = [];
+    }
+  };
+  const closePara = () => {
+    if (paraLines.length) {
+      html.push(`<p>${renderInline(escapeHtml(paraLines.join('\n')))}</p>`);
+      paraLines = [];
+    }
+  };
+  const closeTable = () => {
+    if (tableHeader !== null && tableSplit !== null) {
+      html.push(renderTable(tableHeader, tableSplit, tableBody));
+    } else if (tableHeader !== null) {
+      // 没等到分隔行就不是表格，按普通段落吐回去
+      paraLines.push(tableHeader);
+      paraLines.push(...tableBody);
+    }
+    tableHeader = null;
+    tableSplit = null;
+    tableBody = [];
+  };
+  const closeAll = () => {
+    // 先关表格（回退时会把 header 吐回 paraLines），再关段落，
+    // 否则单行"伪表格"文本会滞留在 paraLines 里丢失。
+    closeTable();
+    closePara();
+    closeList();
+    closeQuote();
+  };
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+
+    // 字典原文可能含有较短的围栏，只用不少于开头长度的独立围栏闭合。
+    if (codeFenceLength) {
+      const closingFence = /^\s*(`{3,})\s*$/.exec(line);
+      if (closingFence && closingFence[1].length >= codeFenceLength) {
+        html.push(codeBlockHtml());
+        codeLines = [];
+        codeFenceLength = 0;
+        codeLanguage = '';
+      } else {
+        codeLines.push(raw);
+      }
+      continue;
+    }
+    const openingFence = /^\s*(`{3,})[^`]*$/.exec(line);
+    if (openingFence) {
+      closeAll();
+      codeFenceLength = openingFence[1].length;
+      codeLanguage = fenceLanguage(line.trim().slice(openingFence[1].length));
+      continue;
+    }
+
+    // 空行：收束当前块
+    if (!line.trim()) {
+      closeAll();
+      continue;
+    }
+
+    // 表格：header 行之后必须紧跟分隔行，然后连续吃数据行。
+    // 注意表格判定要排在列表/引用/标题之前——分隔行 "---" 形态与水平线
+    // 冲突，但仅在 header 待定上下文里才会走到这里。
+    const looksLikeRow = looksLikeTableRow(line);
+    if (looksLikeRow) {
+      if (tableHeader === null) {
+        // 待定：先攒着，下一行是分隔行才成立（水平线等形态由后续分支处理，
+        // 因为能进这个分支说明 header 已待定）
+        closePara();
+        closeList();
+        closeQuote();
+        tableHeader = line;
+        continue;
+      }
+      if (tableSplit === null) {
+        if (isTableSplit(line)) {
+          tableSplit = line;
+        } else {
+          // header 后不是分隔行：回退成段落，当前行重新走普通逻辑
+          closeTable();
+          paraLines.push(line);
+        }
+        continue;
+      }
+      // 分隔行已见，这是数据行
+      tableBody.push(line);
+      continue;
+    } else if (tableHeader !== null || tableSplit !== null) {
+      // 表格被非表格行打断：闭合（header 无分隔行时回退为段落）
+      closeTable();
+      if (tableSplit === null && paraLines.length) {
+        // closeTable 已把 header 吐回 paraLines；当前行作为普通文本续上
+        paraLines.push(line);
+        continue;
+      }
+    }
+
+    // 标题
+    const heading = /^(#{1,4})\s+(.*)$/.exec(line);
+    if (heading) {
+      closeAll();
+      const level = Math.min(heading[1].length + 2, 6); // # -> h3，最多 h6
+      html.push(`<h${level}>${renderInline(escapeHtml(heading[2]))}</h${level}>`);
+      continue;
+    }
+
+    // 引用（> 已被转义成 &gt;，两种形态都认）
+    const quote = /^\s*(?:&gt;|>)\s?(.*)$/.exec(line);
+    if (quote) {
+      closePara();
+      closeList();
+      quoteLines.push(quote[1]);
+      continue;
+    }
+
+    // 无序列表
+    const ul = /^\s*[-*+]\s+(.*)$/.exec(line);
+    if (ul) {
+      closePara();
+      closeQuote();
+      if (listType !== 'ul') {
+        closeList();
+        html.push('<ul>');
+        listType = 'ul';
+      }
+      // 任务列表（模型写待办时很常见）：- [ ] / - [x]，用伪元素画方框。
+      const task = /^\[([ xX])\]\s+(.*)$/.exec(ul[1]);
+      html.push(task
+        ? `<li class="is-task${task[1] === ' ' ? '' : ' is-done'}">${renderInline(escapeHtml(task[2]))}</li>`
+        : `<li>${renderInline(escapeHtml(ul[1]))}</li>`);
+      continue;
+    }
+
+    // 有序列表
+    const ol = /^\s*\d+[.)]\s+(.*)$/.exec(line);
+    if (ol) {
+      closePara();
+      closeQuote();
+      if (listType !== 'ol') {
+        closeList();
+        html.push('<ol>');
+        listType = 'ol';
+      }
+      html.push(`<li>${renderInline(escapeHtml(ol[1]))}</li>`);
+      continue;
+    }
+
+    // 水平线
+    if (/^\s*([-*_])\s*(\1\s*){2,}$/.test(line)) {
+      closeAll();
+      html.push('<hr />');
+      continue;
+    }
+
+    // 普通段落文本
+    closeList();
+    closeQuote();
+    paraLines.push(line);
+  }
+
+  // 收尾：未闭合的代码块/列表/段落
+  if (codeFenceLength && codeLines.length) {
+    html.push(codeBlockHtml());
+  }
+  closeAll();
+  return html.join('\n');
+}
+
+/* ── 块级增量渲染 ──
+   流式输出每 50ms 就整段重解析一次；一条 20KB 的回复在十几秒里会被完整解析上百遍。
+   空行本来就是上面这个解析器的硬块边界（见循环里的 closeAll()），所以按顶层空行
+   切块、逐块渲染再拼起来，结果与整段渲染等价，但只有正在增长的最后一块需要重解析。
+   围栏代码块内的空行不是块边界，切分时要跟着围栏状态走。 */
+
+/** 缓存块数上限：超过直接清空（正常长度的回复远远到不了）。 */
+const BLOCK_CACHE_MAX = 2000;
+let blockCache = new Map<string, string>();
+/** 缓存与 UI 语言绑定：图片降级文案会随语言变化，换语言就整表作废。 */
+let blockCacheLanguage: string | null = null;
+
+/** 按顶层空行把 markdown 切块（围栏内的空行不切）。 */
+export function splitMarkdownBlocks(markdown: string): string[] {
+  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
+  const blocks: string[] = [];
+  let current: string[] = [];
+  let fenceLength = 0;
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (fenceLength) {
+      const closing = /^\s*(`{3,})\s*$/.exec(line);
+      if (closing && closing[1].length >= fenceLength) fenceLength = 0;
+      current.push(raw);
+      continue;
+    }
+    const opening = /^\s*(`{3,})[^`]*$/.exec(line);
+    if (opening) {
+      fenceLength = opening[1].length;
+      current.push(raw);
+      continue;
+    }
+    if (!line.trim()) {
+      if (current.length) {
+        blocks.push(current.join('\n'));
+        current = [];
+      }
+      continue;
+    }
+    current.push(raw);
+  }
+  if (current.length) blocks.push(current.join('\n'));
+  return blocks;
+}
+
+/** 与 renderMarkdown 等价，但按块命中缓存——流式输出只有最后一块会重解析。 */
+export function renderMarkdownBlocks(markdown: string, language = ''): string {
+  if (language !== blockCacheLanguage) {
+    blockCache.clear();
+    blockCacheLanguage = language;
+  }
+  const blocks = splitMarkdownBlocks(markdown);
+  const html: string[] = [];
+  for (const block of blocks) {
+    let rendered = blockCache.get(block);
+    if (rendered === undefined) {
+      rendered = renderMarkdown(block);
+      if (blockCache.size >= BLOCK_CACHE_MAX) blockCache.clear();
+      blockCache.set(block, rendered);
+    }
+    // 空结果（例如只写了个 ``` 还没跟内容）不能占位，否则 join 会多出空行，
+    // 与整段渲染的结果不再逐字节相同。
+    if (rendered) html.push(rendered);
+  }
+  return html.join('\n');
+}

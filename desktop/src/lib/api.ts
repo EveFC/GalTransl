@@ -1,4 +1,8 @@
+import { UiError, message as uiMessage, resolveMessage, isUiMessage, type LocalizedText, type UiMessage } from "../i18n/core";
 import { invoke } from '@tauri-apps/api/core';
+import { readProjectStorage, removeProjectStorage, writeProjectStorage } from './projectStorage';
+
+import type { PermissionDecision, PermissionMode } from './permissionMode';
 
 const DEFAULT_BACKEND_URL = 'http://127.0.0.1:12333';
 let runtimeBackendBaseUrl: string | null = null;
@@ -76,6 +80,10 @@ export type FileEntry = {
   size: number;
   modified: string;
   entry_count?: number;
+  /** false = 还没有缓存文件的输入文件（界面标记成未翻译，打开时后端回落读原文） */
+  has_cache?: boolean;
+  /** 未翻译文件在 gt_input 里的相对路径（它的 name 是缓存键，这里是原文路径） */
+  input_name?: string;
 };
 
 export type ProjectFilesResponse = {
@@ -92,6 +100,10 @@ export type CacheFileResponse = {
   project_dir: string;
   filename: string;
   entries: CacheEntry[];
+  /** false = 没有缓存文件，entries 是从原文回落的（只有 pre_src/post_src，译文为空） */
+  has_cache?: boolean;
+  /** 回落时读到的是哪个输入文件（gt_input 里的相对路径） */
+  input_name?: string;
 };
 
 export type CacheEntry = {
@@ -104,8 +116,9 @@ export type CacheEntry = {
   trans_by?: string;
   proofread_by?: string;
   problem?: string;
+  skip_check?: boolean;
   trans_conf?: number;
-  doub_content?: string;
+  proofread_comment?: string;
   unknown_proper_noun?: string;
   // 旧key名兼容字段（读取旧缓存时可能存在）
   pre_jp?: string;
@@ -114,9 +127,12 @@ export type CacheEntry = {
   proofread_zh?: string;
   post_zh_preview?: string;
   post_dst_preview?: string;
+  // 用于标记条目是否被删除（前端状态，不会发送到后端）
+  deleted?: boolean;
 };
 
-export type CacheSearchField = 'all' | 'src' | 'dst' | 'problem';
+export type CacheSearchField = 'all' | 'src' | 'dst' | 'problem' | 'name' | 'pre_src' | 'post_src' | 'pre_dst' | 'proofread_dst';
+export type CacheSearchCondition = { query: string; field: CacheSearchField; options: CacheSearchOptions };
 
 export type CacheSearchResult = {
   filename: string;
@@ -129,14 +145,24 @@ export type CacheSearchResult = {
   match_problem: boolean;
   problem: string;
   trans_by: string;
+  /** false = 这条来自还没翻译的原文件（原文命中），没有译文与问题 */
+  has_cache?: boolean;
+  truncated?: boolean;
 };
 
 export type CacheSearchResponse = {
   results: CacheSearchResult[];
   total: number;
+  has_more?: boolean;
+  next_offset?: number;
+  truncated?: boolean;
 };
 
 export type CacheReplaceField = 'src' | 'dst' | 'all';
+
+export type CacheSearchOptions = {
+  re: boolean;
+};
 
 export type CacheReplaceFileDetail = {
   filename: string;
@@ -158,6 +184,25 @@ export type FileProgress = {
   translated: number;
   problems: number;
   failed: number;
+  /**
+   * 这个文件此刻有请求在跑时的实时状态（后端只在有请求在跑时给，请求结束就没了）：
+   * phase=waiting 请求已发出、还没出字 / thinking 在吐思考内容 / writing 在出正文 /
+   * retrying 上一次失败、正在退避等重试；cps 是这几个请求合计的字/秒，requests 是同时在跑的
+   * 请求数（切块并发、GenDic 多线程时会大于 1）。「文件进度」那行用它点那颗小灯。
+   */
+  activity?: FileActivity;
+};
+
+export type FileActivity = {
+  phase: 'waiting' | 'thinking' | 'writing' | 'retrying';
+  cps: number;
+  requests: number;
+  /**
+   * 有请求在跑、但超过 REQUEST_STALL_SECONDS（后端 3s）没有新输出。
+   * phase 不回退——还是「思考中/翻译中」，只是界面把灯放慢；思考型模型两个思考块之间
+   * 隔几秒是常态，回退会让那颗灯在「思考中/请求中」之间反复横跳。
+   */
+  stalled: boolean;
 };
 
 export type ProjectProgressResponse = {
@@ -187,6 +232,8 @@ export type ProjectRuntimeSummary = {
   problems: number;
   failed: number;
   percent: number;
+  /** total 中分块交叉句的数量（相邻两块各翻一次）；旧后端不返回 */
+  cross_total?: number;
   workers_active: number;
   workers_configured: number;
   translation_speed_lpm: number;
@@ -218,6 +265,18 @@ export type ProjectRuntimeSuccessEntry = {
   trans_by: string;
 };
 
+/** 本次任务累计的 token 用量；cached/reasoning 为 null 表示没有任何请求报过这一项 */
+export type ProjectRuntimeUsage = {
+  requests: number;
+  reported_requests: number;
+  input_tokens: number;
+  cached_tokens: number | null;
+  cache_reported_input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number | null;
+  reasoning_reported_output_tokens: number;
+};
+
 export type ProjectRetranslStatEntry = {
   key: string;
   count: number;
@@ -229,6 +288,8 @@ export type ProjectRuntimeResponse = {
   summary: ProjectRuntimeSummary;
   stage: string;
   current_file: string;
+  /** 旧后端不返回 */
+  usage?: ProjectRuntimeUsage;
   recent_errors: ProjectRuntimeErrorEntry[];
   recent_successes: ProjectRuntimeSuccessEntry[];
   retransl_stats: ProjectRetranslStatEntry[];
@@ -293,9 +354,12 @@ export type ProblemEntry = {
 };
 
 export type ProjectProblemsResponse = {
+  unchanged?: false;
+  revision?: string | null;
   project_dir: string;
   problems: ProblemEntry[];
   total: number;
+  filter_keys?: string[];
 };
 
 // ---- Name Table API types ----
@@ -337,6 +401,20 @@ export type ProjectLogsResponse = {
   lines: string[];
 };
 
+export type PluginSettingSchema = {
+  legacy_path?: string;
+  label?: string;
+  description?: string;
+  placeholder?: string;
+  advanced?: boolean;
+  multiline?: boolean;
+  secret?: boolean;
+  min?: number;
+  max?: number;
+  step?: number;
+  options?: { value: string | number | boolean; label: string }[];
+};
+
 export type PluginInfo = {
   name: string;
   display_name: string;
@@ -345,11 +423,17 @@ export type PluginInfo = {
   description: string;
   type: string;
   module: string;
+  project_local?: boolean;
   settings: Record<string, unknown>;
+  settings_schema?: Record<string, PluginSettingSchema>;
 };
 
 export type AppSettings = {
   printTranslationLogInTerminal: boolean;
+  billionContextEnabled?: boolean;
+  extractionBillionContextEnabled?: boolean;
+  mnemonEnabled?: boolean;
+  extractionMnemonEnabled?: boolean;
 };
 
 export type ThemeMode = 'light' | 'dark' | 'system';
@@ -368,6 +452,8 @@ export type PluginsResponse = {
 export type ProblemTypeInfo = {
   name: string;
   description: string;
+  default_enabled: boolean;
+  plugins?: string[];
 };
 
 export type ProblemTypesResponse = {
@@ -420,9 +506,11 @@ export function decodeProjectDir(token: string): string {
 
 export class ApiError extends Error {
   readonly status: number;
+  readonly uiMessage?: UiMessage;
 
-  constructor(message: string, status: number) {
-    super(message);
+  constructor(message: LocalizedText, status: number) {
+    super(resolveMessage(message));
+    this.uiMessage = isUiMessage(message) ? message : undefined;
     this.name = 'ApiError';
     this.status = status;
   }
@@ -441,19 +529,85 @@ export async function fetchVersion() {
   return response.version;
 }
 
+/** 程序所在目录（后端进程所在位置）：新建项目向导把「父目录」默认成它 */
+export async function fetchProgramDir(): Promise<string> {
+  const response = await apiRequest<{ path?: string }>('/api/program-dir');
+  return (response.path || '').trim();
+}
+
 export async function fetchVersionCheck() {
   return apiRequest<VersionCheckResponse>('/api/version/check');
 }
+
+export type ApplicationUpdateStatus = {
+  supported: boolean; reason: string; id: string; version: string;
+  phase: 'idle' | 'downloading' | 'verifying' | 'extracting' | 'ready' | 'failed';
+  downloaded: number; total: number; error: string;
+};
+export function fetchApplicationUpdateStatus() {
+  return apiRequest<ApplicationUpdateStatus>('/api/update/status');
+}
+export function startApplicationUpdate(preserveDict: boolean) {
+  return apiRequest<ApplicationUpdateStatus>('/api/update/start', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ preserve_dict: preserveDict }),
+  });
+}
+export function canInstallApplicationUpdate() {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+    && !import.meta.env.DEV && shouldUseManagedDesktopBackend();
+}
+export function installApplicationUpdate(updateId: string) {
+  return invoke<void>('install_application_update', { updateId });
+}
+
+/* ── 更新提示的「忽略本次更新」 ──
+ * 存的是被忽略的那个版本号：同一个版本不再弹窗，等更新的版本出现还会再提醒。 */
+const IGNORED_UPDATE_VERSION_KEY = 'galtransl-ignored-update-version';
+
+export function getIgnoredUpdateVersion(): string {
+  try {
+    return localStorage.getItem(IGNORED_UPDATE_VERSION_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+export function setIgnoredUpdateVersion(version: string): void {
+  try {
+    if (version) {
+      localStorage.setItem(IGNORED_UPDATE_VERSION_KEY, version);
+    } else {
+      localStorage.removeItem(IGNORED_UPDATE_VERSION_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export type DesktopBackendConnection = { url: string };
+let desktopBackendStartup: Promise<DesktopBackendConnection> | null = null;
 
 export async function ensureDesktopBackendReady(options?: { hideConsole?: boolean; timeoutMs?: number }) {
   if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window) || !shouldUseManagedDesktopBackend()) {
     return null;
   }
 
-  return invoke<string>('ensure_backend_ready', {
-    hideConsole: options?.hideConsole ?? getHideBackendConsolePreference(),
-    timeoutMs: options?.timeoutMs,
-  });
+  if (!desktopBackendStartup) {
+    desktopBackendStartup = invoke<DesktopBackendConnection>('ensure_backend_ready', {
+      hideConsole: options?.hideConsole ?? getHideBackendConsolePreference(),
+      timeoutMs: options?.timeoutMs,
+    }).then((connection) => {
+      setRuntimeBackendBaseUrl(connection.url);
+      return connection;
+    }).catch((error) => {
+      setRuntimeBackendBaseUrl(null);
+      throw error;
+    }).finally(() => {
+      desktopBackendStartup = null;
+    });
+  }
+  return desktopBackendStartup;
 }
 
 export async function fetchTranslators() {
@@ -471,6 +625,15 @@ export async function fetchJob(jobId: string) {
 }
 
 export async function submitJob(payload: SubmitJobPayload) {
+  // 所有前端 GenDic 入口统一使用专属默认。
+  if (payload.translator?.toLowerCase() === 'gendic') {
+    const name = getGenDicDefaultBackendProfile();
+    if (name) {
+      const profile = getBackendProfile(name);
+      if (!profile) throw new UiError(uiMessage('errors:profiles.notFound', { name }));
+      payload = { ...payload, backend_profile: name, backend_profile_data: profile };
+    }
+  }
   const overrides = getPromptTemplateOverridesForJob(payload.translator);
   const payloadWithOverrides = Object.keys(overrides).length > 0
     ? { ...payload, prompt_template_overrides: overrides }
@@ -505,19 +668,41 @@ export async function updateProjectConfig(projectId: string, payload: ProjectCon
   );
 }
 
+/** 按保存时的格式把配置渲染成 YAML 文本（只读预览用，不写盘）。 */
+export async function previewProjectConfigYaml(projectId: string, config: Record<string, unknown>, signal?: AbortSignal) {
+  return apiRequest<{ yaml: string }>(
+    `/api/projects/${projectId}/config/preview`,
+    {
+      body: JSON.stringify({ config }),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      method: 'POST',
+      signal,
+    },
+  );
+}
+
 export async function fetchProjectFiles(projectId: string) {
   return apiRequest<ProjectFilesResponse>(`/api/projects/${projectId}/files`);
 }
 
-export async function fetchProjectCache(projectId: string) {
-  return apiRequest<{ project_dir: string; cache_dir: string; files: FileEntry[] }>(
-    `/api/projects/${projectId}/cache`,
-  );
+export async function fetchProjectCache(projectId: string, configFileName = 'config.yaml') {
+  return apiRequest<{
+    project_dir: string;
+    cache_dir: string;
+    files: FileEntry[];
+    /** gt_input 里还没有缓存的输入文件（Cache/ 目录里看不到它们） */
+    uncached_files?: FileEntry[];
+  }>(`/api/projects/${projectId}/cache?config=${encodeURIComponent(configFileName)}`, { cache: 'no-store' });
 }
 
-export async function fetchCacheFile(projectId: string, filename: string) {
+export async function fetchCacheFile(projectId: string, filename: string, configFileName = 'config.yaml', refreshInput = false) {
+  // no-store：缓存文件会被 Agent 的 patch/delete 工具改写，读它必须拿到磁盘上的当前内容。
+  // 后端没给缓存头，浏览器/Electron 的 HTTP 缓存没有可用的过期与校验信息，不让它插手最稳。
   return apiRequest<CacheFileResponse>(
-    `/api/projects/${projectId}/cache/${encodeURIComponent(filename)}`,
+    `/api/projects/${projectId}/cache/${encodeURIComponent(filename)}?config=${encodeURIComponent(configFileName)}${refreshInput ? '&refresh_input=1' : ''}`,
+    { cache: 'no-store' },
   );
 }
 
@@ -528,6 +713,102 @@ export async function saveCacheFile(projectId: string, filename: string, entries
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ filename, entries, config_file_name: configFileName || 'config.yaml' }),
+    },
+  );
+}
+
+export type CacheEdit = {
+  change_id: string;
+  at: number;
+  session_id: string;
+  turn_id: string;
+  actor_id: string;
+  actor_label: string;
+  operation: string;
+  reason: string;
+  status: string;
+  updated: number;
+  reverted_by?: string | null;
+  reverts: string[];
+  files: { filename: string; updated: number; deleted: boolean; created: boolean }[];
+};
+
+export type CacheHistoryFile = {
+  filename: string;
+  updated: number;
+  added: number;
+  removed: number;
+  diff: string;
+};
+
+export type CacheHistoryPage<T> = {
+  items: T[];
+  total: number;
+  returned: number;
+  has_more: boolean;
+  next_offset?: number;
+};
+
+export type CacheUndoResult = {
+  status: 'reverted' | 'conflict' | 'no_change' | 'preview';
+  updated: number;
+  note?: string;
+  conflicts: { file: string; index?: number; field?: string; reason: string }[];
+  history?: CacheEdit;
+};
+
+export function listCacheHistory(projectDir: string, sessionId: string, turnId: string, offset = 0) {
+  return apiRequest<CacheHistoryPage<CacheEdit>>(`/api/projects/${encodeProjectDir(projectDir)}/cache/history`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'list', session_id: sessionId, turn_id: turnId, limit: 200, offset }),
+  });
+}
+
+export function diffCacheHistory(projectDir: string, changeIds: string[], filename: string) {
+  return apiRequest<CacheHistoryPage<CacheHistoryFile>>(`/api/projects/${encodeProjectDir(projectDir)}/cache/history`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'diff', change_ids: changeIds, filename }),
+  });
+}
+
+export function undoCacheHistory(projectDir: string, changeIds: string[], sessionId: string) {
+  return apiRequest<CacheUndoResult>(`/api/projects/${encodeProjectDir(projectDir)}/cache/history`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'revert', change_ids: changeIds,
+      _cache_edit: { session_id: sessionId, turn_id: `undo-${crypto.randomUUID()}`, actor_id: '', actor_label: resolveMessage(uiMessage('agent:cacheHistory.user')) } }),
+  });
+}
+
+export type CacheDictionaryKind = 'pre' | 'post' | 'gpt';
+export type CacheDictionaryCounts = Record<CacheDictionaryKind, number>;
+export type CacheDictionaryMatch = {
+  kind: CacheDictionaryKind;
+  file: string;
+  line: number;
+  search: string;
+  replacement: string;
+  note: string;
+  rule: string;
+};
+export type CacheDictionaryResult = {
+  counts: CacheDictionaryCounts;
+  entries?: CacheDictionaryMatch[];
+  total?: number;
+  offset?: number;
+};
+export type CacheDictionarySentence = CacheEntry & { context_before?: CacheEntry[]; context_after?: CacheEntry[] };
+
+export function fetchCacheDictionaryMatches(
+  projectId: string, configFileName: string, entries: CacheDictionarySentence[],
+  options: { details?: boolean; offset?: number; signal?: AbortSignal } = {},
+) {
+  return apiRequest<{ results: CacheDictionaryResult[] }>(
+    `/api/projects/${projectId}/cache/dictionary-matches`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: options.signal,
+      body: JSON.stringify({ entries, config_file_name: configFileName, details: options.details ?? false, offset: options.offset ?? 0 }),
     },
   );
 }
@@ -558,14 +839,26 @@ export async function searchCache(
   projectId: string,
   query: string,
   field: CacheSearchField = 'all',
-  maxResults = 500,
+  options: CacheSearchOptions = { re: false },
+  configFileName = 'config.yaml',
+  /** 连还没翻译的原文件一起搜（界面默认开；Agent 的 search_transl_cache 有专门的原文搜索工具，不开） */
+  includeUncached = true,
+  conditions: CacheSearchCondition[] = [],
 ) {
   return apiRequest<CacheSearchResponse>(
     `/api/projects/${projectId}/cache/search`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, field, max_results: maxResults }),
+      body: JSON.stringify({
+        query,
+        field,
+        options,
+        result_mode: 'all',
+        config_file_name: configFileName,
+        include_uncached: includeUncached,
+        ...(conditions.length ? { conditions } : {}),
+      }),
     },
   );
 }
@@ -704,8 +997,14 @@ export async function deleteCommonDictionaryFile(payload: { filename: string }) 
   );
 }
 
-export async function fetchProjectProblems(projectId: string) {
-  return apiRequest<ProjectProblemsResponse>(`/api/projects/${projectId}/problems`);
+type ProjectProblemsCheckResponse = ProjectProblemsResponse | { unchanged: true; revision: string };
+
+export function fetchProjectProblems(projectId: string, configFileName?: string): Promise<ProjectProblemsResponse>;
+export function fetchProjectProblems(projectId: string, configFileName: string, revision: string | null | undefined): Promise<ProjectProblemsCheckResponse>;
+export async function fetchProjectProblems(projectId: string, configFileName = 'config.yaml', revision?: string | null): Promise<ProjectProblemsCheckResponse> {
+  const condition = revision ? `&revision=${encodeURIComponent(revision)}` : '';
+  return apiRequest<ProjectProblemsCheckResponse>(
+    `/api/projects/${projectId}/problems?config=${encodeURIComponent(configFileName)}${condition}`, { cache: 'no-store' });
 }
 
 // ---- Name Table API functions ----
@@ -730,7 +1029,7 @@ export async function saveNameTable(projectId: string, names: NameEntry[]) {
 }
 
 export function getAiTranslateUrl(projectId: string) {
-  const baseUrl = getBackendBaseUrl();
+  const baseUrl = requireBackendBaseUrl();
   return `${baseUrl}/api/projects/${projectId}/name-table/ai-translate`;
 }
 
@@ -744,13 +1043,28 @@ export async function fetchProjectLogs(projectId: string, tail = 2000) {
   );
 }
 
-export async function fetchPlugins() {
-  const response = await apiRequest<PluginsResponse>('/api/plugins');
+export async function fetchPlugins(projectId?: string) {
+  const response = await apiRequest<PluginsResponse>(projectId ? `/api/projects/${projectId}/plugins` : '/api/plugins');
   return response.plugins;
 }
 
-export async function fetchProblemTypes() {
-  const response = await apiRequest<ProblemTypesResponse>('/api/problem-types');
+export interface FilePluginDetection {
+  /** 推荐的 filePlugin：单一格式时是那个插件，混合格式时是 'auto'，都识别不了时为 null */
+  suggested: string | null;
+  /** 插件名 → 识别到的文件数 */
+  counts: Record<string, number>;
+  /** 识别不了格式的文件名 */
+  unknown: string[];
+  files: Record<string, string | null>;
+}
+
+/** 按项目 gt_input 里的文件自动识别应使用的文件插件。 */
+export async function detectFilePlugin(projectId: string) {
+  return apiRequest<FilePluginDetection>(`/api/projects/${projectId}/detect-file-plugin`);
+}
+
+export async function fetchProblemTypes(projectId?: string) {
+  const response = await apiRequest<ProblemTypesResponse>(projectId ? `/api/projects/${projectId}/problem-types` : '/api/problem-types');
   return response.problem_types;
 }
 
@@ -759,8 +1073,147 @@ export async function fetchTranslationGuidelines() {
   return response.guidelines;
 }
 
+/** 全局翻译规范文件（translation_guidelines 目录里的一份 .md/.txt）。 */
+export type TranslationGuidelineFile = {
+  name: string;
+  size: number;
+  mtime: number;
+  /** 未配置全局规范时的兜底文件（Basic.md）：界面上不允许删 */
+  builtin: boolean;
+};
+
+export type TranslationGuidelineManagerResponse = {
+  /** 纯文件名数组（项目配置下拉、Agent 的 read_guideline 用同一份） */
+  guidelines: string[];
+  files: TranslationGuidelineFile[];
+  /** 规范目录的绝对路径（只用于展示） */
+  dir: string;
+  default: string;
+};
+
+export async function fetchTranslationGuidelineManager() {
+  return apiRequest<TranslationGuidelineManagerResponse>('/api/translation-guidelines');
+}
+
+export async function fetchTranslationGuidelineContent(name: string) {
+  return apiRequest<{ name: string; content: string }>(
+    `/api/translation-guidelines/${encodeURIComponent(name)}`,
+  );
+}
+
+/** 新建一份全局规范。文件名没写后缀时后端会补 .md；重名报错（不会覆盖）。 */
+export async function createTranslationGuideline(payload: { filename: string; content?: string }) {
+  return apiRequest<{ success: boolean; filename: string; path: string }>(
+    '/api/translation-guidelines/create',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+/** 覆写一份全局规范（文件不存在会报错，不做"顺手新建"）。 */
+export async function saveTranslationGuideline(payload: { filename: string; content: string }) {
+  return apiRequest<{ success: boolean; filename: string; length: number }>(
+    '/api/translation-guidelines/save',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+/** 删除一份全局规范。兜底文件（Basic.md）后端会拒绝。 */
+export async function deleteTranslationGuideline(payload: { filename: string }) {
+  return apiRequest<{ success: boolean; filename: string }>(
+    '/api/translation-guidelines/delete',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+/** 项目翻译规范：项目目录里的一个文件（不是配置项），翻译时拼在全局规范之后。 */
+export type ProjectGuidelineResponse = {
+  filename: string;
+  path: string;
+  exists: boolean;
+  content: string;
+};
+
+export async function fetchProjectGuideline(projectId: string) {
+  return apiRequest<ProjectGuidelineResponse>(`/api/projects/${projectId}/guideline`);
+}
+
+/** 写项目规范。mode：overwrite 覆写 / append 增写 / replace 替换（old_text 需唯一命中）。 */
+export async function saveProjectGuideline(
+  projectId: string,
+  payload: {
+    mode: 'overwrite' | 'append' | 'replace';
+    content?: string;
+    old_text?: string;
+    new_text?: string;
+  },
+) {
+  return apiRequest<{
+    success: boolean;
+    filename: string;
+    path: string;
+    mode: string;
+    created: boolean;
+    length: number;
+  }>(`/api/projects/${projectId}/guideline`, {
+    body: JSON.stringify(payload),
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    method: 'PUT',
+  });
+}
+
 export async function fetchAppSettings() {
   return apiRequest<AppSettings>('/api/app-settings');
+}
+
+export type MemoryAgent = 'translation' | 'extraction';
+
+export type MemoryEntry = {
+  id: string;
+  scope: 'project' | 'global';
+  content: string;
+  importance: 'normal' | 'critical';
+  created_at: string;
+  updated_at: string;
+};
+
+export async function fetchMemories(projectDir: string, agent: MemoryAgent) {
+  return apiRequest<{ entries: MemoryEntry[] }>(`/api/agent/memories?${new URLSearchParams({ project_dir: projectDir, agent })}`);
+}
+
+export async function deleteMemory(projectDir: string, id: string, agent: MemoryAgent) {
+  return apiRequest<{ success: boolean }>('/api/agent/memories/delete', {
+    method: 'POST',
+    body: JSON.stringify({ project_dir: projectDir, id, agent }),
+  });
+}
+
+export type MemoryDraft = Pick<MemoryEntry, 'content' | 'scope' | 'importance'> & { id?: string };
+
+export async function saveMemory(projectDir: string, memory: MemoryDraft, agent: MemoryAgent) {
+  return apiRequest<{ entry: MemoryEntry }>('/api/agent/memories/save', {
+    method: 'POST',
+    body: JSON.stringify({ project_dir: projectDir, ...memory, agent }),
+  });
 }
 
 export async function fetchDefaultProjectConfigTemplate() {
@@ -826,7 +1279,7 @@ export function getPromptTemplateOverridesForJob(translator: string): Record<str
   return { [translator]: override };
 }
 
-export async function updateAppSettings(settings: AppSettings) {
+export async function updateAppSettings(settings: Partial<AppSettings>) {
   return apiRequest<AppSettings>('/api/app-settings', {
     method: 'PUT',
     headers: {
@@ -860,7 +1313,7 @@ export async function fetchBackendProfiles() {
 export async function fetchBackendProfile(name: string) {
   const profile = getBackendProfile(name);
   if (!profile) {
-    throw new Error(`profile not found: ${name}`);
+    throw new UiError(uiMessage('errors:profiles.notFound', { name }));
   }
   return { name, profile } satisfies BackendProfileResponse;
 }
@@ -868,11 +1321,18 @@ export async function fetchBackendProfile(name: string) {
 export async function createBackendProfile(name: string, profile: Record<string, unknown>) {
   const trimmedName = name.trim();
   if (!trimmedName) {
-    throw new Error('profile name is required');
+    throw new UiError(uiMessage('errors:profiles.nameRequired'));
   }
   const profiles = readBackendProfilesStorage();
+  const isFirstProfile = Object.keys(profiles).length === 0;
   profiles[trimmedName] = cloneBackendProfile(profile);
   writeBackendProfilesStorage(profiles);
+  if (isFirstProfile) {
+    // 首个配置只初始化翻译器和主 agent 的默认。GenDic、子 agent 留空表示"跟随翻译器 /
+    // 跟随主 agent"：在这里写死名字，用户之后换翻译器或主 agent 默认时它们不会跟着变。
+    setDefaultBackendProfile(trimmedName);
+    setAgentDefaultBackendProfile(trimmedName);
+  }
   return { success: true, name: trimmedName };
 }
 
@@ -883,18 +1343,118 @@ export async function updateBackendProfile(name: string, profile: Record<string,
 export async function deleteBackendProfile(name: string) {
   const trimmedName = name.trim();
   if (!trimmedName) {
-    throw new Error('profile name is required');
+    throw new UiError(uiMessage('errors:profiles.nameRequired'));
   }
   const profiles = readBackendProfilesStorage();
   if (!(trimmedName in profiles)) {
-    throw new Error(`profile not found: ${trimmedName}`);
+    throw new UiError(uiMessage('errors:profiles.notFound', { name: trimmedName }));
   }
   delete profiles[trimmedName];
   writeBackendProfilesStorage(profiles);
+  // 删配置时：若它是翻译器默认就清翻译器默认、若是 Agent 默认就清 Agent 默认（互不影响）
   if (getDefaultBackendProfile() === trimmedName) {
     setDefaultBackendProfile('');
   }
+  if (getAgentDefaultBackendProfile() === trimmedName) {
+    setAgentDefaultBackendProfile('');
+  }
+  if (getGenDicDefaultBackendProfile() === trimmedName) setGenDicDefaultBackendProfile('');
+  if (getSubagentDefaultBackendProfile() === trimmedName) setSubagentDefaultBackendProfile('');
   return { success: true, name: trimmedName };
+}
+
+/** 在 base 后面加序号直到不与已有配置重名（复制副本、导入冲突都用它取名） */
+function uniqueProfileName(base: string, profiles: BackendProfilesMap): string {
+  if (!(base in profiles)) {
+    return base;
+  }
+  let index = 2;
+  while (`${base}-${index}` in profiles) {
+    index += 1;
+  }
+  return `${base}-${index}`;
+}
+
+/** 复制一份后端配置：深拷贝内容，名字自动加「-副本」后缀（重名再加序号）。
+ *  副本不会自动变成默认配置。 */
+export async function copyBackendProfile(sourceName: string) {
+  const from = sourceName.trim();
+  if (!from) {
+    throw new UiError(uiMessage('errors:profiles.nameRequired'));
+  }
+  const profiles = readBackendProfilesStorage();
+  if (!(from in profiles)) {
+    throw new UiError(uiMessage('errors:profiles.notFound', { name: from }));
+  }
+  const copyName = uniqueProfileName(resolveMessage(uiMessage('errors:profiles.copyName', { name: from })), profiles);
+  profiles[copyName] = cloneBackendProfile(profiles[from]);
+  writeBackendProfilesStorage(profiles);
+  return { success: true, name: copyName };
+}
+
+/** 把各项目里指向 oldName 的后端选择改写为 newName。
+ *  项目级选择没有变更事件（和 setSelectedBackendProfile 一致），读取方下次渲染即生效。 */
+function renameSelectedBackendProfileReferences(oldName: string, newName: string) {
+  try {
+    const raw = readProjectStorage(BACKEND_PROFILE_KEY);
+    if (!raw) return;
+    const map = JSON.parse(raw) as Record<string, string>;
+    let changed = false;
+    for (const [projectDir, name] of Object.entries(map)) {
+      if (name === oldName) {
+        map[projectDir] = newName;
+        changed = true;
+      }
+    }
+    if (changed) {
+      writeProjectStorage(BACKEND_PROFILE_KEY, JSON.stringify(map));
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+/** 重命名后端配置：搬数据，并把所有指向旧名的引用一起改掉，
+ *  否则全局默认与项目选择会突然指向一个不存在的配置。 */
+export async function renameBackendProfile(oldName: string, newName: string) {
+  const from = oldName.trim();
+  const to = newName.trim();
+  if (!from) {
+    throw new UiError(uiMessage('errors:profiles.nameRequired'));
+  }
+  if (!to) {
+    throw new UiError(uiMessage('errors:profiles.nameRequired'));
+  }
+  if (from === to) {
+    return { success: true, name: to };
+  }
+  const profiles = readBackendProfilesStorage();
+  if (!(from in profiles)) {
+    throw new UiError(uiMessage('errors:profiles.notFound', { name: from }));
+  }
+  if (to in profiles) {
+    throw new UiError(uiMessage('errors:profiles.alreadyExists', { name: to }));
+  }
+  // 保持列表原有顺序，只换 key
+  const renamed: BackendProfilesMap = {};
+  for (const [key, value] of Object.entries(profiles)) {
+    if (key === from) {
+      renamed[to] = value;
+    } else if (key !== to) {
+      renamed[key] = value;
+    }
+  }
+  writeBackendProfilesStorage(renamed);
+  if (getDefaultBackendProfile() === from) {
+    setDefaultBackendProfile(to);
+  }
+  if (getAgentDefaultBackendProfile() === from) {
+    setAgentDefaultBackendProfile(to);
+  }
+  if (getGenDicDefaultBackendProfile() === from) setGenDicDefaultBackendProfile(to);
+  if (getSubagentDefaultBackendProfile() === from) setSubagentDefaultBackendProfile(to);
+  renameSelectedBackendProfileReferences(from, to);
+  return { success: true, name: to };
 }
 
 // ---- OpenAI-Compatible model list query ----
@@ -931,6 +1491,7 @@ const THEME_MODE_KEY = 'galtransl-theme-mode';
 const CUSTOM_BACKGROUND_KEY = 'galtransl-custom-background';
 const HIDE_BACKEND_CONSOLE_KEY = 'galtransl-hide-backend-console';
 const CACHE_BROWSER_FONT_SIZE_KEY = 'galtransl-cache-browser-font-size';
+const DISABLE_ANIMATIONS_KEY = 'galtransl-disable-animations';
 
 export const HOME_HISTORY_LIMIT_DEFAULT = 20;
 export const HOME_JOB_LIMIT_DEFAULT = 20;
@@ -943,6 +1504,7 @@ export const CUSTOM_BACKGROUND_SURFACE_OPACITY_MIN = 18;
 export const CUSTOM_BACKGROUND_SURFACE_OPACITY_MAX = 92;
 export const CUSTOM_BACKGROUND_SURFACE_OPACITY_DEFAULT = 33;
 export const HIDE_BACKEND_CONSOLE_DEFAULT = true;
+export const DISABLE_ANIMATIONS_DEFAULT = false;
 export const CACHE_BROWSER_FONT_SIZE_MIN = 11;
 export const CACHE_BROWSER_FONT_SIZE_MAX = 20;
 export const CACHE_BROWSER_FONT_SIZE_DEFAULT = 14;
@@ -950,12 +1512,94 @@ export const CACHE_BROWSER_FONT_SIZE_DEFAULT = 14;
 /** Custom event dispatched when the global default backend profile changes. */
 export const BACKEND_PROFILES_CHANGE_EVENT = 'galtransl:backend-profiles-change';
 export const DEFAULT_BACKEND_PROFILE_CHANGE_EVENT = 'galtransl:default-backend-profile-change';
+export const PROJECT_CONFIG_DIRTY_CHANGE_EVENT = 'galtransl:project-config-dirty-change';
 export const HOME_HISTORY_LIMIT_CHANGE_EVENT = 'galtransl:home-history-limit-change';
 export const HOME_JOB_LIMIT_CHANGE_EVENT = 'galtransl:home-job-limit-change';
 export const THEME_MODE_CHANGE_EVENT = 'galtransl:theme-mode-change';
 export const CUSTOM_BACKGROUND_CHANGE_EVENT = 'galtransl:custom-background-change';
 export const HIDE_BACKEND_CONSOLE_CHANGE_EVENT = 'galtransl:hide-backend-console-change';
 export const CACHE_BROWSER_FONT_SIZE_CHANGE_EVENT = 'galtransl:cache-browser-font-size-change';
+export const DISABLE_ANIMATIONS_CHANGE_EVENT = 'galtransl:disable-animations-change';
+
+/* ── 已打开项目（open projects）的共享读写 + 广播 ──
+ * 翻译器（App.tsx）和 Agent 页面都用这一套，保证两边的"已打开项目"列表
+ * 始终同步：任一处 addOpenProject 都会写 localStorage 并广播，另一处监听
+ * 后更新自己的 state。单一数据源 = localStorage，单一写入路径 = addOpenProject。 */
+export const OPEN_PROJECTS_KEY = 'galtransl-open-projects';
+export const OPEN_PROJECTS_CHANGE_EVENT = 'galtransl:open-projects-change';
+const CONFIG_FILE_KEY = 'galtransl-config-file';
+
+export function loadOpenProjects(): string[] {
+  try {
+    const parsed: unknown = JSON.parse(readProjectStorage(OPEN_PROJECTS_KEY) || '[]');
+    return Array.isArray(parsed)
+      ? [...new Set(parsed.filter((dir): dir is string => typeof dir === 'string' && Boolean(dir.trim())))]
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveOpenProjects(projects: string[]): void {
+  persistOpenProjects(projects);
+  window.dispatchEvent(new CustomEvent(OPEN_PROJECTS_CHANGE_EVENT, { detail: projects }));
+}
+
+export function persistOpenProjects(projects: string[]): void {
+  // Persist before broadcasting so subscribers can immediately read the list,
+  // including its in-memory fallback when browser storage is unavailable.
+  writeProjectStorage(OPEN_PROJECTS_KEY, JSON.stringify(projects));
+}
+
+export function readConfigFileName(projectDir: string): string {
+  try {
+    const map = JSON.parse(readProjectStorage(CONFIG_FILE_KEY) || '{}');
+    return typeof map?.[projectDir] === 'string' && map[projectDir] ? map[projectDir] : 'config.yaml';
+  } catch {
+    return 'config.yaml';
+  }
+}
+
+export function saveConfigFileName(projectDir: string, configFileName: string): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readProjectStorage(CONFIG_FILE_KEY) || '{}');
+  } catch {
+    // Replace malformed optional metadata when registering a project.
+  }
+  const map = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  writeProjectStorage(CONFIG_FILE_KEY, JSON.stringify({ ...map, [projectDir]: configFileName }));
+}
+
+/** 注册一个已打开项目（幂等）。已存在则只刷新其 config 文件名、保持原顺序；
+ *  不存在则前插。写后广播 OPEN_PROJECTS_CHANGE_EVENT，监听方据此同步。 */
+export function addOpenProject(projectDir: string, configFileName = 'config.yaml'): void {
+  if (!projectDir) return;
+  saveConfigFileName(projectDir, configFileName || 'config.yaml');
+  const prev = loadOpenProjects();
+  if (prev.includes(projectDir)) return;
+  saveOpenProjects([projectDir, ...prev]);
+}
+
+const dirtyProjectConfigDirs = new Set<string>();
+
+/** Return whether a project's config page has unsaved changes in this session. */
+export function isProjectConfigDirty(projectDir: string): boolean {
+  return Boolean(projectDir) && dirtyProjectConfigDirs.has(projectDir);
+}
+
+/** Update a project's unsaved state and notify persistent UI such as the sidebar. */
+export function setProjectConfigDirty(projectDir: string, dirty: boolean) {
+  if (!projectDir) return;
+  if (dirty) {
+    dirtyProjectConfigDirs.add(projectDir);
+  } else {
+    dirtyProjectConfigDirs.delete(projectDir);
+  }
+  window.dispatchEvent(new CustomEvent(PROJECT_CONFIG_DIRTY_CHANGE_EVENT, {
+    detail: { projectDir, dirty },
+  }));
+}
 
 function cloneBackendProfile(profile: Record<string, unknown>): Record<string, unknown> {
   return JSON.parse(JSON.stringify(profile ?? {})) as Record<string, unknown>;
@@ -963,7 +1607,7 @@ function cloneBackendProfile(profile: Record<string, unknown>): Record<string, u
 
 function readBackendProfilesStorage(): BackendProfilesMap {
   try {
-    const raw = localStorage.getItem(BACKEND_PROFILES_STORAGE_KEY);
+    const raw = readProjectStorage(BACKEND_PROFILES_STORAGE_KEY);
     if (!raw) {
       return {};
     }
@@ -987,12 +1631,8 @@ function readBackendProfilesStorage(): BackendProfilesMap {
 }
 
 function writeBackendProfilesStorage(profiles: BackendProfilesMap) {
-  try {
-    localStorage.setItem(BACKEND_PROFILES_STORAGE_KEY, JSON.stringify(profiles));
-    window.dispatchEvent(new CustomEvent(BACKEND_PROFILES_CHANGE_EVENT, { detail: Object.keys(profiles) }));
-  } catch {
-    // ignore storage errors
-  }
+  writeProjectStorage(BACKEND_PROFILES_STORAGE_KEY, JSON.stringify(profiles));
+  window.dispatchEvent(new CustomEvent(BACKEND_PROFILES_CHANGE_EVENT, { detail: Object.keys(profiles) }));
 }
 
 export function getBackendProfile(name: string): Record<string, unknown> | null {
@@ -1032,25 +1672,60 @@ export function getSelectedBackendProfileJobPayload(projectDir: string): Pick<Su
 
 /** Get the global default backend profile name. */
 export function getDefaultBackendProfile(): string {
-  try {
-    return localStorage.getItem(DEFAULT_BACKEND_PROFILE_KEY) || '';
-  } catch {
-    return '';
-  }
+  return readProjectStorage(DEFAULT_BACKEND_PROFILE_KEY) || '';
 }
 
 /** Set the global default backend profile name. Pass empty to clear. */
 export function setDefaultBackendProfile(name: string) {
-  try {
-    if (name) {
-      localStorage.setItem(DEFAULT_BACKEND_PROFILE_KEY, name);
-    } else {
-      localStorage.removeItem(DEFAULT_BACKEND_PROFILE_KEY);
-    }
-    window.dispatchEvent(new CustomEvent(DEFAULT_BACKEND_PROFILE_CHANGE_EVENT, { detail: name }));
-  } catch {
-    // ignore storage errors
-  }
+  if (name) writeProjectStorage(DEFAULT_BACKEND_PROFILE_KEY, name);
+  else removeProjectStorage(DEFAULT_BACKEND_PROFILE_KEY);
+  window.dispatchEvent(new CustomEvent(DEFAULT_BACKEND_PROFILE_CHANGE_EVENT, { detail: name }));
+}
+
+/* ── Agent 默认后端配置（与翻译器默认各自独立） ──
+ * 同一配置可同时是翻译器默认 + Agent 默认，也可只占其一；两者互不影响。
+ * Agent 页用这套；翻译器页继续用上面的 getDefaultBackendProfile（翻译器默认）。 */
+const AGENT_DEFAULT_BACKEND_PROFILE_KEY = 'galtransl-agent-default-backend-profile';
+
+/** Custom event dispatched when the Agent default backend profile changes. */
+export const AGENT_DEFAULT_BACKEND_PROFILE_CHANGE_EVENT = 'galtransl:agent-default-backend-profile-change';
+
+/** Get the Agent default backend profile name (independent of translator default). */
+export function getAgentDefaultBackendProfile(): string {
+  return readProjectStorage(AGENT_DEFAULT_BACKEND_PROFILE_KEY) || '';
+}
+
+/** Set the Agent default backend profile name. Pass empty to clear. */
+export function setAgentDefaultBackendProfile(name: string) {
+  if (name) writeProjectStorage(AGENT_DEFAULT_BACKEND_PROFILE_KEY, name);
+  else removeProjectStorage(AGENT_DEFAULT_BACKEND_PROFILE_KEY);
+  window.dispatchEvent(new CustomEvent(AGENT_DEFAULT_BACKEND_PROFILE_CHANGE_EVENT, { detail: name }));
+}
+
+export const GENDIC_DEFAULT_BACKEND_PROFILE_CHANGE_EVENT = 'galtransl:gendic-default-backend-profile-change';
+export const SUBAGENT_DEFAULT_BACKEND_PROFILE_CHANGE_EVENT = 'galtransl:subagent-default-backend-profile-change';
+
+function getTaskDefaultBackendProfile(task: 'gendic' | 'subagent'): string {
+  return readProjectStorage(`galtransl-${task}-default-backend-profile`) || '';
+}
+
+function setTaskDefaultBackendProfile(task: 'gendic' | 'subagent', name: string, event: string) {
+  writeProjectStorage(`galtransl-${task}-default-backend-profile`, name);
+  window.dispatchEvent(new CustomEvent(event, { detail: name }));
+}
+
+/** 空值表示跟随项目的翻译器后端，兼容已有配置。 */
+export const getGenDicDefaultBackendProfile = () => getTaskDefaultBackendProfile('gendic');
+export const setGenDicDefaultBackendProfile = (name: string) =>
+  setTaskDefaultBackendProfile('gendic', name, GENDIC_DEFAULT_BACKEND_PROFILE_CHANGE_EVENT);
+/** 空值表示跟随当前会话的主 agent 后端。 */
+export const getSubagentDefaultBackendProfile = () => getTaskDefaultBackendProfile('subagent');
+export const setSubagentDefaultBackendProfile = (name: string) =>
+  setTaskDefaultBackendProfile('subagent', name, SUBAGENT_DEFAULT_BACKEND_PROFILE_CHANGE_EVENT);
+
+export function resolveGenDicBackendProfile(projectDir: string) {
+  const name = getGenDicDefaultBackendProfile();
+  return name ? { name, profile: getBackendProfile(name) } : resolveSelectedBackendProfile(projectDir);
 }
 
 /**
@@ -1059,7 +1734,7 @@ export function setDefaultBackendProfile(name: string) {
  */
 export function getSelectedBackendProfile(projectDir: string): string {
   try {
-    const map = JSON.parse(localStorage.getItem(BACKEND_PROFILE_KEY) || '{}');
+    const map = JSON.parse(readProjectStorage(BACKEND_PROFILE_KEY) || '{}');
     if (map[projectDir] !== undefined) {
       return map[projectDir]; // may be empty string (explicitly chose "不使用")
     }
@@ -1077,7 +1752,7 @@ export function getSelectedBackendProfile(projectDir: string): string {
  */
 export function getSelectedBackendProfileDisplay(projectDir: string): string {
   try {
-    const map = JSON.parse(localStorage.getItem(BACKEND_PROFILE_KEY) || '{}');
+    const map = JSON.parse(readProjectStorage(BACKEND_PROFILE_KEY) || '{}');
     if (map[projectDir] !== undefined) {
       return map[projectDir]; // '' or a specific name
     }
@@ -1090,7 +1765,7 @@ export function getSelectedBackendProfileDisplay(projectDir: string): string {
 
 export function setSelectedBackendProfile(projectDir: string, profileName: string) {
   try {
-    const map = JSON.parse(localStorage.getItem(BACKEND_PROFILE_KEY) || '{}');
+    const map = JSON.parse(readProjectStorage(BACKEND_PROFILE_KEY) || '{}');
     if (profileName === '__default__') {
       // "Follow global default" → remove the project-specific key entirely
       delete map[projectDir];
@@ -1098,7 +1773,7 @@ export function setSelectedBackendProfile(projectDir: string, profileName: strin
       // Store even empty string — it means "explicitly don't use any global config".
       map[projectDir] = profileName;
     }
-    localStorage.setItem(BACKEND_PROFILE_KEY, JSON.stringify(map));
+    writeProjectStorage(BACKEND_PROFILE_KEY, JSON.stringify(map));
   } catch {
     // ignore storage errors
   }
@@ -1110,7 +1785,7 @@ export function setSelectedBackendProfile(projectDir: string, profileName: strin
  */
 export function hasExplicitBackendProfile(projectDir: string): boolean {
   try {
-    const map = JSON.parse(localStorage.getItem(BACKEND_PROFILE_KEY) || '{}');
+    const map = JSON.parse(readProjectStorage(BACKEND_PROFILE_KEY) || '{}');
     return projectDir in map;
   } catch {
     return false;
@@ -1145,6 +1820,11 @@ export function setSelectedTranslatorTemplate(projectDir: string, translatorName
 }
 
 function normalizeHomeListLimit(value: unknown, fallback: number): number {
+  // Missing localStorage entries and blank values must use the default;
+  // Number(null) and Number('') would otherwise become 0 and clamp to 1.
+  if (value == null || (typeof value === 'string' && value.trim() === '')) {
+    return fallback;
+  }
   const numeric = typeof value === 'number' ? value : Number(value);
   if (!Number.isFinite(numeric)) {
     return fallback;
@@ -1232,7 +1912,42 @@ export function setHideBackendConsolePreference(enabled: boolean): boolean {
   } catch {
     // ignore storage errors
   }
+  // 同步给 Rust：下次启动会在窗口加载网页之前预热后端，那时读不到 localStorage，
+  // 只能靠这份落盘的副本决定要不要给后端开控制台窗口。
+  if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
+    void invoke('set_backend_console_preference', { hideConsole: normalized }).catch(() => undefined);
+  }
   return normalized;
+}
+
+export function getDisableAnimationsPreference(): boolean {
+  try {
+    const raw = localStorage.getItem(DISABLE_ANIMATIONS_KEY);
+    return normalizeDisableAnimations(raw);
+  } catch {
+    return DISABLE_ANIMATIONS_DEFAULT;
+  }
+}
+
+export function setDisableAnimationsPreference(disabled: boolean): boolean {
+  const normalized = normalizeDisableAnimations(disabled);
+  try {
+    localStorage.setItem(DISABLE_ANIMATIONS_KEY, String(normalized));
+    window.dispatchEvent(new CustomEvent(DISABLE_ANIMATIONS_CHANGE_EVENT, { detail: normalized }));
+  } catch {
+    // ignore storage errors
+  }
+  return normalized;
+}
+
+/**
+ * 把偏好写到根元素上（data-animations="off"），CSS 侧全局压制动画。
+ * 启动时先调用一次，避免首帧页面转场动画闪一下。
+ */
+export function applyAnimationsPreference(): boolean {
+  const disabled = getDisableAnimationsPreference();
+  document.documentElement.dataset.animations = disabled ? 'off' : 'on';
+  return disabled;
 }
 
 export function getHomeJobRetentionLimit(): number {
@@ -1275,6 +1990,19 @@ function normalizeCacheBrowserFontSize(value: unknown): number {
     return CACHE_BROWSER_FONT_SIZE_MAX;
   }
   return integer;
+}
+
+function normalizeDisableAnimations(value: unknown): boolean {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (value === 'true') {
+    return true;
+  }
+  if (value === 'false') {
+    return false;
+  }
+  return DISABLE_ANIMATIONS_DEFAULT;
 }
 
 function normalizeHideBackendConsole(value: unknown): boolean {
@@ -1351,70 +2079,749 @@ function normalizeCustomBackgroundPreference(value: unknown): CustomBackgroundPr
 }
 
 export function getCustomBackgroundPreference(): CustomBackgroundPreference {
-  try {
-    const raw = localStorage.getItem(CUSTOM_BACKGROUND_KEY);
-    if (!raw) {
-      return defaultCustomBackgroundPreference();
-    }
-    const parsed = JSON.parse(raw) as unknown;
-    return normalizeCustomBackgroundPreference(parsed);
-  } catch {
-    return defaultCustomBackgroundPreference();
+  return customBackgroundPreference;
+}
+
+type StoredCustomBackground = Omit<CustomBackgroundPreference, 'imageDataUrl'> & { imageVersion: string; configured: boolean };
+let customBackgroundPreference = defaultCustomBackgroundPreference();
+let customBackgroundLoad: Promise<CustomBackgroundPreference> | null = null;
+let customBackgroundWrites: Promise<unknown> = Promise.resolve();
+let customBackgroundRevision = 0;
+
+function publishCustomBackground(stored: StoredCustomBackground): CustomBackgroundPreference {
+  customBackgroundPreference = normalizeCustomBackgroundPreference({
+    ...stored,
+    imageDataUrl: stored.imageVersion
+      ? `${requireBackendBaseUrl()}/api/custom-background/image?version=${encodeURIComponent(stored.imageVersion)}`
+      : '',
+  });
+  window.dispatchEvent(new CustomEvent(CUSTOM_BACKGROUND_CHANGE_EVENT, { detail: customBackgroundPreference }));
+  return customBackgroundPreference;
+}
+
+function writeCustomBackground(write: () => Promise<StoredCustomBackground>) {
+  customBackgroundRevision += 1;
+  const pending = customBackgroundWrites.catch(() => undefined).then(async () => publishCustomBackground(await write()));
+  customBackgroundWrites = pending;
+  return pending;
+}
+
+export function uploadCustomBackgroundImage(image: Blob, name: string, preference?: CustomBackgroundPreference) {
+  const query = new URLSearchParams({ name });
+  if (preference) {
+    query.set('opacity', String(preference.opacity));
+    query.set('surfaceOpacity', String(preference.surfaceOpacity));
   }
+  return writeCustomBackground(() => apiRequest<StoredCustomBackground>(`/api/custom-background/image?${query}`, {
+    method: 'POST',
+    headers: { 'Content-Type': image.type },
+    body: image,
+  }));
+}
+
+export function loadCustomBackgroundPreference(): Promise<CustomBackgroundPreference> {
+  if (customBackgroundLoad) return customBackgroundLoad;
+  const revision = customBackgroundRevision;
+  customBackgroundLoad = (async () => {
+    // Read the old setting once; remove it only after a successful disk migration.
+    let legacyRaw: string | null = null;
+    try { legacyRaw = localStorage.getItem(CUSTOM_BACKGROUND_KEY); } catch { /* Storage may be unavailable. */ }
+    try {
+      const stored = await apiRequest<StoredCustomBackground>('/api/custom-background');
+      if (revision !== customBackgroundRevision) return getCustomBackgroundPreference();
+      if (legacyRaw && !stored.configured) {
+        let legacy: CustomBackgroundPreference | null = null;
+        try { legacy = normalizeCustomBackgroundPreference(JSON.parse(legacyRaw)); } catch { /* Ignore invalid old settings. */ }
+        if (legacy?.imageDataUrl.startsWith('data:image/')) {
+          const image = await (await fetch(legacy.imageDataUrl)).blob();
+          if (revision !== customBackgroundRevision) return getCustomBackgroundPreference();
+          const migrated = await uploadCustomBackgroundImage(image, legacy.imageName, legacy);
+          try { localStorage.removeItem(CUSTOM_BACKGROUND_KEY); } catch { /* Disk is already authoritative. */ }
+          return migrated;
+        }
+        if (legacy) {
+          const migrated = await setCustomBackgroundPreference(legacy);
+          try { localStorage.removeItem(CUSTOM_BACKGROUND_KEY); } catch { /* Disk is already authoritative. */ }
+          return migrated;
+        }
+      }
+      if (legacyRaw) {
+        try { localStorage.removeItem(CUSTOM_BACKGROUND_KEY); } catch { /* Disk is already authoritative. */ }
+      }
+      return publishCustomBackground(stored);
+    } catch (error) {
+      // Backend/disk is unreachable, so the legacy base64 image can never be
+      // migrated. Keeping it would let a stale wallpaper hold the whole
+      // localStorage quota hostage (and block project metadata from saving).
+      if (legacyRaw) {
+        try { localStorage.removeItem(CUSTOM_BACKGROUND_KEY); } catch { /* Storage may be unavailable. */ }
+      }
+      throw error;
+    }
+  })().finally(() => { customBackgroundLoad = null; });
+  return customBackgroundLoad;
+}
+
+export function setCustomBackgroundPreference(preference: Partial<CustomBackgroundPreference>): Promise<CustomBackgroundPreference> {
+  const settings: { opacity?: number; surfaceOpacity?: number } = {};
+  if ('opacity' in preference) settings.opacity = normalizeCustomBackgroundOpacity(preference.opacity);
+  if ('surfaceOpacity' in preference) settings.surfaceOpacity = normalizeCustomBackgroundSurfaceOpacity(preference.surfaceOpacity);
+  return writeCustomBackground(() => apiRequest<StoredCustomBackground>('/api/custom-background', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  }));
+}
+
+export function clearCustomBackgroundPreference(): Promise<CustomBackgroundPreference> {
+  return writeCustomBackground(() => apiRequest<StoredCustomBackground>('/api/custom-background', { method: 'DELETE' }));
+}
+
+// ---- Agent API ----
+
+export type AgentEventType =
+  | 'content'
+  | 'content_delta'
+  | 'content_end'
+  | 'reasoning_delta'
+  | 'reasoning_end'
+  | 'user_message'
+  | 'tool_call'
+  | 'tool_result'
+  | 'permission_request'
+  | 'wait_start'
+  | 'wait_tick'
+  | 'wait_end'
+  | 'llm_retry_start'
+  | 'llm_retry_end'
+  | 'compacted'
+  | 'compacting'
+  | 'context_usage'
+  | 'queue'
+  | 'assistant_message'
+  // 子代理（run_subagents）：start/done 持久（重建界面用），中间几条是瞬态的逐步活动/重试
+  | 'subagent_start'
+  | 'subagent_message'
+  | 'subagent_tool_call'
+  | 'subagent_tool_result'
+  | 'subagent_retry'
+  | 'subagent_done'
+  | 'cache_edit'
+  | 'cache_edit_summary'
+  | 'finish'
+  | 'error'
+  | 'stopped'
+  | 'status'
+  | 'close';
+
+/** 已用上下文 / 上下文窗口（token）。used_tokens 为估算值（含系统提示与对话历史）。 */
+export type AgentContextUsage = {
+  used_tokens: number;
+  window_tokens: number;
+  /** 本会话主 Agent 的 provider 实测缓存用量；未上报的请求不计入平均值。 */
+  cache?: {
+    request_count: number;
+    input_tokens: number;
+    cached_tokens: number;
+    hit_rate: number | null;
+    latest_input_tokens: number;
+    latest_cached_tokens: number | null;
+    latest_hit_rate: number | null;
+  } | null;
+};
+
+/** 排队中的用户消息（模型还没看到）：显示在 composer 上方的队列面板里。 */
+export type QueuedMessage = {
+  id: string;
+  text: string;
+  images?: import('../pages/agent/images').AgentImage[];
+};
+
+/**
+ * 助手消息的有序段落（助手消息的 content 模型）。
+ * 思考与正文随消息一起持久化，所以刷新/切会话/重连后仍能重建出卡片；
+ * 流式增量只是实时打字机效果，不是转录的来源。
+ */
+export type AgentMessagePart =
+  | { type: 'reasoning'; text: string }
+  | { type: 'text'; text: string }
+  | { type: 'tool_call'; id?: string; name?: string; arguments?: string };
+
+/** 正在生成的助手消息（进行中）：重连时据此把"那半条消息"照原样补出来。 */
+export type AgentStreamingMessage = {
+  /** 快照覆盖到的事件序号，客户端据此续订 SSE（避免重复补增量） */
+  step: number;
+  parts: AgentMessagePart[];
+};
+
+export type AgentEvent = {
+  type: AgentEventType;
+  step: number;
+  edit?: CacheEdit;
+  edits?: CacheEdit[];
+  turn_id?: string;
+  warning?: string;
+  // content
+  content?: string;
+  // content_delta（流式增量）/ content_end（一段流式文本结束）/ reasoning_*（思考流同构）
+  delta?: string;
+  index?: number;
+  length?: number;
+  // user_message
+  message?: string;
+  images?: import('../pages/agent/images').AgentImage[];
+  // tool_call
+  id?: string;
+  name?: string;
+  arguments?: unknown;
+  // tool_result
+  ok?: boolean;
+  result?: unknown;
+  /** 面向模型/结果区的 Markdown 预览；result 可能仍是前端变更卡所需的原始对象。 */
+  result_markdown?: string;
+  error?: string;
+  duration_ms?: number;
+  // permission_request（写操作执行前请用户批准）
+  tool_call_id?: string;
+  label?: string;
+  risk?: string;
+  mode?: string;
+  timeout_s?: number;
+  // 编辑类工具挂起前的「将要变更」预览（后端只读算出来，结构同工具结果的 changes /
+  // line_diff / deleted_preview）：审批卡据此提前显示 diff，不必等执行完才有。
+  preview?: unknown;
+  // wait_start / wait_tick / wait_end
+  seconds?: number;
+  total_ms?: number;
+  remaining_ms?: number;
+  elapsed_ms?: number;
+  interrupted?: boolean;
+  // compacted（上下文压缩）：tokens_after 是压缩后重建出来的真实历史的估算
+  // （含保留的尾部，所以可能远大于摘要本身）；老会话可能没有这个字段。
+  removed?: number;
+  cleared?: number;
+  summary_chars?: number;
+  tokens_before?: number;
+  tokens_after?: number;
+  // llm_retry_start / llm_retry_end（LLM 请求失败自动重试）
+  attempt?: number;
+  max_attempts?: number;
+  delay_ms?: number;
+  code?: string;
+  /** Event time in Unix seconds (retry start or turn completion). */
+  ts?: number;
+  aborted?: boolean;
+  // finish
+  summary?: string;
+  total_steps?: number;
+  /** 收尾事件专用：后端已安排好 followup 回合，马上又会跑起来（别把运行态打回停止） */
+  followup?: boolean;
+  // context_usage 事件 / status 快照里的上下文用量
+  context?: AgentContextUsage;
+  /** queue 事件 / status 快照：排队中的消息（整份，顺序即发送顺序） */
+  queued?: QueuedMessage[];
+  // assistant_message：助手消息的有序段落（思考/正文/工具调用）
+  parts?: AgentMessagePart[];
+  /** true 表示这是"进行中"的段落快照（由 status().streaming 合成，非持久化事件） */
+  streaming?: boolean;
+  // status
+  status?: string;
+  traceback?: string;
+  reason?: string;
+  started_at?: number;
+  finished_at?: number;
+  first_prompt?: string;
+  // 子代理事件（subagent_*）：id 是本次派发的 id，parent_id 指向发起它的那次工具调用
+  parent_id?: string;
+  agent?: string;
+  file?: string;
+  indexes?: string;
+  brief?: string;
+  model?: string;
+  /** subagent_message：这一轮子代理说了什么 */
+  round?: number;
+  text?: string;
+  /** subagent_done：子代理的收尾报告与统计 */
+  report?: string;
+  turns?: number;
+  tool_calls?: number;
+  /** subagent_done：写了几条校对批注（proofread_comment 的条数） */
+  proofread_comment?: number | number[];
+  /** @deprecated 旧字段名（doubts）：仅用于重放改名之前落盘的旧会话 */
+  doubts?: number | number[];
+  modified_count?: number;
+  needs_review_count?: number;
+  unverified_count?: number;
+  failed_file_count?: number;
+};
+
+export type AgentStatus = {
+  status: string;
+  project_dir: string;
+  session_id?: string;
+  title?: string;
+  first_prompt?: string;
+  step: number;
+  started_at?: number;
+  finished_at?: number;
+  error?: string;
+  /** 已用上下文/窗口（界面指示器用；会话为空时 used_tokens 为 0） */
+  context?: AgentContextUsage;
+  /** 排队中的消息（队列面板的数据源；内存态，重启即空） */
+  queued?: QueuedMessage[];
+  /** 正在生成的助手消息（没有进行中的响应时为 null/缺省） */
+  streaming?: AgentStreamingMessage | null;
+  events?: AgentEvent[];
+};
+
+/** A conversation under a project. One project can hold many. */
+export type AgentSession = {
+  session_id: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+  /** 后端内存里的实时状态：running / awaiting_input / stopped / failed；无状态时为空串。
+   *  侧边栏的状态灯据此显示（running 蓝灯亮着、跑完亮绿灯或橙灯）。 */
+  status?: string;
+};
+
+export type AgentStartPayload = {
+  project_dir: string;
+  config_file_name?: string;
+  backend_profile_data: Record<string, unknown>;
+  first_prompt?: string;
+  images?: { name: string; data_url?: string }[];
+  /** Omit to let the backend create a fresh session. */
+  session_id?: string;
+} & AgentRequestContext;
+
+/**
+ * Agent 会话要带上的「后端上下文」：配置名＋翻译器那份的配置内容。
+ *
+ * 后端拿不到配置名（配置存在前端 localStorage），而「了解项目」要如实报出
+ * 实际生效的后端（本会话、翻译任务、GenDic 和子 agent），所以随 start/message
+ * 一起送过去。地址与密钥不在返回里出现，这里送的是原名与内容。
+ */
+export type AgentBackendContext = {
+  /** 本会话在用的后端配置名（Agent 页选中的那份）。 */
+  backend_profile_name?: string;
+  /** 本会话实际使用的配置内容。token 不落盘，重启后继续历史会话时必须重新随请求提供。 */
+  backend_profile_data?: Record<string, unknown>;
+  /** 翻译任务会用的后端配置名（项目选择 → 否则全局「翻译器默认」）。 */
+  translator_profile_name?: string;
+  translator_profile_data?: Record<string, unknown>;
+  gendic_profile_name?: string;
+  gendic_profile_data?: Record<string, unknown>;
+  subagent_profile_name?: string;
+  subagent_profile_data?: Record<string, unknown>;
+};
+
+/** start / message 的请求上下文：后端上下文 + 权限模式（见 lib/permissionMode）。 */
+export type AgentRequestContext = AgentBackendContext & {
+  /** 权限模式：后端据此决定每次工具调用是直接放行还是先请用户批准。 */
+  permission_mode?: PermissionMode;
+};
+
+/** 主 agent 启动的翻译、GenDic 和子 agent 所用后端；空对象显式清除旧选择。 */
+export function getAgentTranslatorBackendContext(
+  projectDir: string,
+): Omit<AgentBackendContext, 'backend_profile_name' | 'backend_profile_data'> {
+  const { name, profile } = resolveSelectedBackendProfile(projectDir);
+  const gendicName = getGenDicDefaultBackendProfile();
+  const subagentName = getSubagentDefaultBackendProfile();
+  const taskProfile = (selected: string) => {
+    const data = selected ? getBackendProfile(selected) : {};
+    if (!data) throw new UiError(uiMessage('errors:profiles.notFound', { name: selected }));
+    return data;
+  };
+  return {
+    ...(name ? { translator_profile_name: name } : {}),
+    ...(profile ? { translator_profile_data: profile } : {}),
+    gendic_profile_name: gendicName,
+    gendic_profile_data: taskProfile(gendicName),
+    subagent_profile_name: subagentName,
+    subagent_profile_data: taskProfile(subagentName),
+  };
+}
+
+/** Agent 控制类请求（停止 / 队列 / 状态 / 会话列表与新建）的超时。
+ *  这些接口后端正常都是毫秒级回包；等不到就该报错让界面恢复可操作，而不是无限挂着——
+ *  否则停止、新建、发送全卡在一个没回音的请求上，看起来就是整页"卡死"。 */
+const AGENT_CONTROL_TIMEOUT_MS = 15_000;
+/** 发消息 / 启动回合：后端要落盘、起线程、回状态快照，给宽一点。 */
+const AGENT_SEND_TIMEOUT_MS = 30_000;
+
+export async function startAgent(payload: AgentStartPayload) {
+  return apiRequest<AgentStatus>('/api/agent/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: AGENT_SEND_TIMEOUT_MS,
+  });
 }
 
 /**
- * Persist the custom-background preference.
- *
- * Throws if `localStorage.setItem` fails (e.g. quota exceeded). Callers are
- * responsible for surfacing the error to the user — silently swallowing it
- * previously caused the "restart reverts to an older wallpaper" bug, because
- * the in-memory state diverged from what was actually persisted.
+ * 回答 Agent 的 ask_user 提问（后端那个工具正阻塞着等这一下）。
+ * answers 与提问一一对应：选项数组；null / 空数组 = 跳过该题。
+ * backendContext：与 sendAgentMessage 同一份前端上下文。后端那边如果已经没在等这道题
+ * （卡在提问上时被关了程序），会把这次选择当成一条用户消息另起回合——token 只在
+ * localStorage，必须随请求带上，否则新回合起不来。
  */
-export function setCustomBackgroundPreference(preference: CustomBackgroundPreference): CustomBackgroundPreference {
-  const normalized = normalizeCustomBackgroundPreference(preference);
-  localStorage.setItem(CUSTOM_BACKGROUND_KEY, JSON.stringify(normalized));
-  window.dispatchEvent(new CustomEvent(CUSTOM_BACKGROUND_CHANGE_EVENT, { detail: normalized }));
-  return normalized;
+export async function answerAgentAsk(
+  projectDir: string,
+  answers: Array<string[] | null>,
+  sessionId?: string,
+  backendContext?: Record<string, unknown>,
+) {
+  return apiRequest<{ ok: boolean; answers: Array<string[] | null>; resumed_as_message?: boolean }>(
+    '/api/agent/answer',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        project_dir: projectDir,
+        session_id: sessionId,
+        answers,
+        ...(backendContext || {}),
+      }),
+      timeoutMs: AGENT_SEND_TIMEOUT_MS,
+    },
+  );
 }
 
-export function clearCustomBackgroundPreference(): CustomBackgroundPreference {
-  const cleared = defaultCustomBackgroundPreference();
-  try {
-    localStorage.removeItem(CUSTOM_BACKGROUND_KEY);
-    window.dispatchEvent(new CustomEvent(CUSTOM_BACKGROUND_CHANGE_EVENT, { detail: cleared }));
-  } catch {
-    // ignore storage errors
+/**
+ * 回答权限确认卡（后端那个工具调用正阻塞着等这一下）。
+ * decision：allow-once 只批这一次 / allow-session 本会话都批这个工具 / deny 拒绝。
+ * reason：拒绝时可选的一句话（"为什么不要"），后端会把它拼进那条工具结果给模型看；
+ * 批准时传了也会被忽略。
+ * backendContext：同 answerAgentAsk——没在等的审批也会被兜底成一条用户消息。
+ */
+export async function answerAgentPermission(
+  projectDir: string,
+  decision: PermissionDecision,
+  sessionId?: string,
+  reason?: string,
+  backendContext?: Record<string, unknown>,
+) {
+  return apiRequest<{ ok: boolean; decision: string; name: string; reason?: string }>(
+    '/api/agent/permission',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        project_dir: projectDir,
+        session_id: sessionId,
+        decision,
+        reason: reason || undefined,
+        ...(backendContext || {}),
+      }),
+      timeoutMs: AGENT_SEND_TIMEOUT_MS,
+    },
+  );
+}
+
+/**
+ * 改权限模式。回合跑着也能改：后端下一次工具调用就按新档判；如果正好有一张权限卡在等，
+ * 新档本来就会放行它的话会自动放行（相当于替你点了「允许一次」）。
+ * 空闲会话也允许（下次 start/message 照样会带，两边一致）。
+ */
+export async function setAgentPermissionMode(
+  projectDir: string,
+  permissionMode: PermissionMode,
+  sessionId?: string,
+) {
+  return apiRequest<{ ok: boolean; permission_mode: string; session_id: string }>(
+    '/api/agent/permission-mode',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        project_dir: projectDir,
+        session_id: sessionId,
+        permission_mode: permissionMode,
+      }),
+      timeoutMs: AGENT_CONTROL_TIMEOUT_MS,
+    },
+  );
+}
+
+/**
+ * Send a user message to the project's agent session. While the agent is
+ * running the message is queued as an interjection; otherwise it starts a
+ * new turn continuing the same conversation.
+ */
+export async function sendAgentMessage(
+  projectDir: string,
+  message: string,
+  sessionId?: string,
+  backendContext?: AgentRequestContext,
+) {
+  return apiRequest<AgentStatus>('/api/agent/message', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      project_dir: projectDir,
+      message,
+      session_id: sessionId,
+      ...backendContext,
+    }),
+    timeoutMs: AGENT_SEND_TIMEOUT_MS,
+  });
+}
+
+/** Stop any running turn and drop the session history. */
+export async function resetAgent(projectDir: string, sessionId?: string) {
+  return apiRequest<AgentStatus>('/api/agent/reset', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_dir: projectDir, session_id: sessionId }),
+  });
+}
+
+export async function stopAgent(projectDir: string, sessionId?: string) {
+  return apiRequest<AgentStatus>('/api/agent/stop', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_dir: projectDir, session_id: sessionId }),
+    timeoutMs: AGENT_CONTROL_TIMEOUT_MS,
+  });
+}
+
+/** 删掉一条排队消息（模型还没看到的那条）。 */
+export async function deleteAgentQueued(projectDir: string, id: string, sessionId?: string) {
+  return apiRequest<AgentStatus>('/api/agent/queue/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_dir: projectDir, id, session_id: sessionId }),
+    timeoutMs: AGENT_CONTROL_TIMEOUT_MS,
+  });
+}
+
+/** 就地改一条排队消息的文本（位置不变）。 */
+export async function updateAgentQueued(
+  projectDir: string,
+  id: string,
+  message: string,
+  sessionId?: string,
+) {
+  return apiRequest<AgentStatus>('/api/agent/queue/update', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_dir: projectDir, id, message, session_id: sessionId }),
+    timeoutMs: AGENT_CONTROL_TIMEOUT_MS,
+  });
+}
+
+/** 「立即」：打断当前回合，把这条排队消息马上发出去。 */
+export async function sendAgentQueuedNow(projectDir: string, id: string, sessionId?: string) {
+  return apiRequest<AgentStatus>('/api/agent/queue/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_dir: projectDir, id, session_id: sessionId }),
+    timeoutMs: AGENT_CONTROL_TIMEOUT_MS,
+  });
+}
+
+export async function fetchAgentStatus(projectDir: string, sessionId?: string) {
+  const sid = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : '';
+  return apiRequest<AgentStatus>(
+    `/api/agent/status?project_dir=${encodeURIComponent(projectDir)}${sid}`,
+    { timeoutMs: AGENT_CONTROL_TIMEOUT_MS },
+  );
+}
+
+/** List all conversation sessions belonging to a project. */
+export async function listAgentSessions(projectDir: string) {
+  const res = await apiRequest<{ sessions: AgentSession[] }>(
+    `/api/agent/sessions?project_dir=${encodeURIComponent(projectDir)}`,
+    { timeoutMs: AGENT_CONTROL_TIMEOUT_MS },
+  );
+  return res.sessions || [];
+}
+
+/**
+ * 回放某会话的已提交转录（后端从会话日志读，不受内存事件窗口限制）。
+ * 这是界面重建转录的权威历史来源；status().events 只当补充。
+ */
+export async function fetchAgentTranscript(projectDir: string, sessionId?: string, limit?: number) {
+  const sid = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : '';
+  const lim = limit ? `&limit=${limit}` : '';
+  const res = await apiRequest<{ events: AgentEvent[] }>(
+    `/api/agent/transcript?project_dir=${encodeURIComponent(projectDir)}${sid}${lim}`,
+    { timeoutMs: AGENT_SEND_TIMEOUT_MS },
+  );
+  return res.events || [];
+}
+
+/** Create an empty session (no turn started). Title defaults to 占位「新会话」，
+ * 首条消息发出后由后端改成这条消息的内容（见 startAgent 的 first_prompt）。 */
+export async function createAgentSession(projectDir: string, title?: string) {
+  return apiRequest<AgentSession>('/api/agent/sessions/create', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_dir: projectDir, title }),
+    timeoutMs: AGENT_CONTROL_TIMEOUT_MS,
+  });
+}
+
+/** Delete a session and its persisted history. */
+export async function deleteAgentSession(projectDir: string, sessionId: string) {
+  return apiRequest<{ status: string; session_id: string }>('/api/agent/sessions/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_dir: projectDir, session_id: sessionId }),
+    timeoutMs: AGENT_CONTROL_TIMEOUT_MS,
+  });
+}
+
+/**
+ * Subscribe to an agent's SSE event stream. Calls `onEvent` for every agent
+ * event (content / tool_call / tool_result / finish / error / stopped / status / close).
+ * `afterStep`: skip replayed events with step <= afterStep (resume without duplicates).
+ * The stream ending without a `close` frame (backend restarted, proxy dropped the
+ * connection…) is reported through `onError`, so callers can reconnect instead of
+ * showing "running" forever.
+ * Returns an abort function that closes the stream.
+ */
+export function subscribeAgentStream(
+  projectDir: string,
+  onEvent: (event: AgentEvent) => void,
+  onError?: (err: Error) => void,
+  afterStep?: number,
+  sessionId?: string,
+): () => void {
+  const controller = new AbortController();
+
+  (async () => {
+    try {
+      const baseUrl = requireBackendBaseUrl();
+      const url =
+        `${baseUrl}/api/agent/stream?project_dir=${encodeURIComponent(projectDir)}` +
+        (typeof afterStep === 'number' ? `&after_step=${afterStep}` : '') +
+        (sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : '');
+      const response = await fetch(url, {
+        method: 'GET',
+        signal: controller.signal,
+        headers: { Accept: 'text/event-stream' },
+      });
+      if (!response.ok || !response.body) {
+        throw new UiError(uiMessage("errors:api.subscribeAgentStream_message_agentStreamFailed", { status: response.status }));
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+      let closed = false;
+      const handle = (event: AgentEvent) => {
+        if (event.type === 'close') closed = true;
+        onEvent(event);
+      };
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        // SSE frames separated by "\n\n"
+        let sep: number;
+        while ((sep = buffer.indexOf('\n\n')) >= 0) {
+          const frame = buffer.slice(0, sep);
+          buffer = buffer.slice(sep + 2);
+          parseAgentFrame(frame, handle);
+        }
+      }
+      if (!closed && !controller.signal.aborted) {
+        throw new UiError(uiMessage("errors:api.subscribeAgentStream_message_agent"));
+      }
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      onError?.(err instanceof Error ? err : new Error(String(err)));
+    }
+  })();
+
+  return () => controller.abort();
+}
+
+function parseAgentFrame(frame: string, onEvent: (event: AgentEvent) => void) {
+  // frame format: "event: agent\ndata: {...}"
+  const lines = frame.split('\n');
+  let dataLine = '';
+  for (const line of lines) {
+    if (line.startsWith('data:')) {
+      dataLine = line.slice(5).trim();
+    }
   }
-  return cleared;
+  if (!dataLine) return;
+  try {
+    const payload = JSON.parse(dataLine) as AgentEvent;
+    onEvent(payload);
+  } catch {
+    // ignore malformed frame
+  }
 }
 
 // ---- Internal ----
 
-async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
-  const baseUrl = getBackendBaseUrl();
+type ApiRequestInit = RequestInit & {
+  /** 等不到响应头就放弃（毫秒）。调用方自己传了 signal 时不叠加。 */
+  timeoutMs?: number;
+};
+
+async function apiRequest<T>(path: string, init?: ApiRequestInit): Promise<T> {
+  const baseUrl = requireBackendBaseUrl();
+  // 没传 init 就原样不传（fetch(url, undefined)）：有调用方/测试按"有没有 options"区分请求
+  let requestInit: RequestInit | undefined;
+  let timeoutMs: number | undefined;
+  if (init) ({ timeoutMs, ...requestInit } = init);
+  // 超时用 AbortController 自己计时（不用 AbortSignal.timeout：测试的 vm 环境里没有）。
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  if (timeoutMs && timeoutMs > 0 && !requestInit?.signal) {
+    const controller = new AbortController();
+    requestInit = { ...requestInit, signal: controller.signal };
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  }
 
   let response: Response;
   try {
-    response = await fetch(`${baseUrl}${path}`, init);
+    response = await fetch(`${baseUrl}${path}`, requestInit);
   } catch {
-    throw new ApiError(`无法连接到后端：${baseUrl}`, 0);
+    if (timedOut) {
+      throw new ApiError(
+        uiMessage("errors:api.apiRequest_message_timeout", { seconds: Math.round((timeoutMs || 0) / 1000) }),
+        0,
+      );
+    }
+    throw new ApiError(uiMessage("errors:api.apiRequest_message_unableConnectionBackend", { baseUrl }), 0);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 
   const data = (await response.json().catch(() => ({}))) as T & ErrorResponse;
   if (!response.ok) {
-    throw new ApiError(data.error || `请求失败：${response.status}`, response.status);
+    throw new ApiError(data.error || uiMessage("errors:api.apiRequest_message_failed", { status: response.status }), response.status);
   }
 
   return data;
 }
 
-function getBackendBaseUrl() {
+export function getBackendBaseUrl() {
   if (runtimeBackendBaseUrl) {
     return runtimeBackendBaseUrl;
   }
+  // A packaged instance must never fall back to another instance on 12333,
+  // including when startup failed and the user skipped the splash screen.
+  if (!import.meta.env.DEV && typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window && shouldUseManagedDesktopBackend()) {
+    return '';
+  }
   const configured = import.meta.env.VITE_BACKEND_URL?.trim();
   return configured ? configured.replace(/\/$/, '') : DEFAULT_BACKEND_URL;
+}
+
+function requireBackendBaseUrl() {
+  const url = getBackendBaseUrl();
+  if (!url) throw new ApiError(uiMessage("errors:api.requireBackendBaseUrl_message_backendNotSettingsReconnect"), 0);
+  return url;
 }
 
 export function setRuntimeBackendBaseUrl(url: string | null) {
@@ -1422,7 +2829,9 @@ export function setRuntimeBackendBaseUrl(url: string | null) {
 }
 
 function shouldUseManagedDesktopBackend() {
-  const baseUrl = getBackendBaseUrl();
+  // Decide ownership from configuration, not the dynamically assigned port.
+  const configured = import.meta.env.VITE_BACKEND_URL?.trim();
+  const baseUrl = configured ? configured.replace(/\/$/, '') : DEFAULT_BACKEND_URL;
 
   if (baseUrl === DEFAULT_BACKEND_URL) {
     return true;

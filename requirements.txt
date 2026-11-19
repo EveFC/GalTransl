@@ -8,7 +8,9 @@ tiktoken
 colorlog
 openpyxl
 orjson
+Pillow>=10
 beautifulsoup4
+lxml
 playsound3
 fasttext-predict
 InquirerPy

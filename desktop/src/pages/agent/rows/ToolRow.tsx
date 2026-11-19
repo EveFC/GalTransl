@@ -1,0 +1,488 @@
+import { AnimatedCollapse } from '../../../components/UiMotion';
+import { t as translate, useUiLanguage } from "../../../i18n";
+import { memo, type KeyboardEvent, type ReactNode, useContext, useEffect, useRef, useState } from 'react';
+import { ProjectPreviewContext, ProjectPreviewScopeContext, type ProjectPreviewTarget } from '../../../components/ProjectPreviewContext';
+import { Icon } from '../../../components/Icon';
+import { Markdown } from '../../../components/Markdown';
+import { SubagentList } from './SubagentList';
+import type { ActivityItem } from '../timeline';
+import { toolOperation, asArgs, formatCountdown, formatDuration, formatPayload, str, toolMeta } from '../toolMeta';
+import { manualOpenState } from '../uiState';
+import { ImageAttachments, type ImageScope } from '../images';
+
+/** 工具行的"轮到哪一步"。一批工具调用在后端是**挨个执行**的（runtime 里
+    `for tc in tool_calls`），但助手消息的 parts 会先把整批一次性画成行——所以"哪一行在跑"
+    不能看是不是最后一行，得看谁还没有结果：
+
+    - running：第一个还没有结果的行，正在执行；
+    - awaiting：它卡在权限门禁上等用户批准（那张审批卡就画在这行下面）；
+    - queued：排在它后面、还没轮到的（后端还没轮到它们，界面上不该显示成"进行中"）；
+    - stale：不在运行中的组里却也没有结果——历史里断在半路的那次调用（进程被杀等）。
+
+    返回数组与 items 下标对齐；非工具行、已有结果的行都是 undefined。 */
+export type ToolPhase = 'running' | 'awaiting' | 'queued' | 'stale';
+
+export function toolRowPhases(items: ActivityItem[], isLive: boolean): (ToolPhase | undefined)[] {
+  const phases: (ToolPhase | undefined)[] = items.map(() => undefined);
+  let isFirstPending = true;
+  items.forEach((it, i) => {
+    if (it.kind !== 'tool') return;
+    if (it.ok !== undefined || it.result !== undefined || it.error !== undefined) return;
+    if (!isLive) phases[i] = 'stale';
+    else if (isFirstPending) phases[i] = it.permission ? 'awaiting' : 'running';
+    else phases[i] = 'queued';
+    isFirstPending = false;
+  });
+  return phases;
+}
+
+export const ToolRow = memo(function ToolRow({
+  item,
+  phase,
+  persistKey,
+  imageScope,
+  autoExpand = true,
+}: {
+  item: ActivityItem;
+  /** 这一行在本次执行里轮到哪一步（见 toolRowPhases） */
+  phase?: ToolPhase;
+  persistKey: string;
+  imageScope?: ImageScope;
+  /** Extraction tools keep parameters/results folded, even as results arrive. */
+  autoExpand?: boolean;
+}) {
+  const uiLanguage = useUiLanguage();
+  const stateKey = `${persistKey}::tool-${item.id || item.step}`;
+
+  // 写入类工具的变更卡片数据（后端在结果里带回）：
+  // - changes: [{path, before, after, kind}] 键值级 before→after
+  // - line_diff: {rows: [{op: add|del, line}], truncated} 行级 diff（save_dict）
+  // - deleted_preview: [{index, text}] 被删条目（delete_transl_cache）
+  const changeList = extractChangeList(item.result);
+  // 写类工具的可选入参 reason（模型说明"为什么改"）：有变更卡就画在卡里，没有
+  // （如 save_dict 只新建空文件时的返回不含 changes）就在正文里单独给一行。
+  const reason = extractReason(item.result);
+  const ok = item.ok !== false;
+  const pending = item.ok === undefined && item.result === undefined && !item.error;
+  const awaiting = phase === 'awaiting';
+  const isRunning = phase === 'running';
+  const subagents = item.subagents ?? [];
+  const hasSubagents = subagents.length > 0;
+  // 正等批准时后端已经算好的「将要变更」（审批卡上摆的那份，见 PermissionCard）：
+  // 有它就不必为了"它准备改什么"把这一行撑开去铺原始 JSON。
+  const permPreview = awaiting ? extractChangeList(item.permission?.preview) : null;
+
+  // 行**默认展开**的情形：
+  // 1) 成功且有变更卡 —— 改了什么是这次调用的重点，diff 不该藏在一次点击后面。
+  //    只有 reason 没有 diff（改动 0 条、文本没变、调用失败）不展开：那时铺开的只是参数和
+  //    一句"未保存"，反倒把真正有改动的行挤下去；
+  // 2) **正等着批准、但算不出 diff 的调用** —— 整文件删缓存、启动翻译、派子代理这类没有
+  //    可比对的 before→after，用户要判断就只能看原始参数，那还是替它铺开（能算 diff 的
+  //    都摆在审批卡上了，这一行不必再展开一次）；
+  // 3) 带图片或子代理的行。
+  // manualOpenState 里只记"用户手动点过"的选择——记过就听用户的，没记过才用这个默认值
+  // （重挂/刷新后同一规则）。
+  const autoOpen = autoExpand && (Boolean((ok && changeList) || item.images?.length) || hasSubagents || (awaiting && !permPreview));
+  const [open, setOpenRaw] = useState(() => manualOpenState.get(stateKey) ?? autoOpen);
+  const setOpen = (value: boolean | ((prev: boolean) => boolean)) => {
+    setOpenRaw((prev) => {
+      const next = typeof value === 'function' ? value(prev) : value;
+      manualOpenState.set(stateKey, next);
+      return next;
+    });
+  };
+  // 状态比行晚到（结果比行晚到、批准请求也可能晚一拍）：该展开了就展开。用户手动点过就不抢，
+  // 否则会跟"刚点开又自己收起/展开"打架。
+  const autoOpenedRef = useRef(autoOpen);
+  useEffect(() => {
+    if (!autoOpen || autoOpenedRef.current) return;
+    autoOpenedRef.current = true;
+    if (!manualOpenState.has(stateKey)) setOpenRaw(true);
+  }, [autoOpen, stateKey]);
+
+  const meta = toolMeta(item.name, asArgs(item.arguments));
+  const summary = meta.summary(asArgs(item.arguments), item.result);
+
+  // 把原始参数/结果收进折叠菜单：写入调用要看的通常是 diff，JSON 参数与整份结果只是证据；
+  // 派子代理的调用同理想——任务清单和各份报告已经在子代理行里逐条显示了，那串 JSON 是重复的。
+  // 失败时例外：错误全文要直接可见（那时子代理行也未必建得起来）。
+  const foldRaw = ok && (hasSubagents || (Boolean(changeList) && !pending));
+
+  // wait 行：等待期间显示倒计时（只出秒数，不画进度条）。
+  const isWait = toolOperation(item.name, asArgs(item.arguments)) === 'wait';
+  const waiting = isWait && pending && typeof item.waitTotalMs === 'number';
+  const waitTotal = item.waitTotalMs || 0;
+  const waitRemaining = item.waitRemainingMs ?? waitTotal;
+
+  // 询问用户的结果：后端已经给出「问题：答案」的可读文本，转录里别再甩一坨 JSON
+  const askSummary =
+    item.name === 'ask_user' && ok
+      ? str((item.result as Record<string, unknown> | undefined)?.summary)
+      : '';
+  const resultText = askSummary || (ok && item.resultMarkdown) || formatPayload(ok ? item.result : item.error) || item.progressText || '';
+  const resultMarkdown = item.resultFormat !== 'text' && !askSummary && ok && (typeof item.resultMarkdown === 'string' || typeof item.result === 'string');
+  const hasDetails = Boolean(summary || resultText || item.arguments || changeList || item.images?.length);
+  const longResult = resultText.length > 400;
+
+  // 权限被拒不是故障，是用户的决定：状态标签说"已拒绝"，免得看着像系统出错。
+  // 「用户没有在」是旧会话里"审批到点自动拒绝"留下的文案——现在没有超时了，留着这句
+  // 只是为了让老转录仍显示成"已拒绝"而不是"失败"。
+  const denied =
+    !ok && typeof item.error === 'string' && /^(用户拒绝权限|用户没有在|回合被停止)/.test(item.error);
+  // 状态标签以**这一行自己的进度**为准（见 toolRowPhases）：没有结果就不是"完成"。
+  // 以前按"是不是最后一行"判断，整批里等在中间的那行会写成完成——最刺眼的就是
+  // "还在等你批准，却已经显示完成"。排队中/未完成走默认的灰，不给"在跑"那种蓝色呼吸点。
+  const state = waiting
+    ? { label: formatCountdown(waitRemaining), tone: 'running', countdown: true }
+    : awaiting
+      ? { label: translate("agent:toolRow.label_label_approve"), tone: 'running', countdown: false }
+      : isRunning
+        ? { label: translate("agent:toolRow.label_label_text"), tone: 'running', countdown: false }
+        : phase === 'queued'
+          ? { label: translate("agent:toolRow.label_label_queue"), tone: '', countdown: false }
+          : phase === 'stale'
+            ? { label: translate("agent:toolRow.label_label_notComplete"), tone: '', countdown: false }
+            : isWait && item.waitInterrupted
+              ? { label: translate("agent:toolRow.label_label_done"), tone: '', countdown: false }
+              : denied
+                ? { label: translate("agent:toolRow.label_label_doneDeny"), tone: 'error', countdown: false }
+                : ok
+                  ? { label: translate("common:actions.completed"), tone: 'done', countdown: false }
+                  : { label: translate("common:actions.failed"), tone: 'error', countdown: false };
+
+  return (
+    <div className={`agent-tool${open ? ' is-open' : ''}`} data-agent-tool-id={item.id}>
+      <button
+        type="button"
+        className="agent-tool__header"
+        onClick={() => hasDetails && setOpen((v) => !v)}
+        disabled={!hasDetails}
+        aria-expanded={open}
+      >
+        <span className="agent-tool__icon"><Icon name={meta.icon} /></span>
+        <span className={`agent-tool__name${state.tone === 'running' ? ' is-running' : ''}`}>{meta.action}</span>
+        {summary ? <span className="agent-tool__summary" title={summary}>{summary}</span> : null}
+        {changeList ? <span className="agent-tool__diffbadge">±{changeList.total}</span> : null}
+        <span className={`agent-tool__state${state.tone ? ` is-${state.tone}` : ''}${state.countdown ? ' is-countdown' : ''}`}>
+          <span className="agent-tool__state-dot" />
+          {state.label}
+        </span>
+        <span className="agent-tool__caret">›</span>
+      </button>
+      <AnimatedCollapse open={open}>{() => (
+        <div className="agent-tool__body">
+          {hasSubagents ? <SubagentList runs={subagents} /> : null}
+          {changeList ? (
+            <ChangeListCard data={changeList} args={asArgs(item.arguments)} />
+          ) : reason ? (
+            <ChangeReason text={reason} />
+          ) : null}
+          {foldRaw ? (
+            <RawToolData
+              args={item.arguments}
+              resultText={resultText}
+              markdown={resultMarkdown}
+              resultTitle={ok ? translate("agent:toolRow.agentToolBody_resultTitle_text") : translate("agent:toolRow.agentToolBody_resultTitle_error")}
+              tone={ok ? 'default' : 'error'}
+              durationMs={item.durationMs}
+              truncate={longResult ? 1200 : 0}
+            />
+          ) : (
+            <>
+              {item.arguments !== undefined ? (
+                <ToolBlock title={translate("agent:toolRow.agentToolBody_title_text")} content={formatPayload(item.arguments)} mono />
+              ) : null}
+              {item.images?.length ? <ImageAttachments images={item.images} scope={imageScope} /> : null}
+              {resultText ? (
+                <ToolBlock
+                  title={ok ? translate("agent:toolRow.agentToolBody_title_textVariant2") : translate("agent:toolRow.agentToolBody_title_error")}
+                  content={resultText}
+                  markdown={resultMarkdown}
+                  mono
+                  truncate={longResult ? 1200 : 0}
+                  tone={ok ? 'default' : 'error'}
+                  durationMs={item.durationMs}
+                />
+              ) : null}
+            </>
+          )}
+        </div>
+      )}</AnimatedCollapse>
+    </div>
+  );
+});
+
+/** 参数 / 结果块：Markdown 结果复用对话渲染，原始参数和错误保留等宽正文。 */
+export function ToolBlock({
+  title,
+  content,
+  mono,
+  markdown = false,
+  truncate = 0,
+  tone = 'default',
+  durationMs,
+}: {
+  title: string;
+  content: string;
+  mono?: boolean;
+  markdown?: boolean;
+  truncate?: number;
+  tone?: 'default' | 'error';
+  durationMs?: number;
+}) {
+  const uiLanguage = useUiLanguage();
+  const [expanded, setExpanded] = useState(false);
+  const clipped = truncate > 0 && content.length > truncate && !expanded;
+  const shown = clipped ? content.slice(0, truncate) + '…' : content;
+  return (
+    <div className={`agent-toolblock${tone === 'error' ? ' is-error' : ''}`}>
+      <div className="agent-toolblock__head">
+        <span className="agent-toolblock__title">{title}</span>
+        {typeof durationMs === 'number' ? (
+          <span className="agent-toolblock__duration">{formatDuration(durationMs)}</span>
+        ) : null}
+      </div>
+      <AnimatedCollapse open contentKey={expanded ? 'full' : 'preview'}>{() => markdown ? (
+        // 完整解析后按高度折叠，避免截在表格或代码围栏中间破坏结构。
+        <Markdown text={content} className={`agent-toolblock__markdown${expanded ? ' is-expanded' : ''}`} />
+      ) : (
+        <pre className={`agent-toolblock__pre${mono ? ' is-mono' : ''}`}>{shown}</pre>
+      )}</AnimatedCollapse>
+      {truncate > 0 && content.length > truncate ? (
+        <button type="button" className="agent-toolblock__toggle" aria-expanded={expanded} onClick={() => setExpanded((v) => !v)}>
+          {expanded ? translate("agent:toolRow.agentToolblockToggle_message_text") : translate("agent:toolRow.agentToolblockToggle_message_all", { count: content.length })}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+/** 写入类调用的「原始参数/结果」：合成一个折叠菜单，默认折起。
+
+    变更卡已经说清改了什么，原始 JSON 与整份结果只是证据——要看再展开。折成两行
+    （参数一行、结果一行）点起来目标太小、还容易点错，合成一行开门更像"翻原始数据"；
+    折叠态右侧给总字符数，一眼知道里面有多少东西。 */
+function RawToolData({
+  args,
+  resultText,
+  resultTitle,
+  markdown,
+  tone,
+  durationMs,
+  truncate,
+}: {
+  args: unknown;
+  resultText: string;
+  resultTitle: string;
+  markdown?: boolean;
+  tone: 'default' | 'error';
+  durationMs?: number;
+  truncate?: number;
+}) {
+  const uiLanguage = useUiLanguage();
+  const [open, setOpen] = useState(false);
+  const argsText = args === undefined ? '' : formatPayload(args);
+  if (!argsText && !resultText) return null;
+  return (
+    <div className="agent-rawdata">
+      <button
+        type="button"
+        className="agent-toolblock__head is-toggle"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
+        <span className="agent-toolblock__label">
+          <span className="agent-toolblock__caret" aria-hidden>›</span>
+          <span className="agent-toolblock__title">{translate("agent:toolRow.agentToolblockLabel_message_text")}</span>
+        </span>
+        <span className="agent-toolblock__meta">
+          {open ? null : (
+            <span className="agent-toolblock__len">{translate("agent:toolRow.agentToolblockMeta_message_text", { value: argsText.length + resultText.length })}</span>
+          )}
+        </span>
+      </button>
+      <AnimatedCollapse open={open} className="agent-rawdata__body">{() => (
+        <>
+          {argsText ? <ToolBlock title={translate("agent:toolRow.agentRawdata_title_text")} content={argsText} mono /> : null}
+          {resultText ? (
+            <ToolBlock
+              title={resultTitle}
+              content={resultText}
+              markdown={markdown}
+              mono
+              truncate={truncate}
+              tone={tone}
+              durationMs={durationMs}
+            />
+          ) : null}
+        </>
+      )}</AnimatedCollapse>
+    </div>
+  );
+}
+
+/* ── 写入类工具的变更卡片（diff 风格） ──
+   后端在写入结果里带回三类结构之一/组合：
+   - changes: [{path, before, after, kind}] —— update_project_config、
+     manage_problem_filter、patch_transl_cache、save_name_table
+   - line_diff: {rows, truncated} —— save_dict 的整文本行级 diff
+   - deleted_preview: [{index, text}] —— delete_transl_cache 被删条目
+
+   审批卡上的「将要变更」用的是**同一份结构**（后端在挂起前只读算出来，见
+   _preview_tool_changes），所以两处共用这一个渲染，没有第二套 diff 视图。 */
+
+type ChangeEntry = { path: string; before?: unknown; after?: unknown; kind?: string; file?: string };
+
+type DiffRow = { op: 'add' | 'del'; line: string };
+
+type ChangeData = {
+  fileKey?: string;
+  filename?: string;
+  changes?: ChangeEntry[];
+  line_diff?: { rows?: DiffRow[]; truncated?: boolean };
+  deleted_preview?: { index: number; text: string }[];
+  /** 模型填的「为什么改」（写类工具的可选入参 reason，后端原样回传） */
+  reason?: string;
+  total: number;
+};
+
+/** 写类工具结果里模型交代的原因（可选）。空/非字符串都当没填。 */
+function extractReason(result: unknown): string {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return '';
+  const value = (result as Record<string, unknown>).reason;
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+export function extractChangeList(result: unknown): ChangeData | null {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+  const r = result as Record<string, unknown>;
+  const changes = Array.isArray(r.changes) ? (r.changes as ChangeEntry[]) : undefined;
+  const lineDiff =
+    r.line_diff && typeof r.line_diff === 'object' && Array.isArray((r.line_diff as Record<string, unknown>).rows)
+      ? (r.line_diff as { rows?: DiffRow[]; truncated?: boolean })
+      : undefined;
+  const deletedPreview = Array.isArray(r.deleted_preview) ? (r.deleted_preview as { index: number; text: string }[]) : undefined;
+  const total =
+    (changes?.length || 0) +
+    (lineDiff?.rows?.length || 0) +
+    (deletedPreview?.length || 0);
+  if (!total) return null;
+  return {
+    fileKey: typeof r.file_key === 'string' ? r.file_key : undefined,
+    filename: typeof r.filename === 'string' ? r.filename : undefined,
+    changes,
+    line_diff: lineDiff,
+    deleted_preview: deletedPreview,
+    reason: extractReason(result) || undefined,
+    total,
+  };
+}
+
+function fmtChangeValue(v: unknown): string {
+  if (v === null || v === undefined) return translate("common:actions.empty");
+  if (typeof v === 'string') return v.length > 80 ? v.slice(0, 77) + '…' : v;
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
+/** 模型填的「为什么改」：变更卡顶部一行，没有变更卡时（如 save_dict 只新建空文件时不产生
+    changes）在工具正文里单独显示，不然填了原因却没地方看。 */
+function ChangeReason({ text }: { text: string }) {
+  const uiLanguage = useUiLanguage();
+  return (
+    <div className="agent-changes__reason">
+      <span className="agent-changes__reason-label">{translate("agent:toolRow.agentChangesReason_message_text")}</span>
+      <span className="agent-changes__reason-text">{text}</span>
+    </div>
+  );
+}
+
+/** 变更卡。title 只有审批卡会换（那边的同一份数据是"将要变更"，还没真写）。 */
+export function ChangeListCard({ data, args, title = translate("agent:toolRow.changeListCard_message_text") }: { data: ChangeData; args?: Record<string, unknown>; title?: string }) {
+  useUiLanguage();
+  const showPreview = useContext(ProjectPreviewContext);
+  const scope = useContext(ProjectPreviewScopeContext);
+  const navigation = (target: ProjectPreviewTarget | null) => {
+    if (!target || !showPreview || !scope?.projectDir) return {};
+    const show = () => showPreview({ ...scope, ...target });
+    return { role: 'button', tabIndex: 0, title: translate('agent:projectPreview.openEntry'),
+      onClick: show, onKeyDown: (event: KeyboardEvent<HTMLElement>) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        show();
+      } };
+  };
+  const filename = data.filename || str(args?.filename);
+  const rows: ReactNode[] = [];
+
+  if (data.line_diff?.rows?.length) {
+    // diff 全量渲染、不再折叠：容器限高 + 内部滚动（见 .agent-changes__body 的
+    // max-height）。改了什么应当一眼看完，不该先点一次"展开全部"。
+    const diffRows = data.line_diff.rows;
+    for (const [i, r] of diffRows.entries()) {
+      rows.push(
+        <div key={`d-${i}`} className={`agent-changes__dline agent-changes__dline--${r.op}`}
+          {...navigation(data.fileKey ? { page: 'dictionary', fileKey: data.fileKey, line: r.line } : null)}>
+          <span className="agent-changes__sign">{r.op === 'add' ? '+' : '−'}</span>
+          <span className="agent-changes__dtext">{r.line || ' '}</span>
+        </div>,
+      );
+    }
+    if (data.line_diff.truncated) {
+      // 后端生成 diff 时就截断过（总行数上限），如实说明，不是界面的折叠
+      rows.push(<div key="d-trunc" className="agent-changes__more">{translate("agent:toolRow.changeListCard_push_diffDone")}</div>);
+    }
+  }
+
+  if (data.deleted_preview?.length) {
+    for (const p of data.deleted_preview) {
+      rows.push(
+        <div key={`del-${p.index}`} className="agent-changes__dline agent-changes__dline--del"
+          {...navigation(filename ? { page: 'cache', filename, index: p.index } : null)}>
+          <span className="agent-changes__sign">−</span>
+          <span className="agent-changes__path">#{p.index}</span>
+          <span className="agent-changes__dtext">{p.text || translate("agent:toolRow.agentChangesDtext_message_translationText")}</span>
+        </div>,
+      );
+    }
+  }
+
+  if (data.changes?.length) {
+    for (const [i, c] of data.changes.entries()) {
+      const match = /^(.*?)#(\d+)\./.exec(c.path);
+      const file = c.file || match?.[1] || filename;
+      rows.push(
+        <div key={`c-${i}`} className="agent-changes__item"
+          {...navigation(match && file ? { page: 'cache', filename: file, index: Number(match[2]) } : null)}>
+          <span className="agent-changes__path">{c.path}</span>
+          {c.kind !== 'add' ? (
+            <span className="agent-changes__old">
+              <span className="agent-changes__sign">−</span>
+              {fmtChangeValue(c.before)}
+            </span>
+          ) : null}
+          {c.kind !== 'remove' ? (
+            <span className="agent-changes__new">
+              <span className="agent-changes__sign">+</span>
+              {fmtChangeValue(c.after)}
+            </span>
+          ) : null}
+        </div>,
+      );
+    }
+  }
+
+  return (
+    <div className="agent-changes">
+      <div className="agent-changes__head">
+        <span className="agent-changes__title">{title}</span>
+        <span className="agent-changes__count">±{data.total}</span>
+      </div>
+      {data.reason ? <ChangeReason text={data.reason} /> : null}
+      {rows.length ? <div className="agent-changes__body">{rows}</div> : null}
+    </div>
+  );
+}

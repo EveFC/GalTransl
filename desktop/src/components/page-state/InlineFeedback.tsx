@@ -1,6 +1,7 @@
+import { t as translate, useUiLanguage } from "../../i18n";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 
-type InlineFeedbackTone = 'error' | 'info' | 'success';
+type InlineFeedbackTone = 'error' | 'info' | 'success' | 'warning';
 
 type InlineFeedbackProps = {
   title?: string;
@@ -9,7 +10,7 @@ type InlineFeedbackProps = {
   action?: ReactNode;
   tone?: InlineFeedbackTone;
   className?: string;
-  /** 自动消失延迟(ms)，设置后到时间会淡出并触发 onDismiss；success/info 默认 2200，error 不自动消失 */
+  /** 自动消失延迟(ms)，设置后到时间会淡出并触发 onDismiss；success/info 默认 2200，warning/error 默认 4200；传 0 表示常驻不自动消失 */
   autoDismiss?: number;
   /** 淡出动画结束后回调，通常用来清除父组件的 info/error 状态 */
   onDismiss?: () => void;
@@ -36,7 +37,8 @@ function stringifyNode(node: ReactNode): string {
 const DEFAULT_AUTO_DISMISS: Record<InlineFeedbackTone, number | undefined> = {
   success: 2200,
   info: 2200,
-  error: undefined,
+  warning: 4200,
+  error: 4200,
 };
 
 const TONE_ICON: Record<InlineFeedbackTone, ReactNode> = {
@@ -55,6 +57,11 @@ const TONE_ICON: Record<InlineFeedbackTone, ReactNode> = {
       <path fill="currentColor" d="M12 2a10 10 0 100 20 10 10 0 000-20zm0 4.5a1.3 1.3 0 110 2.6 1.3 1.3 0 010-2.6zm1.4 11.5h-2.8v-7h2.8v7z" />
     </svg>
   ),
+  warning: (
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+      <path fill="currentColor" d="M12 3.1a1.8 1.8 0 011.56.9l8.04 13.94A1.8 1.8 0 0120.04 20H3.96a1.8 1.8 0 01-1.56-2.06L10.44 4A1.8 1.8 0 0112 3.1zm0 4.25a1.1 1.1 0 00-1.1 1.1v4.65a1.1 1.1 0 102.2 0V8.45a1.1 1.1 0 00-1.1-1.1zm0 9.3a1.3 1.3 0 100 2.6 1.3 1.3 0 000-2.6z" />
+    </svg>
+  ),
 };
 
 export function InlineFeedback({
@@ -68,9 +75,10 @@ export function InlineFeedback({
   onDismiss,
   dedupeKey,
 }: InlineFeedbackProps) {
+  useUiLanguage();
   const content = children ?? description;
   const classes = ['inline-alert', `inline-alert--${tone}`, className].filter(Boolean).join(' ');
-  const role = tone === 'error' ? 'alert' : 'status';
+  const role = tone === 'error' || tone === 'warning' ? 'alert' : 'status';
 
   // 计算去重 key：显式传入优先；null 表示禁用；否则若是 floating toast 自动生成。
   const isFloating = (className ?? '').includes('inline-alert--floating');
@@ -114,7 +122,7 @@ export function InlineFeedback({
 
   useEffect(() => {
     if (alreadySeen) return;
-    if (dismissMs == null) return;
+    if (dismissMs == null || dismissMs <= 0) return;
     timerRef.current = setTimeout(startDismiss, dismissMs);
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current);
@@ -138,15 +146,15 @@ export function InlineFeedback({
       <div className="inline-alert__icon">{TONE_ICON[tone]}</div>
       <div className="page-state-feedback__body">
         <div className="inline-alert__meta">
-          <span className="inline-alert__app">GalTransl</span>
+          <span className="inline-alert__app">{translate("common:inlineFeedback.inlineAlertMeta_message_galTransl")}</span>
           <span className="inline-alert__dot" aria-hidden="true" />
-          <span className="inline-alert__time">刚刚</span>
+          <span className="inline-alert__time">{translate("common:inlineFeedback.inlineAlertMeta_message_text")}</span>
         </div>
         {title ? <strong className="page-state-feedback__title">{title}</strong> : null}
         {content ? <div className="page-state-feedback__description">{content}</div> : null}
       </div>
       {action ? <div className="page-state-feedback__action">{action}</div> : null}
-      <button type="button" className="inline-alert__close" aria-label="关闭提示" onClick={startDismiss}>
+      <button type="button" className="inline-alert__close" aria-label={translate("common:inlineFeedback.inlineAlertClose_ariaLabel_disableHint")} onClick={startDismiss}>
         ×
       </button>
     </div>

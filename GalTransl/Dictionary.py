@@ -6,6 +6,15 @@ from GalTransl import LOGGER
 from GalTransl.Utils import process_escape
 
 
+def split_dictionary_line(line: str, *, gpt: bool = False) -> list[str]:
+    """字典加载与编辑共用的列解析；保留查找词中的空白。"""
+    line = line.replace("    ", "\t")
+    if gpt and "->" in line:
+        line = line.replace("->", "\t").replace("#", "\t")
+    parts = line.rstrip("\r\n").split("\t")
+    return parts if gpt else [process_escape(part) for part in parts]
+
+
 class ifWord:
     __slots__ = ["without_flag", "startswith_flag", "endswith_flag", "word"]
 
@@ -48,6 +57,9 @@ class CBasicDicElement:
         "spl_word",  # if_word_list的连接关键字
         "note",  # For GPT
         "dic_name",  # 字典名
+        "source_file",
+        "line_number",
+        "raw_line",
     ]
 
     def __init__(
@@ -79,6 +91,9 @@ class CBasicDicElement:
         self.spl_word: str = ""  # if_word_list的连接关键字
         self.note: str = ""  # For GPT
         self.dic_name: str = dic_name  # 字典名
+        self.source_file = ""
+        self.line_number = 0
+        self.raw_line = ""
 
     def __repr__(self) -> str:
         return f"{self.search_word} -> {self.replace_word}"
@@ -156,23 +171,16 @@ class CNormalDic:
         dic_name = path.basename(dic_path)
         dic_name = path.splitext(dic_name)[0]
 
-        for line in dic_lines:
+        for line_number, line in enumerate(dic_lines, 1):
             if line.startswith("\n"):
                 continue
             # elif line.startswith("\\\\") or line.startswith("//"):  # 注释行跳过
             #     continue
 
-            # 四个空格换成Tab
-            line = line.replace("    ", "\t")
-
-            sp = line.rstrip("\r\n").split("\t")  # 去多余换行符，Tab分割
+            sp = split_dictionary_line(line)
             len_sp = len(sp)
             if len_sp < 2:  # 至少是2个元素
                 continue
-            # 处理转义字符
-            for i in range(len_sp):
-                sp[i] = process_escape(sp[i])
-
             is_conditionaDic_line = True if sp[0] in self.conditionaDic_key else False
             is_situationsDic_line = True if sp[0] in self.situationsDic_key else False
             if (is_conditionaDic_line and len_sp < 4) or (
@@ -199,6 +207,9 @@ class CNormalDic:
             else:
                 self.dic_list.append(CBasicDicElement(sp[0], sp[1], dic_name=dic_name))
                 normalDic_count += 1
+            self.dic_list[-1].source_file = str(dic_path)
+            self.dic_list[-1].line_number = line_number
+            self.dic_list[-1].raw_line = line.rstrip("\r\n")
         LOGGER.info(
             "载入 普通字典："
             + path.basename(dic_path)
@@ -217,7 +228,8 @@ class CNormalDic:
         )
 
     def do_replace(
-        self, input_text: str, input_tran: CSentense, full_match: bool = False
+        self, input_text: str, input_tran: CSentense, full_match: bool = False,
+        *, matches: list | None = None,
     ) -> str:
         """
         通过这个dic字典来优化一个句子。
@@ -226,6 +238,8 @@ class CNormalDic:
         full_match：是否全匹配，默认False，开启后查找词完全等于input_text才替换
         """
         # 遍历每个BasicDicElement做替换
+        # "~"/"(同上)" 条件沿用上一条条件字典的结果；首条之前视为不满足
+        last_one_success = False
         for dic in self.dic_list:
             # 场景字典判断
             if dic.is_situationsDic:
@@ -307,13 +321,21 @@ class CNormalDic:
                 if len_search_word > len_input_text:
                     continue  # 肯定不满足
                 elif input_text[:len_search_word] == search_word:
+                    if matches is not None:
+                        matches.append(dic)
                     input_text = input_text.replace(search_word, replace_word, 1)
             elif dic.onetime_flag:  # onetime情况，只替换一次
+                if matches is not None and search_word in input_text:
+                    matches.append(dic)
                 input_text = input_text.replace(search_word, replace_word, 1)
             else:  # 普通情况
                 if not full_match:
+                    if matches is not None and search_word in input_text:
+                        matches.append(dic)
                     input_text = input_text.replace(search_word, replace_word)
                 elif search_word == input_text:
+                    if matches is not None:
+                        matches.append(dic)
                     input_text = replace_word
 
         return input_text
@@ -353,17 +375,11 @@ class CGptDict:
         dic_name = path.splitext(dic_name)[0]
         normalDic_count = 0
 
-        for line in dic_lines:
+        for line_number, line in enumerate(dic_lines, 1):
             if line.startswith("\n"):
                 continue
 
-            # 兼容四个空格
-            line = line.replace("    ", "\t")
-            # 兼容src->dst #note
-            if "->" in line:
-                line = line.replace("->", "\t").replace("#", "\t")
-
-            sp = line.rstrip("\r\n").split("\t")  # 去多余换行符，Tab分割
+            sp = split_dictionary_line(line, gpt=True)
             len_sp = len(sp)
 
             if len_sp < 2:  # 至少是2个元素
@@ -391,23 +407,34 @@ class CGptDict:
             else:
                 dic = CBasicDicElement(search_word, replace_word, dic_name=dic_name)
             dic.note = note
+            dic.source_file = str(dic_path)
+            dic.line_number = line_number
+            dic.raw_line = line.rstrip("\r\n")
             self._dic_list.append(dic)
             normalDic_count += 1
         LOGGER.info(
             f"载入 GPT字典: {path.basename(dic_path)} {normalDic_count}普通词条"
         )
 
-    def gen_prompt(self, trans_list: CTransList, type="gpt"):
-        def _should_add_dic(dic, input_text, input_text_copy, used_dic):
-            """判断是否应该添加字典条目到提示中"""
-            if dic.search_word in input_text:
-                return True
-            if dic.search_word in input_text_copy:
-                for word in used_dic:
-                    if word in dic.search_word:
-                        return True
-            return False
+    def matching_entries(self, trans_list: CTransList):
+        """Use the same overlap handling for inspection and prompt generation."""
+        input_text = "\n".join(
+            f"{tran.get_speaker_name()}:{tran.post_src}" for tran in trans_list
+        )
+        original_text = input_text
+        used_words = []
+        result = []
+        for dic in self._dic_list:
+            if dic.search_word in input_text or (
+                dic.search_word in original_text
+                and any(word in dic.search_word for word in used_words)
+            ):
+                result.append(dic)
+                input_text = input_text.replace(dic.search_word, "")
+                used_words.append(dic.search_word)
+        return result
 
+    def gen_prompt(self, trans_list: CTransList, type="gpt"):
         def _format_dic_entry_gpt(dic:CBasicDicElement):
             """格式化字典条目为提示所需的字符串"""
             entry = f"| {dic.search_word} | {dic.replace_word} |"
@@ -434,23 +461,13 @@ class CGptDict:
         TITLE_TSV="SRC\tDST\tNOTE\n"
 
         promt = ""
-        input_text = "\n".join(
-            [f"{tran.get_speaker_name()}:{tran.post_src}" for tran in trans_list]
-        )
-        input_text_copy=input_text
-        used_dic=[]
-
-
-        for dic in self._dic_list:
-            if _should_add_dic(dic, input_text, input_text_copy, used_dic):
-                if type=="gpt":
-                    promt += _format_dic_entry_gpt(dic)
-                elif type=="sakura":
-                    promt += _format_dic_entry_sakura(dic)
-                elif type=="tsv":
-                    promt += _format_dic_entry_tsv(dic)
-                input_text = input_text.replace(dic.search_word, "")
-                used_dic.append(dic.search_word)
+        for dic in self.matching_entries(trans_list):
+            if type=="gpt":
+                promt += _format_dic_entry_gpt(dic)
+            elif type=="sakura":
+                promt += _format_dic_entry_sakura(dic)
+            elif type=="tsv":
+                promt += _format_dic_entry_tsv(dic)
         if promt:
             if type=="gpt":
                 promt=TITLE_GPT+promt
@@ -464,9 +481,12 @@ class CGptDict:
 
     def check_dic_use(self, find_from_str: str, tran: CSentense):
         problem_list = []
-        for dic in self._dic_list:
-            if dic.search_word not in tran.post_src:
+        # 长词条先检查并从原文里抹掉，免得只作为长词一部分出现的短词条（マルアンネ 里的 ルアン）被误报未使用
+        remaining_src = tran.post_src
+        for dic in sorted(self._dic_list, key=lambda d: len(d.search_word), reverse=True):
+            if not dic.search_word or dic.search_word not in remaining_src:
                 continue
+            remaining_src = remaining_src.replace(dic.search_word, "\0")
 
             replace_word_list = (
                 dic.replace_word.split("/")

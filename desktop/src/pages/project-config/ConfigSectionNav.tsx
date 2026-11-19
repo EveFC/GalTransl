@@ -1,20 +1,25 @@
+import { t as translate, useUiLanguage } from "../../i18n";
 import type { ReactNode } from 'react';
+import { Icon, type IconName } from '../../components/Icon';
 
-export type ConfigSectionKey = 'common' | 'backendSpecific' | 'plugin' | 'dictionary' | 'problemAnalyze' | 'retranslKey';
+export type ConfigSectionKey = 'fileIO' | 'common' | 'backendSpecific' | 'textProcessing' | 'dictionary' | 'problemAnalyze' | 'retranslKey' | 'problemFilterKey' | 'projectGuideline';
 
 export interface ConfigSectionDef {
   key: ConfigSectionKey;
   label: string;
-  icon: string;
+  icon: IconName;
 }
 
 export const CONFIG_SECTIONS: ConfigSectionDef[] = [
-  { key: 'common', label: '通用设置', icon: '⚙️' },
-  { key: 'backendSpecific', label: '翻译后端', icon: '🤖' },
-  { key: 'plugin', label: '插件设置', icon: '🧩' },
-  { key: 'dictionary', label: '字典设置', icon: '📖' },
-  { key: 'problemAnalyze', label: '问题分析', icon: '🔍' },
-  { key: 'retranslKey', label: '重翻关键字', icon: '🔁' },
+  { key: 'fileIO', get label() { return translate("config:configSectionNav.label_label_file"); }, icon: 'folder-open' },
+  { key: 'common', get label() { return translate("config:configSectionNav.label_label_translationSettings"); }, icon: 'settings' },
+  { key: 'backendSpecific', get label() { return translate("config:configSectionNav.label_label_translationBackend"); }, icon: 'bot' },
+  { key: 'textProcessing', get label() { return translate("config:configSectionNav.label_label_textProcess"); }, icon: 'file-text' },
+  { key: 'dictionary', get label() { return translate("config:configSectionNav.label_label_dictionarySettings"); }, icon: 'book' },
+  { key: 'problemAnalyze', get label() { return translate("config:configSectionNav.label_label_problem"); }, icon: 'search' },
+  { key: 'retranslKey', get label() { return translate("config:configSectionNav.label_label_retranslate"); }, icon: 'repeat' },
+  { key: 'problemFilterKey', get label() { return translate("config:configSectionNav.label_label_problemFilter"); }, icon: 'ban' },
+  { key: 'projectGuideline', get label() { return translate("config:configSectionNav.label_label_projectGuideline"); }, icon: 'bookmark' },
 ];
 
 interface ConfigSectionNavProps {
@@ -39,6 +44,7 @@ export function ConfigSectionNav({
   dirty,
   disabled = false,
 }: ConfigSectionNavProps) {
+  useUiLanguage();
   return (
     <aside className="project-config-page__sidebar">
       {CONFIG_SECTIONS.map((section) => (
@@ -48,7 +54,7 @@ export function ConfigSectionNav({
           className={`project-config-page__section-btn ${activeSection === section.key ? 'project-config-page__section-btn--active' : ''}`}
           onClick={() => { onSectionChange(section.key); }}
         >
-          <span>{section.icon}</span>
+          <span><Icon name={section.icon} /></span>
           <span>{section.label}</span>
         </button>
       ))}
@@ -58,8 +64,12 @@ export function ConfigSectionNav({
         onClick={onSave}
         disabled={saving || disabled}
       >
-        <span>💾</span>
-        <span>{saving ? '保存中…' : '保存配置'}{dirty && !saving && <span style={{ color: '#e53e3e', marginLeft: 4 }}>●</span>}</span>
+        <span><Icon name="save" /></span>
+        <span>
+          {saving ? translate("common:actions.saving") : translate("config:configSectionNav.projectConfigPageSaveBtn_message_saveConfig")}
+          {/* 未保存提示：一个小圆点（原来是圆点字符，CSS 画的更稳、颜色也走 token） */}
+          {dirty && !saving && <span className="project-config-page__dirty-dot" title={translate("config:configSectionNav.projectConfigPageSaveBtn_title_notSaveChange")} />}
+        </span>
       </button>
       <div className="project-config-page__section-divider" />
       <button
@@ -67,8 +77,8 @@ export function ConfigSectionNav({
         className={`project-config-page__section-btn ${yamlView ? 'project-config-page__section-btn--active' : ''}`}
         onClick={onYamlToggle}
       >
-        <span>📝</span>
-        <span>YAML源码</span>
+        <span><Icon name="note" /></span>
+        <span>{translate("config:configSectionNav.projectConfigPageSidebar_message_yAMLSource")}</span>
       </button>
     </aside>
   );

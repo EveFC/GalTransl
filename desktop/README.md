@@ -1,19 +1,75 @@
 # GalTransl Desktop
 
-This folder contains the Tauri desktop shell and the web frontend for GalTransl.
+This folder contains the Tauri desktop shell and the React frontend for GalTransl.
 
 ## Development
 
 1. Install frontend dependencies:
-   `npm install`
+   `npm ci`
 2. Start the Python backend from the repository root:
    `python run_backend.py --host 127.0.0.1 --port 12333`
 3. Start the frontend dev server:
    `npm run dev`
-4. With Rust installed, you can run the desktop shell:
+4. With Rust installed, run the desktop shell:
    `npm run tauri:dev`
 
-## Notes
+On Linux x86_64, `../run_desktop_dev.sh` performs steps 2-4 and stops the
+backend when the desktop process exits. The frontend remains browser-compatible
+and talks to the Python backend over HTTP.
 
-- This machine currently does not have Rust/Cargo installed, so Tauri packaging cannot be verified here yet.
 - The frontend is intentionally browser-compatible and talks to the Python backend over HTTP.
+- Each packaged desktop process starts its own backend with `--port 0`. The operating system selects the port while binding; the backend publishes its actual address through a private `--ready-file`, and Tauri passes that address to the frontend before API requests begin.
+- Closing a packaged window stops only the backend process tree it started. Concurrent windows have separate backends. Startup failures and timeouts also clean up their own child processes.
+- Development continues to use the external backend at `127.0.0.1:12333`; closing the dev window leaves that backend running. Explicit `VITE_BACKEND_URL` overrides remain available.
+- Rebuild both the desktop executable and the Python backend when packaging these changes, since the startup handshake changed. Assigned ports are kept in memory and are not saved to frontend preferences.
+
+## Application updates
+
+The new-version notice offers **Update automatically** and **Keep global
+dictionaries (skip Dict)**, selected by default. Updating downloads the current
+platform's existing portable release from GitHub, checks its SHA256 digest
+(or `SHA256SUMS.txt`), then prepares the files without changing the installed app.
+Once preparation succeeds, the desktop shell starts an isolated copy of its own
+backend as the installer, stops its backend, and exits. The installer waits for
+the old desktop process to exit, replaces the release files, and relaunches the
+desktop. It uses the packaged Python runtime, with no separate Python installation.
+
+Release archives and Skill ZIP downloads share `GalTransl/GitHubDownload.py`.
+It reads the node configuration published by [github.akams.cn](https://github.akams.cn/)
+from the site's CDN-hosted `oopsunix/ghproxy-next/components/nodes.ts`, caching
+successful lists in memory for one hour. It probes six candidates and direct
+GitHub using a small Range request, tries up to three healthy routes in latency
+order, and retains direct fallback. Failed node discovery uses direct GitHub.
+Release metadata and SHA256 checksums are fetched directly from official GitHub;
+each release download must match both its declared size and checksum before
+preparation continues. Skill archive and path validation remain in the installer.
+Build and CI Skill downloads use this same path.
+
+Projects, translation caches, user settings, and user-only files are retained.
+Keeping dictionaries skips every update to the bundled `Dict` directory and the
+active user dictionary directory. Clearing that option also updates matching
+files in the active global dictionary directory. File replacement failures
+restore files already replaced; the next launch reports the error.
+
+Automatic replacement supports the Windows, Linux x86_64, and macOS portable
+archives in the existing release workflow. Source builds and installed system
+packages use the download-page action. Rebuild both desktop and backend to enable
+this feature. Stop active translation or Agent tasks before updating.
+
+## Linux build
+
+Install the Tauri Linux prerequisites for your distribution, then run:
+
+```bash
+python ../build_linux_x64.py
+```
+
+The script builds the PyInstaller backend, embeds it as a Tauri sidecar, bundles
+`plugins`, `Dict`, `translation_guidelines`, and `res`, and generates `.deb`,
+`.rpm`, `.AppImage`, and portable `.tar.gz` artifacts. Only x86_64 is supported;
+ARM targets are intentionally out of scope.
+
+## Connection tests
+
+- Frontend address selection, HTTP/SSE routing, and reconnects: `npm run test:backend-connection`.
+- Native process lifecycle (from `src-tauri`): `cargo test --offline backend::tests -- --include-ignored`. These tests launch real Python backends using the repository's `.venv`; set `GALTRANSL_TEST_PYTHON` to use another Python environment with the backend dependencies installed. On Windows, the test environment must allow stopping its own child process trees.

@@ -13,6 +13,19 @@ from openai import OpenAI
 import re
 import httpx
 from GalTransl.TerminalOutput import should_print_translation_logs, terminal_progress
+from GalTransl.Reasoning import apply_reasoning_kwargs, build_reasoning_kwargs
+
+# 可用性检测的输出上限：小到几乎不生成，但不能取 1——有的家对 max_tokens 有下限
+# （「max_tokens must be greater than 2」），取 1 会把一个本来能用的后端判成不可用。
+AVAILABILITY_CHECK_MAX_TOKENS = 16
+
+
+def _rejects_max_tokens(exc: BaseException) -> bool:
+    """provider 是否在抱怨输出上限参数（下限/上限/不认识）。"""
+    text = str(exc).lower()
+    return any(name in text for name in (
+        "max_tokens", "max tokens", "max_completion_tokens", "max completion tokens",
+    ))
 
 
 def normalize_sakura_endpoints(section: dict, fallback_endpoint: str = "") -> list[str]:
@@ -52,12 +65,14 @@ class COpenAIToken:
         model_name: str,
         stream: bool = True,
         isAvailable: bool = True,
+        reasoning_kwargs: Optional[dict] = None,
     ) -> None:
         self.token: str = token
         self.domain: str = domain
         self.model_name: str = model_name
         self.stream: bool = stream
         self.isAvailable: bool = isAvailable
+        self.reasoning_kwargs: dict = reasoning_kwargs or {}
         self.avg_latency: float = 0
         self.req_count: int = 0
 
@@ -82,11 +97,18 @@ class COpenAITokenPool:
         self.pj_config = config
         defaultEndpoint = "https://api.openai.com"
         section_name = "OpenAI-Compatible"
+        backend_config = config.getBackendConfigSection(section_name)
         self.tokens: list[tuple[bool, COpenAIToken]] = []
         self.force_eng_name = config.getBackendConfigSection(section_name).get(
             "rewriteModelName", ""
         )
-        self.stream = config.getBackendConfigSection(section_name).get("stream", False)
+        # 流式请求默认开启。流式时译好的句子边生成边进「最近译文」、坏行当场中止省 token，「文件进度」的
+        # 小灯也才分得出思考中/翻译中并跟着输出速度呼吸（见 Backend/BaseTranslate._FileRequestProgress）；
+        # 非流式要等整批返回才一次出结果，小灯从头到尾只有「请求中」（实时速度、预计剩余按成功句数算，
+        # 两种都有）。这里以前默认 False，而前端那份后端配置档（整段替换 backendSpecific，见
+        # Service.py）默认不写 stream，于是新建的配置全是非流式。接口/中转不支持流式时，
+        # 在单个令牌上写 stream: false 覆盖即可。
+        self.stream = config.getBackendConfigSection(section_name).get("stream", True)
         self.timeout = config.getBackendConfigSection(section_name).get(
             "apiTimeout", 300
         )
@@ -124,6 +146,7 @@ class COpenAITokenPool:
                         model_name=model_name,
                         stream=is_stream,
                         isAvailable=True,
+                        reasoning_kwargs=build_reasoning_kwargs(backend_config, tokenEntry),
                     )
                 )
                 pass
@@ -189,34 +212,48 @@ class COpenAITokenPool:
                 base_url=token.domain,
                 http_client=httpx.Client(**proxy_kwargs) if proxy_kwargs else None,
             )
-            # 可用性检测只关心"能否成功返回一个响应"，
-            # 用极简 prompt + max_tokens=1 避免模型做无谓生成，大幅缩短检测耗时。
+            # 可用性检测只关心"能否成功返回一个响应"：给个很小的输出上限避免模型做无谓生成。
+            # 但不能取 1——有的家对 max_tokens 有下限（「max_tokens must be greater than 2」），
+            # 那样会把一个本来能用的后端整条判死；下面还有一道"摘掉该参数"的兜底。
             create_kwargs = dict(
                 model=token.model_name,
                 messages=[{"role": "user", "content": "1+1="}],
                 timeout=self.timeout,
                 stream=token.stream,
-                max_tokens=1,
+                max_tokens=AVAILABILITY_CHECK_MAX_TOKENS,
             )
-            try:
-                response = client.chat.completions.create(**create_kwargs)
-            except TypeError:
-                # 少数兼容实现不接受 max_tokens 参数，回退一次
-                create_kwargs.pop("max_tokens", None)
-                response = client.chat.completions.create(**create_kwargs)
-            if token.stream == False:
-                if len(response.choices) > 0:
-                    return True, token
-                else:
-                    return False, token
-            else:
+            create_kwargs = apply_reasoning_kwargs(create_kwargs, token.reasoning_kwargs)
+            limit_key = "max_completion_tokens" if "max_completion_tokens" in create_kwargs else "max_tokens"
+
+            def _attempt(**kwargs) -> Tuple[bool, COpenAIToken]:
+                """发一次请求并判断"有没有拿到响应"（流式看首个 chunk 有没有 choices）。"""
+                response = client.chat.completions.create(**kwargs)
+                if token.stream == False:
+                    return len(response.choices) > 0, token
                 for chunk in response:
-                    if len(chunk.choices) > 0:
-                        return True, token
-                    else:
-                        return False, token
+                    return len(chunk.choices) > 0, token
                 # 如果流响应为空，返回False
                 return False, token
+
+            try:
+                return _attempt(**create_kwargs)
+            except TypeError:
+                # 少数兼容实现不接受输出上限参数，回退一次
+                create_kwargs.pop(limit_key, None)
+                return _attempt(**create_kwargs)
+            except Exception as exc:
+                # 有的家嫌 max_tokens 不合规（下限/上限）——检测本身不需要这个可选参数，
+                # 摘掉再来一次，别让一个能用的后端因为一个参数被判不可用。
+                if limit_key not in create_kwargs or not _rejects_max_tokens(exc):
+                    raise
+                LOGGER.warning(
+                    "可用性检测：provider 不接受 %s=%s（%s），改为不带该参数重试",
+                    limit_key,
+                    create_kwargs[limit_key],
+                    str(exc).strip()[:120],
+                )
+                create_kwargs.pop(limit_key, None)
+                return _attempt(**create_kwargs)
         except Exception as e:
             exception_text = str(e).strip()
             if exception_text:
@@ -290,21 +327,22 @@ class COpenAITokenPool:
                 )
 
         tasks = []
+        task_indices: dict[asyncio.Task, int] = {}
         with terminal_progress(
             should_print_translation_logs(self.pj_config),
             total=len(self.tokens),
             title="Testing Key……",
         ) as bar:
             self.bar = bar
-            index = 0
-            for _, token in self.tokens:
+            for token_index, (_, token) in enumerate(self.tokens):
                 self._raise_if_stop_requested()
-                index += 1
                 LOGGER.info(
-                    f"Testing key{index}---{token.maskToken()}---{token.model_name}"
+                    f"Testing key{token_index + 1}---{token.maskToken()}---{token.model_name}"
                 )
-                tasks.append(asyncio.create_task(check_one_token(token)))
-            result: list[tuple[bool, COpenAIToken]] = []
+                task = asyncio.create_task(check_one_token(token))
+                tasks.append(task)
+                task_indices[task] = token_index
+            result_by_index: dict[int, tuple[bool, COpenAIToken]] = {}
             pending = set(tasks)
             try:
                 while pending:
@@ -315,13 +353,17 @@ class COpenAITokenPool:
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     for done_task in done:
-                        result.append(await done_task)
+                        # Availability checks complete out of order, but the
+                        # fallback policy must keep the configured order.
+                        result_by_index[task_indices[done_task]] = await done_task
             except BaseException:
                 for task in tasks:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 raise
+
+        result = [result_by_index[index] for index in range(len(tasks))]
 
         # replace list with new one
         newList: list[tuple[bool, COpenAIToken]] = []

@@ -1,17 +1,31 @@
-import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
-import { HashRouter, Routes, Route, useNavigate, useLocation } from 'react-router-dom';
+import { t as translate, useUiLanguage } from "../i18n";
+import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { HashRouter, Route, useNavigate, useLocation } from 'react-router-dom';
 import {
+  addOpenProject,
   CUSTOM_BACKGROUND_CHANGE_EVENT,
+  DISABLE_ANIMATIONS_CHANGE_EVENT,
+  OPEN_PROJECTS_CHANGE_EVENT,
   THEME_MODE_CHANGE_EVENT,
   type CustomBackgroundPreference,
   decodeProjectDir,
   encodeProjectDir,
+  applyAnimationsPreference,
   getCustomBackgroundPreference,
+  loadCustomBackgroundPreference,
   getThemeModePreference,
+  loadOpenProjects,
+  saveOpenProjects,
 } from '../lib/api';
+import { CachedRoutes } from '../components/CachedRoutes';
+import { PageActivityContext } from '../components/PageActivity';
 import { Sidebar } from '../components/Sidebar';
-import { ConnectionProvider } from '../features/connection/ConnectionContext';
+import { RenderErrorBoundary } from '../components/RenderErrorBoundary';
+import { ConnectionProvider, useConnection } from '../features/connection/ConnectionContext';
+import { BootstrapGate } from '../features/connection/BootstrapGate';
+import { UpdateNotice } from '../features/update/UpdateNotice';
 import { HomePage, addProjectToHistory } from '../pages/HomePage';
+import { wizardRequestFromState } from '../lib/newProjectWizard';
 
 const ProjectLayout = lazy(async () => {
   const mod = await import('../components/ProjectLayout');
@@ -33,6 +47,11 @@ const PromptTemplatesPage = lazy(async () => {
   return { default: mod.PromptTemplatesPage };
 });
 
+const CommonGuidelinesPage = lazy(async () => {
+  const mod = await import('../pages/CommonGuidelinesPage');
+  return { default: mod.CommonGuidelinesPage };
+});
+
 const CommonDictionaryPage = lazy(async () => {
   const mod = await import('../pages/CommonDictionaryPage');
   return { default: mod.CommonDictionaryPage };
@@ -43,39 +62,21 @@ const NewProjectWizard = lazy(async () => {
   return { default: mod.NewProjectWizard };
 });
 
-const CONFIG_FILE_KEY = 'galtransl-config-file';
-const OPEN_PROJECTS_KEY = 'galtransl-open-projects';
+const AgentPage = lazy(async () => {
+  const mod = await import('../pages/AgentPage');
+  return { default: mod.AgentPage };
+});
+
+const ExtractionPage = lazy(async () => {
+  const mod = await import('../pages/ExtractionPage');
+  return { default: mod.ExtractionPage };
+});
+
 const LAST_ACTIVE_PROJECT_KEY = 'galtransl-last-active-project';
 
-function saveConfigFileName(projectDir: string, configFileName: string) {
-  try {
-    const map = JSON.parse(localStorage.getItem(CONFIG_FILE_KEY) || '{}');
-    map[projectDir] = configFileName;
-    localStorage.setItem(CONFIG_FILE_KEY, JSON.stringify(map));
-  } catch {
-    // ignore storage errors
-  }
-}
-
 function RouteLoadingFallback() {
-  return <div className="inline-feedback">页面加载中…</div>;
-}
-
-function loadOpenProjects(): string[] {
-  try {
-    const raw = localStorage.getItem(OPEN_PROJECTS_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveOpenProjects(projects: string[]) {
-  try {
-    localStorage.setItem(OPEN_PROJECTS_KEY, JSON.stringify(projects));
-  } catch {
-    // ignore storage errors
-  }
+  const uiLanguage = useUiLanguage();
+  return <div className="inline-feedback">{translate("common:app.routeLoadingFallback_message_load")}</div>;
 }
 
 function loadLastActiveProject(): string | null {
@@ -103,6 +104,7 @@ function clearLastActiveProject() {
 }
 
 export function App() {
+  const uiLanguage = useUiLanguage();
   const [openProjects, setOpenProjects] = useState<string[]>(() => loadOpenProjects());
 
   useEffect(() => {
@@ -126,28 +128,49 @@ export function App() {
       }
     };
 
+    // 「关闭所有动画效果」：main.tsx 启动时已预热过一次，这里负责设置里
+    // 的即时切换——写根元素 dataset，CSS 全局规则随之开关全部动画。
+    const handleDisableAnimationsChange = () => {
+      applyAnimationsPreference();
+    };
+
     applyTheme();
+    applyAnimationsPreference();
     window.addEventListener(THEME_MODE_CHANGE_EVENT, handleThemeModeChange as EventListener);
+    window.addEventListener(DISABLE_ANIMATIONS_CHANGE_EVENT, handleDisableAnimationsChange as EventListener);
     mediaQuery.addEventListener('change', handleSystemSchemeChange);
 
     return () => {
       window.removeEventListener(THEME_MODE_CHANGE_EVENT, handleThemeModeChange as EventListener);
+      window.removeEventListener(DISABLE_ANIMATIONS_CHANGE_EVENT, handleDisableAnimationsChange as EventListener);
       mediaQuery.removeEventListener('change', handleSystemSchemeChange);
     };
   }, []);
 
-  // Persist open projects to localStorage whenever the list changes
+  // Publish closes as well as opens to cached Agent pages. The listener below
+  // preserves state identity for an unchanged list, preventing a self-loop.
   useEffect(() => {
     saveOpenProjects(openProjects);
   }, [openProjects]);
 
+  // Listen for open-projects changed elsewhere (e.g. Agent page calling
+  // addOpenProject) and sync App's state so the global sidebar updates too.
+  useEffect(() => {
+    const sync = (e: Event) => {
+      const next = (e as CustomEvent<string[]>).detail;
+      if (!Array.isArray(next)) return;
+      setOpenProjects((prev) => {
+        if (prev.length === next.length && prev.every((d, i) => d === next[i])) return prev;
+        return next;
+      });
+    };
+    window.addEventListener(OPEN_PROJECTS_CHANGE_EVENT, sync as EventListener);
+    return () => window.removeEventListener(OPEN_PROJECTS_CHANGE_EVENT, sync as EventListener);
+  }, []);
+
   const handleOpenProject = useCallback((projectDir: string, config: string) => {
     const cfg = config || 'config.yaml';
-    setOpenProjects((prev) => {
-      if (prev.includes(projectDir)) return prev;
-      return [projectDir, ...prev];
-    });
-    saveConfigFileName(projectDir, cfg);
+    addOpenProject(projectDir, cfg);
     addProjectToHistory(projectDir, cfg);
   }, []);
 
@@ -163,16 +186,29 @@ export function App() {
     setOpenProjects([]);
   }, []);
 
+  const handleReorderProject = useCallback((projectDir: string, toIndex: number) => {
+    setOpenProjects((prev) => {
+      const fromIndex = prev.indexOf(projectDir);
+      if (fromIndex < 0 || fromIndex === toIndex) return prev;
+      const next = prev.filter((d) => d !== projectDir);
+      next.splice(Math.max(0, Math.min(toIndex, next.length)), 0, projectDir);
+      return next;
+    });
+  }, []);
+
   return (
     <HashRouter>
       <ConnectionProvider>
-        <AppInner
-          openProjects={openProjects}
-          onOpenProject={handleOpenProject}
-          onCloseProject={handleCloseProject}
-          onCloseOtherProjects={handleCloseOtherProjects}
-          onCloseAllProjects={handleCloseAllProjects}
-        />
+        <BootstrapGate>
+          <AppInner
+            openProjects={openProjects}
+            onOpenProject={handleOpenProject}
+            onCloseProject={handleCloseProject}
+            onCloseOtherProjects={handleCloseOtherProjects}
+            onCloseAllProjects={handleCloseAllProjects}
+            onReorderProject={handleReorderProject}
+          />
+        </BootstrapGate>
       </ConnectionProvider>
     </HashRouter>
   );
@@ -184,14 +220,47 @@ type AppInnerProps = {
   onCloseProject: (projectDir: string) => void;
   onCloseOtherProjects: (keepProjectDir: string) => void;
   onCloseAllProjects: () => void;
+  onReorderProject: (projectDir: string, toIndex: number) => void;
 };
 
-function AppInner({ openProjects, onOpenProject, onCloseProject, onCloseOtherProjects, onCloseAllProjects }: AppInnerProps) {
+function AppInner({ openProjects, onOpenProject, onCloseProject, onCloseOtherProjects, onCloseAllProjects, onReorderProject }: AppInnerProps) {
+  useUiLanguage();
+  const { backendUrl, connectionPhase } = useConnection();
   const navigate = useNavigate();
   const location = useLocation();
-  const contentRef = useRef<HTMLElement | null>(null);
   const [displayLocation, setDisplayLocation] = useState(location);
-  const [transitionStage, setTransitionStage] = useState<'fadeIn' | 'fadeOut'>('fadeIn');
+  const [wizardOpen, setWizardOpen] = useState(location.pathname === '/new-project');
+  const [wizardProjectName, setWizardProjectName] = useState('');
+  const [wizardRequest, setWizardRequest] = useState<{ key: string; directory: string; autoCreate: boolean } | null>(() => {
+    const request = location.pathname === '/new-project' ? wizardRequestFromState(location.state) : null;
+    return request ? { key: location.key, ...request } : null;
+  });
+  const wizardVisible = displayLocation.pathname === '/new-project';
+
+  useEffect(() => {
+    if (location.pathname !== '/new-project') return;
+    setWizardOpen(true);
+    const request = wizardRequestFromState(location.state);
+    if (request) setWizardRequest({ key: location.key, ...request });
+  }, [location.pathname, location.key, location.state]);
+
+  const handleFinishWizard = useCallback((projectDir: string, config: string) => {
+    onOpenProject(projectDir, config);
+    setWizardOpen(false);
+    setWizardProjectName('');
+    setWizardRequest(null);
+  }, [onOpenProject]);
+
+  const handleCloseWizard = useCallback(() => {
+    // 只丢弃向导草稿；已经创建到磁盘的项目保持原样，不做删除或回滚。
+    setWizardOpen(false);
+    setWizardProjectName('');
+    setWizardRequest(null);
+    if (location.pathname === '/new-project') navigate('/');
+  }, [navigate, location.pathname]);
+  // Cross-fade: the outgoing page stays mounted on top while the new page
+  // fades in underneath — no serial "wait for fadeOut, then mount" delay.
+  const [leavingPath, setLeavingPath] = useState<string | null>(null);
   const [customBackground, setCustomBackground] = useState<CustomBackgroundPreference>(() => getCustomBackgroundPreference());
 
   useEffect(() => {
@@ -233,41 +302,50 @@ function AppInner({ openProjects, onOpenProject, onCloseProject, onCloseOtherPro
     };
   }, []);
 
-  // Timeout fallback: if animationend never fires (e.g. prefers-reduced-motion
-  // disables animations), force the transition to complete so the page doesn't
-  // get stuck on the old route.
-  const transitionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
   useEffect(() => {
-    if (location.pathname !== displayLocation.pathname) {
-      setTransitionStage('fadeOut');
-      // The fadeOut animation is 150 ms; give a generous margin before forcing.
-      if (transitionTimerRef.current) clearTimeout(transitionTimerRef.current);
-      transitionTimerRef.current = setTimeout(() => {
-        setDisplayLocation(location);
-        setTransitionStage('fadeIn');
-      }, 200);
+    if (connectionPhase === 'online') {
+      void loadCustomBackgroundPreference().catch(() => undefined);
     }
-    return () => {
-      if (transitionTimerRef.current) {
-        clearTimeout(transitionTimerRef.current);
-        transitionTimerRef.current = null;
-      }
-    };
+  }, [backendUrl, connectionPhase]);
+
+  // Switch routes synchronously before paint, then let the two pages cross-fade
+  // in place (see CachedRoutes' leavingPath handling).
+  useLayoutEffect(() => {
+    if (location.pathname === displayLocation.pathname) {
+      setDisplayLocation(location);
+      return;
+    }
+    setLeavingPath(displayLocation.pathname);
+    setDisplayLocation(location);
   }, [location, displayLocation]);
 
-  useLayoutEffect(() => {
-    contentRef.current?.scrollTo({ top: 0, left: 0, behavior: 'instant' as ScrollBehavior });
-  }, [displayLocation.pathname]);
+  // Fallback: if the fade-out animation never ends (e.g. reduced motion),
+  // clear the outgoing page so it doesn't linger above the new one.
+  const leavingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const handleTransitionEnd = () => {
-    if (transitionStage === 'fadeOut') {
-      if (transitionTimerRef.current) {
-        clearTimeout(transitionTimerRef.current);
-        transitionTimerRef.current = null;
+  useEffect(() => {
+    if (!leavingPath) return;
+    if (leavingTimerRef.current) clearTimeout(leavingTimerRef.current);
+    leavingTimerRef.current = setTimeout(() => setLeavingPath(null), 260);
+    return () => {
+      if (leavingTimerRef.current) {
+        clearTimeout(leavingTimerRef.current);
+        leavingTimerRef.current = null;
       }
-      setDisplayLocation(location);
-      setTransitionStage('fadeIn');
+    };
+  }, [leavingPath]);
+
+  const isPageAvailable = useCallback((pathname: string) => {
+    const match = pathname.match(/^\/project\/([^/]+)/);
+    if (!match) return true;
+    try { return openProjects.includes(decodeProjectDir(match[1])); } catch { return false; }
+  }, [openProjects]);
+
+  const handleTransitionEnd = (event: React.AnimationEvent<HTMLElement>) => {
+    // Animation events bubble up from child elements; only the outgoing page
+    // itself finishing its fade-out ends the transition early.
+    if ((event.target as HTMLElement).classList?.contains('app-layout__page--leaving')) {
+      setLeavingPath(null);
     }
   };
 
@@ -305,6 +383,87 @@ function AppInner({ openProjects, onOpenProject, onCloseProject, onCloseOtherPro
     '--custom-bg-surface-soft-opacity': String(softSurfaceOpacity),
   } as CSSProperties;
 
+  // Stable route tree: CachedPage is memoized, so hidden cached pages only
+  // re-render when their own props change, not on every App render/navigation.
+  const routeChildren = useMemo(() => (
+    <>
+      <Route
+        path="/"
+        element={<HomePage onOpenProject={onOpenProject} />}
+      />
+      <Route
+        path="/backend-profiles"
+        element={(
+          <Suspense fallback={<RouteLoadingFallback />}>
+            <BackendProfilesPage />
+          </Suspense>
+        )}
+      />
+      <Route
+        path="/common-dictionaries"
+        element={(
+          <Suspense fallback={<RouteLoadingFallback />}>
+            <CommonDictionaryPage />
+          </Suspense>
+        )}
+      />
+      <Route
+        path="/settings"
+        element={(
+          <Suspense fallback={<RouteLoadingFallback />}>
+            <SettingsPage />
+          </Suspense>
+        )}
+      />
+      <Route
+        path="/settings/prompt-templates"
+        element={(
+          <Suspense fallback={<RouteLoadingFallback />}>
+            <PromptTemplatesPage />
+          </Suspense>
+        )}
+      />
+      <Route
+        path="/settings/common-guidelines"
+        element={(
+          <Suspense fallback={<RouteLoadingFallback />}>
+            <CommonGuidelinesPage />
+          </Suspense>
+        )}
+      />
+      <Route
+        path="/new-project"
+        element={null}
+      />
+      <Route
+        path="/extraction"
+        element={(
+          <Suspense fallback={<RouteLoadingFallback />}>
+            <RenderErrorBoundary><ExtractionPage /></RenderErrorBoundary>
+          </Suspense>
+        )}
+      />
+      <Route
+        path="/agent"
+        element={(
+          <Suspense fallback={<RouteLoadingFallback />}>
+            <RenderErrorBoundary>
+              <AgentPage />
+            </RenderErrorBoundary>
+          </Suspense>
+        )}
+      />
+      <Route
+        path="/project/:projectId/*"
+        element={(
+          <Suspense fallback={<RouteLoadingFallback />}>
+            <ProjectLayout />
+          </Suspense>
+        )}
+      />
+    </>
+  ), [onOpenProject]);
+
   return (
     <div
       className={`app-layout${customBackground.imageDataUrl ? ' app-layout--custom-background' : ''}`}
@@ -319,70 +478,45 @@ function AppInner({ openProjects, onOpenProject, onCloseProject, onCloseOtherPro
       />
       <Sidebar
         openProjects={openProjects}
+        wizardOpen={wizardOpen}
+        wizardProjectName={wizardProjectName}
+        onCloseWizard={handleCloseWizard}
         onCloseProject={handleCloseProjectAndNavigate}
         onCloseOtherProjects={handleCloseOtherProjectsAndNavigate}
         onCloseAllProjects={handleCloseAllProjectsAndNavigate}
+        onReorderProject={onReorderProject}
       />
       <main
-        ref={contentRef}
-        className={`app-layout__content page-transition-${transitionStage}`}
+        className="app-layout__content"
         onAnimationEnd={handleTransitionEnd}
       >
-        <Routes location={displayLocation}>
-              <Route
-                path="/"
-                element={<HomePage onOpenProject={onOpenProject} />}
+        {/* Keep the draft mounted across navigation so forms, imports and jobs survive. */}
+        {wizardOpen && (
+          <div className="app-layout__page" hidden={!wizardVisible} style={!wizardVisible ? { display: 'none' } : undefined}>
+            <PageActivityContext.Provider value={wizardVisible && location.pathname === '/new-project'}>
+            <Suspense fallback={<RouteLoadingFallback />}>
+              <NewProjectWizard
+                key={wizardRequest?.key || 'new-project'}
+                initialDirectory={wizardRequest?.directory}
+                autoCreate={wizardRequest?.autoCreate}
+                active={wizardVisible && location.pathname === '/new-project'}
+                onProjectNameChange={setWizardProjectName}
+                onOpenProject={handleFinishWizard}
               />
-              <Route
-                path="/backend-profiles"
-                element={(
-                  <Suspense fallback={<RouteLoadingFallback />}>
-                    <BackendProfilesPage />
-                  </Suspense>
-                )}
-              />
-              <Route
-                path="/common-dictionaries"
-                element={(
-                  <Suspense fallback={<RouteLoadingFallback />}>
-                    <CommonDictionaryPage />
-                  </Suspense>
-                )}
-              />
-              <Route
-                path="/settings"
-                element={(
-                  <Suspense fallback={<RouteLoadingFallback />}>
-                    <SettingsPage />
-                  </Suspense>
-                )}
-              />
-              <Route
-                path="/settings/prompt-templates"
-                element={(
-                  <Suspense fallback={<RouteLoadingFallback />}>
-                    <PromptTemplatesPage />
-                  </Suspense>
-                )}
-              />
-              <Route
-                path="/new-project"
-                element={(
-                  <Suspense fallback={<RouteLoadingFallback />}>
-                    <NewProjectWizard onOpenProject={onOpenProject} />
-                  </Suspense>
-                )}
-              />
-              <Route
-                path="/project/:projectId/*"
-                element={(
-                  <Suspense fallback={<RouteLoadingFallback />}>
-                    <ProjectLayout />
-                  </Suspense>
-                )}
-              />
-        </Routes>
-      </main>
-    </div>
-  );
-}
+            </Suspense>
+            </PageActivityContext.Provider>
+          </div>
+        )}
+        <CachedRoutes
+          location={displayLocation}
+          currentPath={location.pathname}
+          leavingPath={leavingPath}
+          isAvailable={isPageAvailable}
+        >
+          {routeChildren}
+        </CachedRoutes>
+        </main>
+        <UpdateNotice />
+        </div>
+        );
+        }

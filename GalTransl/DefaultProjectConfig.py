@@ -5,17 +5,22 @@ backendSpecific:
       - token: sk-example-key1
         endpoint: https://api.deepseek.com # 请求地址，加不加v1都可以
         modelName: deepseek-chat
+        contextWindow: 200000 # 模型上下文窗口(token)，Agent 用它判断何时压缩上下文与用量指示；留空按200000
       - token: sk-example-key2
         endpoint: https://openrouter.ai/api/v1/chat/completions # /chat/completions结尾则不自动补v1
         modelName: deepseek/deepseek-chat-v3-0324:free
         stream: true # 支持为单个token设置流式请求
     tokenStrategy: "random" # 令牌策略，random随机轮询；fallback优先第一个，出现[API错误]或[解析错误]时使用下一个
+    # 思考等级留空/删除则不发送；令牌条目也可覆盖这里的设置。
+    # reasoningEffort: medium # reasoning_effort，常见于 OpenAI o 系列、GPT-5 及部分中转；等级按模型支持情况选择
     checkAvailable: true # 翻译前检查API是否可用[True/False]
     checkAvailableConcurrency: 4 # checkAvailable阶段的并发检测数，避免启动时瞬时打满请求。[1-16]
     globalRequestRPM: 0 # 全局跨任务请求限速（每分钟请求数）。0表示不限制。[0-60000]
     stream: true # 流式请求，一般不用修改除非接口不支持流式[True/False]
     apiTimeout: 300 # 请求超时时间，单位秒
     apiErrorWait: auto # 发生API Error时的等待时间，包括频率限制。auto将自动适应[auto/0-120]
+    maxApiRetries: 6 # 单个批次最多调用API次数，达到上限后标记失败并继续后续批次。[1-100]
+    genDicMaxApiRetries: 6 # GenDic单个分片最多调用API次数。[1-100]
 
   SakuraLLM: # (Sakura/Galtransl)
     endpoints:
@@ -25,27 +30,30 @@ backendSpecific:
 
 # 插件，插件列表可在启动程序后选择show-plugs查看，或在plugins目录内查看
 plugin:
-  filePlugin: file_galtransl_json # 用于支持更多格式，字幕file_subtitle_srt_lrc_vtt，小说file_epub_epub或file_plaintext_txt，mtooljson用file_i18n_json
+  filePlugin: file_galtransl_json # 填 auto 则按每个输入文件自动识别（可混放多种格式）；用于支持更多格式，字幕file_subtitle_srt_lrc_vtt，小说file_epub_epub或file_plaintext_txt，mtooljson用file_i18n_json
   textPlugins: # 文本处理插件列表，可以设置多个，按顺序执行
     - text_common_normalfix # 常规文本修复插件
     #- text_common_skipNoJP # 跳过无日语句子插件
+  problemPlugins: # 问题检测插件列表，按顺序执行；[] 禁用问题检测插件
+    - problem_common # 常规检测，使用下方 problemAnalyze 设置
   # 某个插件自己的设置可以进入plugins目录内修改对应的yaml文件，也可以这样设置：
   file_galtransl_json:
     output_with_src: False # 输出到gt_output时是否保留原文[True/False]
 
 # 程序设置
 common:
-  gpt.numPerRequestTranslate: 16 # 每次请求包含的句子数，建议不超过16。[1-32]
+  gpt.numPerRequestTranslate: 32 # 每次请求包含的句子数，建议不超过32。[1-32]
   gpt.dynamicNumPerRequestTranslate: false # 动态句数调整：根据解析错误自动调节每次请求句数。[True/False]
   gpt.dynamicNumPerRequestTranslate.min: 8 # 动态句数调整的最小句数。[1-64]
   gpt.dynamicNumPerRequestTranslate.max: 64 # 动态句数调整的最大句数。[1-64]
   workersPerProject: 16 # 项目级并行文件数；单文件并行需配合splitFile。
   autoAdjustWorkers: false # 基于近期429比例和响应延迟自动调节并发worker数。[True/False]
   sortBy: "size" # 文件调度顺序：name按文件名，size优先大文件（并行时通常更快）。[name/size]
+  splitTailChunks: false # 收尾拆分：分片都开翻后，空闲线程拆走正在翻的分片还没发出的后半段并行翻，缩短收尾时间；拆开处少一点前文上下文。[True/False]
   language: "zh-cn" # 目标输出语言。[zh-cn/zh-tw/en/ja/ko/ru/fr]
 
   # 单文件分割设置
-  ###【重要】分割设置直接影响缓存文件的读取命中，迁移旧项目请确保单文件分割设置一致 ###
+  ### 改了分割设置也能沿用已有缓存：下次翻译时旧分片的译文会并入新分片，并清理旧分片缓存 ###
   splitFile: "Num" # 单文件分片模式：no关闭；Num每n句切一片；Equal每文件均分n片。[no/Num/Equal]
   splitFileNum: 2048 # 分片参数：Num模式表示每片句数；Equal模式表示分片总数。
   splitFileCrossNum: 0 # 分片重叠句数（上下文缓冲），可提升片段衔接质量。[推荐0或10]
@@ -57,15 +65,16 @@ common:
   smartRetry: True # 解析失败时自动缩小批次并重置上下文，减少无效重试。[True/False]
   retranslFail: false # 程序重启时是否自动重翻标记为"(Failed)"的句子。[True/False]
   retranslKey: # 在下方添加需要重翻的关键字，匹配原文/译文/problem 中的子串；留空不重翻。
-    #- "翻译失败" # 启动时重翻命中“翻译失败”的句子
+    - "翻译失败" # 启动时重翻命中“翻译失败”的句子（默认带上：失败句不重翻就一直烂在缓存里）
     #- "残留日文" # 启动时重翻命中“残留日文”的句子
+  problemFilterKey: [] # 问题过滤（正则）：每项是一条正则，命中的问题项不展示、不计入统计，也不触发按 problem 的重翻。原则上只过滤小类（如 "^残留日文：♪"），不要整类过滤；按字面过滤需转义特殊字符。
+  problemWhiteList: [] # 问题白名单：按「缓存文件名:index」（如 a.json:12，区间写 a.json:12-15）豁免指定条目，等价于给该条勾选 skip_check。
 
   gpt.contextNum: 8 # 每次请求附带的前文句数；值越大上下文更强、成本更高（常用8）。[0-32]
   # ForGal/ForGal-json/ForNovel
   gpt.translation_guideline: "Basic.md" # 使用的翻译规范文件名（位于translation_guidelines），会影响文风与措辞。
   gpt.enhance_jailbreak: False # 是否启用“抗拒答”增强提示，降低模型拒答概率。[True/False]
-  gpt.change_prompt: "no" # Prompt修改模式：no不改；AdditionalPrompt追加；OverwritePrompt覆盖默认提示词。[no/AdditionalPrompt/OverwritePrompt]
-  gpt.prompt_content: "翻译结果使用文言文" # Prompt自定义内容；仅在change_prompt为AdditionalPrompt/OverwritePrompt时生效。
+  gpt.enhance_jailbreak.mode: prefill # 改善拒答方式：prefill 预置回复开头；image 把前文和输入渲染成图片发送（需要支持图片输入的模型；tool 模板读图后照常调用工具提交，且只支持 image）。未启用时，解析失败的重试也会隔次使用该方式。[prefill/image]
   # Sakura/GalTransl
   gpt.token_limit: 0 # (Sakura/GalTransl) 单轮token上限；0表示不限制。用于避免上下文溢出。
   # 调试日志
@@ -80,25 +89,14 @@ proxy:
   proxies:
     - address: http://127.0.0.1:7890
 
-# 自动问题分析配置，在-前面加#号可以禁用
+# 自动问题分析配置，问题类型和默认启用状态由问题插件声明
 problemAnalyze:
-  problemList: # 要发现的问题清单
-    - 词频过高 # 重复大于20次
-    - 标点错漏 # 标点符号多加或漏加
-    - 残留日文 # 日文平假名片假名残留
-    #- 丢失换行 # 缺少行内换行，一般没所谓
-    - 多加换行 # 换行符比原句多，可能导致溢出屏幕
-    - 比日文长 # 比日文长1.3倍以上
-    - 字典使用 # 没有按GPT字典要求翻译
-    - 语言不通 # 疑似没有被翻译成目标语言，翻译为中文时检查是否包含非GBK字符
-    - 缺控制符 # 检测译文丢失ruby或其他控制符的情况
-    - 独白男他 # 独白（无name）里出现“他”，排除“其他/他们/他人/他乡/他国/他日/他山”
-    #- 引入英文 # 本来没有英文，译文引入了英文
-    #- 比日文长严格 # 比日文长1倍以上就提醒
+  problemList: null # null 使用插件默认值；[] 全部关闭；也可填写显式问题名称列表
+
 
 # 字典设置
 dictionary:
-  defaultDictFolder: Dict # 通用字典文件夹，相对于程序目录，也可填入绝对路径
+  defaultDictFolder: Dict # 通用字典文件夹，Windows 位于程序目录，Linux 的 Dict 位于用户数据目录，也可填入绝对路径
   usePreDictInName: false # 将译前字典用在name字段，可用于翻译name字段，会发送给翻译引擎替换后的name[True/False]
   usePostDictInName: false # 将译后字典用在name字段，可用于翻译name字段[True/False]
   useGPTDictInName: true # 将GPT字典用在name字段，可用于翻译name字段[True/False]

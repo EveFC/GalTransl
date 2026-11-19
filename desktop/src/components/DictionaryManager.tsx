@@ -1,12 +1,24 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { UiTrans, message as uiMessage, t as translate, useMessageState, useUiLanguage } from "../i18n";
+import { memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
+import { usePageActive, useRetainPage } from './PageActivity';
+import { useSaveShortcut } from './useSaveShortcut';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from './Button';
+import { Icon } from './Icon';
+import { PageHeader } from './PageHeader';
 import { Panel } from './Panel';
 import { EmptyState, ErrorState, InlineFeedback, LoadingState } from './page-state';
+import { formatBackendUsage, type BackendUsageSummary } from '../lib/backendUsage';
 import type { DictFileContent, DictionaryCategory } from '../lib/api';
+import type { DictionaryPreviewTarget } from './ProjectPreviewContext';
+import { scrollWithinContainer } from '../lib/scrollWithinContainer';
+import { useResizableSidebar } from '../lib/useResizableSidebar';
 
 type DictTab = DictionaryCategory;
+/** 侧栏不分页签，三类字典按翻译流程的先后各占一棵可折叠的树 */
+const DICT_CATEGORIES: DictTab[] = ['pre', 'gpt', 'post'];
+const DICTIONARY_SIDEBAR_WIDTH_KEY = 'galtransl.dictionary.sidebarWidth';
 type DictRowType = 'normal' | 'conditional' | 'situation' | 'gpt' | 'comment' | 'blank';
 
 type DictRow = {
@@ -43,6 +55,15 @@ type DictionaryManagerProps = {
   onSaveFile: (fileKey: string, content: string) => Promise<void>;
   onDeleteFile: (fileKey: string) => Promise<void>;
   onGenerateGptDict?: () => Promise<void>;
+  /** 「AI 生成 GPT 字典」二次确认里要说明用哪个后端（与开始翻译同一口径） */
+  gendicBackend?: BackendUsageSummary | null;
+  /**
+   * 条目行上的「→」：拿着这一行的日文词（GPT 取原文列、普通/条件/场景条目取「搜索」列）
+   * 跳到「浏览文本」里搜一下，看它实际出现在哪。
+   * 不传就不显示这个按钮（全局字典页没有所属项目，传不了）。
+   */
+  onOpenInCache?: (sourceWord: string) => void;
+  focusTarget?: DictionaryPreviewTarget;
 };
 
 type DictContextMenuState = {
@@ -63,20 +84,40 @@ function getFilesByTab(data: DictionaryManagerData | null, tab: DictTab): string
   if (!data) return [];
   const files = tab === 'pre' ? data.pre_dict_files : tab === 'gpt' ? data.gpt_dict_files : data.post_dict_files;
   return [...files].sort((a, b) => {
-    const aMtime = data.dict_contents[a]?.mtime ?? -1;
-    const bMtime = data.dict_contents[b]?.mtime ?? -1;
-    if (aMtime !== bMtime) {
-      return bMtime - aMtime;
+    // 条目多的字典排在前面；元数据缺失（尚未加载到 count）的放最后，避免顺序跳动。
+    const aCount = data.dict_contents[a]?.count ?? -1;
+    const bCount = data.dict_contents[b]?.count ?? -1;
+    if (aCount !== bCount) {
+      return bCount - aCount;
     }
     return stripProjectDirMarker(a).localeCompare(stripProjectDirMarker(b));
   });
 }
 
+/** 文件属于哪类字典；找不到时按 GPT 处理（与以前默认打开 GPT 页签一致） */
+function getFileCategory(data: DictionaryManagerData | null, file: string | null): DictTab {
+  if (!data || !file) return 'gpt';
+  return DICT_CATEGORIES.find((category) => getFilesByTab(data, category).includes(file)) ?? 'gpt';
+}
+
+/** 默认打开的文件：GPT 字典最常编辑，先选它；没有 GPT 字典时按侧栏顺序取第一个 */
+function getDefaultFile(data: DictionaryManagerData | null): string | null {
+  return getFilesByTab(data, 'gpt')[0]
+    ?? DICT_CATEGORIES.flatMap((category) => getFilesByTab(data, category))[0]
+    ?? null;
+}
+
+// GenDic 生成的 GPT 字典按类目分区：----------↓人名↓----------
+const SECTION_LINE_RE = /^-{3,}↓(.+?)↓-{3,}\s*$/;
+// 第一个分区标题之前的词条（旧格式、手加的）归到这一类
+const UNSECTIONED_LABEL = '\0unsectioned';
+
 function parseRows(text: string, tab: DictTab): DictRow[] {
   const lines = text.split('\n');
   return lines.map((line) => {
     if (!line.trim() && !line.includes('\t')) return { type: 'blank', values: [], raw: line };
-    if (line.startsWith('//') || line.startsWith('#') || line.startsWith('\\\\')) {
+    // GenDic 生成的字典用 ----------↓人名↓---------- 这样的行分区，也当注释显示
+    if (line.startsWith('//') || line.startsWith('#') || line.startsWith('\\\\') || SECTION_LINE_RE.test(line)) {
       return { type: 'comment', values: [line], raw: line };
     }
     const parts = line.split('\t');
@@ -108,42 +149,136 @@ function rowsToText(rows: DictRow[]): string {
   }).join('\n');
 }
 
+function getCategoryLabel(category: DictTab): string {
+  if (category === 'pre') return translate("projects:dictionaryManager.dictTabs_message_dictionary");
+  if (category === 'gpt') return translate("projects:dictionaryManager.dictTabs_message_gPTDictionary");
+  return translate("projects:dictionaryManager.dictTabs_message_dictionaryVariant2");
+}
+
+/** 「新建到」选项里放不下完整名称，用短名 */
+function getCategoryShortLabel(category: DictTab): string {
+  if (category === 'pre') return translate("projects:dictionaryManager.dictCreateTarget_option_pre");
+  if (category === 'gpt') return translate("projects:dictionaryManager.dictCreateTarget_option_gpt");
+  return translate("projects:dictionaryManager.dictCreateTarget_option_post");
+}
+
 /** Column labels by tab & row type for the card's header pills */
 function getTypeLabel(type: DictRowType, tab: DictTab): string {
-  if (type === 'comment') return '注释';
-  if (type === 'blank') return '空行';
+  if (type === 'comment') return translate("projects:dictionaryManager.getTypeLabel_message_text");
+  if (type === 'blank') return translate("projects:dictionaryManager.getTypeLabel_message_textVariant2");
   if (type === 'gpt') return 'GPT';
-  if (type === 'normal') return '普通';
-  if (type === 'conditional') return '条件';
-  if (type === 'situation') return '场景';
+  if (type === 'normal') return translate("projects:dictionaryManager.getTypeLabel_message_textVariant3");
+  if (type === 'conditional') return translate("projects:dictionaryManager.getTypeLabel_message_entry");
+  if (type === 'situation') return translate("projects:dictionaryManager.getTypeLabel_message_textVariant4");
   return type;
 }
 
 /** Field labels for each row type */
 function getFieldLabels(type: DictRowType, _tab: DictTab): string[] {
-  if (type === 'gpt') return ['原文', '译文', '解释(可空)'];
-  if (type === 'normal') return ['搜索', '替换', '备注'];
-  if (type === 'conditional') return ['目标', '条件', '搜索', '替换', '备注'];
-  if (type === 'situation') return ['场景', '搜索', '替换'];
-  if (type === 'comment') return ['内容'];
+  if (type === 'gpt') return [translate("projects:dictionaryManager.getFieldLabels_message_source"), translate("projects:dictionaryManager.getFieldLabels_message_translationText"), translate("projects:dictionaryManager.getFieldLabels_message_text")];
+  if (type === 'normal') return [translate("common:actions.search"), translate("projects:dictionaryManager.getFieldLabels_message_replace"), translate("projects:dictionaryManager.getFieldLabels_message_textVariant2")];
+  if (type === 'conditional') return [translate("projects:dictionaryManager.getFieldLabels_message_target"), translate("projects:dictionaryManager.getFieldLabels_message_entry"), translate("common:actions.search"), translate("projects:dictionaryManager.getFieldLabels_message_replace"), translate("projects:dictionaryManager.getFieldLabels_message_textVariant2")];
+  if (type === 'situation') return [translate("projects:dictionaryManager.getFieldLabels_message_textVariant3"), translate("common:actions.search"), translate("projects:dictionaryManager.getFieldLabels_message_replace")];
+  if (type === 'comment') return [translate("projects:dictionaryManager.getFieldLabels_message_textVariant4")];
   return [];
 }
+
+/**
+ * 这一行里「要拿去搜的日文词」在第几列（条目行上的「→」用它跳到缓存搜索）。
+ * 目标/条件这类前置列不是词本身，所以按类型点名：条件条目的搜索词在第 3 列、场景条目在第 2 列。
+ * 注释行没有词，返回 -1（不显示箭头）。
+ */
+function getSourceCellIndex(type: DictRowType): number {
+  if (type === 'gpt') return 0;         // 原文
+  if (type === 'normal') return 0;      // 搜索
+  if (type === 'conditional') return 2; // 目标 / 条件 / 搜索 / 替换 / 备注
+  if (type === 'situation') return 1;   // 场景 / 搜索 / 替换
+  return -1;
+}
+
+/* ── Single dict entry row (memoized) ── */
+/** 行组件单独 memo：卡片模式下编辑一格只有那一行的 row 对象变化，
+ *  其余行（row 引用不变、回调稳定）直接跳过重渲染 */
+const DictEntryRow = memo(function DictEntryRow({
+  row,
+  rowIndex,
+  labels,
+  sourceCellIndex,
+  showOpenCache,
+  onCellChange,
+  onDelete,
+  onOpenInCache,
+}: {
+  row: DictRow;
+  rowIndex: number;
+  labels: string[];
+  sourceCellIndex: number;
+  showOpenCache: boolean;
+  onCellChange: (rowIndex: number, cellIndex: number, value: string) => void;
+  onDelete: (rowIndex: number) => void;
+  onOpenInCache?: (sourceWord: string) => void;
+}) {
+  useUiLanguage();
+  // 「→」搜的是这一行的日文词：GPT 条目取原文列，其他类型取「搜索」列
+  const sourceWord = sourceCellIndex >= 0 ? String(row.values[sourceCellIndex] ?? '').trim() : '';
+  return (
+    <div className="dict-card__table-row" data-dict-row-index={rowIndex}>
+      <div className="dict-card__cell dict-card__cell--index">#{rowIndex + 1}</div>
+      {labels.map((label, ci) => (
+        <div key={ci} className="dict-card__cell">
+          <input
+            className="dict-card__input"
+            value={row.values[ci] ?? ''}
+            onChange={(e) => onCellChange(rowIndex, ci, e.target.value)}
+            placeholder={label || translate("projects:dictionaryManager.dictCardCell_placeholder_text", { value: ci + 1 })}
+          />
+        </div>
+      ))}
+      {showOpenCache && sourceCellIndex >= 0 ? (
+        <button
+          type="button"
+          className="dict-card__row-open-cache"
+          onClick={() => onOpenInCache?.(sourceWord)}
+          disabled={!sourceWord}
+          title={translate("projects:dictionaryManager.dictCardRowOpenCache_title_textSearchCount")}
+        >
+          <Icon name="arrow-right" />
+        </button>
+      ) : null}
+      <button
+        type="button"
+        className="dict-card__row-delete"
+        onClick={() => onDelete(rowIndex)}
+        title={translate("projects:dictionaryManager.dictCardRowDelete_title_deleteEntry")}
+      >
+        <Icon name="close" />
+      </button>
+    </div>
+  );
+});
 
 /* ── Grouped dict entries card ── */
 function DictEntryGroupCard({
   group,
   tab,
+  headerExtra,
   onCellChange,
   onDelete,
   onAddRow,
+  onOpenInCache,
 }: {
   group: DictRowGroup;
   tab: DictTab;
+  /** 挂在卡片头部、跟「GPT 216条」同一行的额外内容（类目筛选胶囊） */
+  headerExtra?: ReactNode;
   onCellChange: (rowIndex: number, cellIndex: number, value: string) => void;
   onDelete: (rowIndex: number) => void;
   onAddRow: (rowType: DictRowType, insertAfterRowIndex: number) => void;
+  onOpenInCache?: (sourceWord: string) => void;
 }) {
-  const labels = getFieldLabels(group.type, tab);
+  const uiLanguage = useUiLanguage();
+  // labels 引用稳定，memo 化的行组件才不会被每次 render 新建的数组打穿
+  const labels = useMemo(() => getFieldLabels(group.type, tab), [group.type, tab, uiLanguage]);
   const tableStyle = { '--dict-column-count': labels.length } as CSSProperties;
 
   return (
@@ -153,40 +288,31 @@ function DictEntryGroupCard({
           <span className={`dict-card__pill dict-card__pill--${group.type}`}>
             {getTypeLabel(group.type, tab)}
           </span>
-          <span className="dict-card__pill dict-card__pill--index">{group.items.length}条</span>
+          <span className="dict-card__pill dict-card__pill--index">{translate("projects:dictionaryManager.dictCardBadges_message_entry", { count: group.items.length })}</span>
         </div>
+        {headerExtra}
       </div>
 
       <div className="dict-card__table" style={tableStyle}>
         <div className="dict-card__table-head">
-          <div className="dict-card__head-cell dict-card__head-cell--index">ID</div>
+          <div className="dict-card__head-cell dict-card__head-cell--index">{translate("projects:dictionaryManager.dictCardTableHead_message_iD")}</div>
           {labels.map((label, ci) => (
-            <div key={ci} className="dict-card__head-cell">{label || `列${ci + 1}`}</div>
+            <div key={ci} className="dict-card__head-cell">{label || translate("projects:dictionaryManager.dictCardHeadCell_message_text", { value: ci + 1 })}</div>
           ))}
         </div>
 
         {group.items.map(({ row, rowIndex }) => (
-          <div key={`${rowIndex}`} className="dict-card__table-row">
-            <div className="dict-card__cell dict-card__cell--index">#{rowIndex + 1}</div>
-            {labels.map((label, ci) => (
-              <div key={ci} className="dict-card__cell">
-                <input
-                  className="dict-card__input"
-                  value={row.values[ci] ?? ''}
-                  onChange={(e) => onCellChange(rowIndex, ci, e.target.value)}
-                  placeholder={label || `列${ci + 1}`}
-                />
-              </div>
-            ))}
-            <button
-              type="button"
-              className="dict-card__row-delete"
-              onClick={() => onDelete(rowIndex)}
-              title="删除此条"
-            >
-              ✕
-            </button>
-          </div>
+          <DictEntryRow
+            key={`${rowIndex}`}
+            row={row}
+            rowIndex={rowIndex}
+            labels={labels}
+            sourceCellIndex={getSourceCellIndex(group.type)}
+            showOpenCache={Boolean(onOpenInCache)}
+            onCellChange={onCellChange}
+            onDelete={onDelete}
+            onOpenInCache={onOpenInCache}
+          />
         ))}
 
         <div className="dict-card__table-add-row">
@@ -194,7 +320,7 @@ function DictEntryGroupCard({
             type="button"
             className="dict-card__add-row-btn"
             onClick={() => onAddRow(group.type, group.items[group.items.length - 1]?.rowIndex ?? -1)}
-            title="新增同类型条目"
+            title={translate("projects:dictionaryManager.dictCardAddRowBtn_title_entry")}
           >
             +
           </button>
@@ -206,6 +332,7 @@ function DictEntryGroupCard({
 
 /* ── Main component ── */
 export function DictionaryManager(props: DictionaryManagerProps) {
+  const uiLanguage = useUiLanguage();
   const {
     data,
     loading,
@@ -215,52 +342,129 @@ export function DictionaryManager(props: DictionaryManagerProps) {
     onSaveFile,
     onDeleteFile,
     onGenerateGptDict,
+    gendicBackend,
+    onOpenInCache,
     title,
     description,
   } = props;
 
-  const [activeTab, setActiveTab] = useState<DictTab>('gpt');
+  const pageActive = usePageActive();
+  const saveInFlightRef = useRef(false);
+  /** 「→」回调经 ref 转发：父组件每次 render 新建的内联函数不会打穿行组件的 memo */
+  const onOpenInCacheRef = useRef(onOpenInCache);
+  onOpenInCacheRef.current = onOpenInCache;
+  const handleOpenInCache = useCallback((sourceWord: string) => {
+    onOpenInCacheRef.current?.(sourceWord);
+  }, []);
+  const showOpenInCache = Boolean(onOpenInCache);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  // 当前文件的字典类别（决定解析方式、新增条目类型）：看选中的文件落在哪棵树
+  const activeTab = getFileCategory(data, selectedFile);
+  /** 「新建」建到哪一类；选中文件时跟着它走，也可以手动切换 */
+  const [createCategory, setCreateCategory] = useState<DictTab>('gpt');
+  const [collapsedGroups, setCollapsedGroups] = useState<ReadonlySet<DictTab>>(() => new Set());
+  const {
+    width: sidebarWidth,
+    resizing,
+    layoutRef,
+    onResizerPointerDown,
+  } = useResizableSidebar(DICTIONARY_SIDEBAR_WIDTH_KEY);
   const [searchTerm, setSearchTerm] = useState('');
+  const [sectionFilter, setSectionFilter] = useState('');
   const [mode, setMode] = useState<'card' | 'text'>('card');
   const [draftText, setDraftText] = useState<string>('');
+  /** 卡片模式下的行编辑直接保存在行数组里（不整文件序列化再重解析）；
+   *  有值时它就是 parsedRows 的真源，保存/切文本模式时才落地成文本 */
+  const [rowsOverride, setRowsOverride] = useState<DictRow[] | null>(null);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [generatingGptDict, setGeneratingGptDict] = useState(false);
+  const [showGenerateConfirm, setShowGenerateConfirm] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  useRetainPage(dirty || saving || creating || deleting || generatingGptDict);
   const [newFilename, setNewFilename] = useState('');
-  const [localError, setLocalError] = useState<string | null>(null);
-  const [info, setInfo] = useState<string | null>(null);
+  const [localError, setLocalError] = useMessageState<string | null>(null);
+  const [info, setInfo] = useMessageState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<DictContextMenuState | null>(null);
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
+  const cardListRef = useRef<HTMLDivElement | null>(null);
+  const addedRowRef = useRef<number | null>(null);
+  const textEditorRef = useRef<HTMLTextAreaElement>(null);
+  const appliedPreviewTargetRef = useRef<DictionaryPreviewTarget>();
+  const [pendingPreviewRow, setPendingPreviewRow] = useState<number | null>(null);
+  const [previewNotice, setPreviewNotice] = useMessageState<string | null>(null);
+  const highlightedPreviewRowRef = useRef<HTMLElement | null>(null);
 
-  const activeFiles = useMemo(() => getFilesByTab(data, activeTab), [data, activeTab]);
 
   const selectedContent = useMemo(() => {
     if (!data || !selectedFile) return null;
     return data.dict_contents[selectedFile] ?? null;
   }, [data, selectedFile]);
 
-  const parsedRows = useMemo(() => parseRows(draftText, activeTab), [draftText, activeTab]);
+  const parsedRows = useMemo(
+    () => rowsOverride ?? parseRows(draftText, activeTab),
+    [rowsOverride, draftText, activeTab],
+  );
+  const parsedRowsRef = useRef<DictRow[]>(parsedRows);
+  parsedRowsRef.current = parsedRows;
+  const rowsOverrideRef = useRef<DictRow[] | null>(rowsOverride);
+  rowsOverrideRef.current = rowsOverride;
+  const draftSnapshotRef = useRef({ selectedFile, draftText, rowsOverride });
+  draftSnapshotRef.current = { selectedFile, draftText, rowsOverride };
+
+  // 每行所属的类目（最近的分区标题），以及各类目的条目数；文件没有分区时 sections 为空，不显示类目筛选
+  const { rowSections, sections } = useMemo(() => {
+    const owner: string[] = [];
+    const counts = new Map<string, number>();
+    let current = UNSECTIONED_LABEL;
+    let hasSection = false;
+    for (const row of parsedRows) {
+      const match = SECTION_LINE_RE.exec(row.raw);
+      if (match) {
+        current = match[1];
+        hasSection = true;
+        if (!counts.has(current)) counts.set(current, 0);
+      } else if (row.raw.includes('\t') && row.type !== 'comment' && row.type !== 'blank') {
+        counts.set(current, (counts.get(current) ?? 0) + 1);
+      }
+      owner.push(current);
+    }
+    if (!hasSection) return { rowSections: owner, sections: [] as { name: string; count: number }[] };
+    const list = [...counts.entries()]
+      .filter(([name, count]) => name !== UNSECTIONED_LABEL || count > 0)
+      .map(([name, count]) => ({ name, count }));
+    return { rowSections: owner, sections: list };
+  }, [parsedRows]);
+  const rowSectionsRef = useRef<string[]>([]);
+  rowSectionsRef.current = rowSections;
+
+  // 选中的类目在当前文件里不存在（换了文件、分区被删）时视为「全部」
+  const activeSection = sections.some((s) => s.name === sectionFilter) ? sectionFilter : '';
+
+  // 击键先更新输入框，过滤用延迟值：大字典里连续输入不会每击键都全量 join+filter。
+  // 清空搜索（含「新增条目」时程序性清空）立即生效：新行要当帧就渲染出来才能聚焦。
+  const deferredSearchTerm = useDeferredValue(searchTerm);
+  const effectiveSearchTerm = searchTerm === '' ? '' : deferredSearchTerm;
 
   const filteredRows = useMemo(() => {
     const visible = parsedRows
       .map((row, rowIndex) => ({ row, rowIndex }))
-      .filter(({ row }) => {
+      .filter(({ row, rowIndex }) => {
         // 过滤掉注释行（// 或 # 开头）
         if (row.type === 'comment') return false;
         // 过滤掉空行
         if (row.type === 'blank') return false;
         // 过滤掉少于 1 个 tab 分隔的行（即没有 tab 的行）
         if (!row.raw.includes('\t')) return false;
+        if (activeSection && rowSections[rowIndex] !== activeSection) return false;
         return true;
       });
-    if (!searchTerm.trim()) return visible;
-    const needle = searchTerm.toLowerCase();
+    if (!effectiveSearchTerm.trim()) return visible;
+    const needle = effectiveSearchTerm.toLowerCase();
     return visible.filter(({ row }) => row.values.join('\t').toLowerCase().includes(needle));
-  }, [parsedRows, searchTerm]);
+  }, [parsedRows, effectiveSearchTerm, activeSection, rowSections]);
 
   const groupedRows = useMemo(() => {
     const groups: DictRowGroup[] = [];
@@ -274,6 +478,46 @@ export function DictionaryManager(props: DictionaryManagerProps) {
     }
     return groups;
   }, [filteredRows]);
+
+  useLayoutEffect(() => {
+    if (!pageActive || mode !== 'card' || addedRowRef.current === null) return;
+    const row = cardListRef.current?.querySelector<HTMLElement>(`[data-dict-row-index="${addedRowRef.current}"]`);
+    // 过滤用的是 useDeferredValue：清空搜索后新行要晚一拍才渲染出来。
+    // 这时别清掉标记（下一次列表更新会再进这个 effect），否则新行永远拿不到焦点。
+    if (!row) return;
+    addedRowRef.current = null;
+    row.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    row.querySelector<HTMLInputElement>('input')?.focus({ preventScroll: true });
+  }, [parsedRows, filteredRows, pageActive, mode]);
+
+  // 类目筛选：一排胶囊挂在卡片头部（跟「GPT 216条」同一行），点当前项退回全部
+  const sectionPills = sections.length > 0 ? (
+    <div className="dict-section-pills" role="group" aria-label={translate("projects:dictionaryManager.dictSectionPills_ariaLabel_filter")}>
+      <button
+        type="button"
+        className={`dict-section-pill${activeSection ? '' : ' dict-section-pill--active'}`}
+        onClick={() => setSectionFilter('')}
+        title={translate("projects:dictionaryManager.dictSectionPills_title_all")}
+      >{translate("projects:dictionaryManager.dictSectionPills_button_all")}<span className="dict-section-pill__count">{sections.reduce((sum, item) => sum + item.count, 0)}</span>
+      </button>
+      {sections.map((section) => {
+        const isActive = activeSection === section.name;
+        const label = section.name === UNSECTIONED_LABEL ? translate("projects:dictionaryManager.uNSECTIONEDLABEL_message_not") : section.name;
+        return (
+          <button
+            key={section.name}
+            type="button"
+            className={`dict-section-pill${isActive ? ' dict-section-pill--active' : ''}`}
+            onClick={() => setSectionFilter(isActive ? '' : section.name)}
+            title={isActive ? translate("projects:dictionaryManager.dictSectionPills_title_cancelFilterAll") : translate("projects:dictionaryManager.dictSectionPills_title_text", { name: label })}
+          >
+            {label}
+            <span className="dict-section-pill__count">{section.count}</span>
+          </button>
+        );
+      })}
+    </div>
+  ) : null;
 
   const handleReload = async () => {
     if (refreshing) return;
@@ -295,7 +539,7 @@ export function DictionaryManager(props: DictionaryManagerProps) {
   };
 
   useEffect(() => {
-    if (!contextMenu) return;
+    if (!pageActive || !contextMenu) return;
 
     const onPointerDown = (event: PointerEvent) => {
       const menuEl = contextMenuRef.current;
@@ -312,12 +556,12 @@ export function DictionaryManager(props: DictionaryManagerProps) {
       window.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('keydown', onKeyDown);
     };
-  }, [contextMenu]);
+  }, [pageActive, contextMenu]);
 
   const handleRevealFile = async (file: string) => {
     const filePath = data?.dict_contents?.[file]?.path;
     if (!filePath) {
-      setLocalError(`无法定位字典文件「${stripProjectDirMarker(file)}」`);
+      setLocalError(uiMessage("projects:dictionaryManager.handleRevealFile_setLocalError_unableDictionaryFile", { value: stripProjectDirMarker(file) }));
       setInfo(null);
       return;
     }
@@ -327,7 +571,7 @@ export function DictionaryManager(props: DictionaryManagerProps) {
     try {
       await invoke('reveal_file', { path: filePath });
     } catch (e) {
-      setLocalError(e instanceof Error ? e.message : `在文件管理器中浏览失败: ${String(e)}`);
+      setLocalError(e instanceof Error ? e.message : uiMessage("projects:dictionaryManager.handleRevealFile_setLocalError_fileFailed", { value: String(e) }));
     }
   };
 
@@ -339,103 +583,202 @@ export function DictionaryManager(props: DictionaryManagerProps) {
     try {
       await onGenerateGptDict();
     } catch (e) {
-      setLocalError(e instanceof Error ? e.message : '启动 AI 生成 GPT 字典任务失败');
+      setLocalError(e instanceof Error ? e.message : uiMessage("projects:dictionaryManager.handleGenerateGptDict_setLocalError_aIGPTDictionaryJobFailed"));
     } finally {
       setGeneratingGptDict(false);
     }
   };
 
-  const ensureSelection = (nextFiles: string[]) => {
-    if (nextFiles.length === 0) {
-      setSelectedFile(null);
-      setDraftText('');
-      setDirty(false);
-      return;
-    }
-    setSelectedFile((prev) => (prev && nextFiles.includes(prev) ? prev : nextFiles[0]));
+  // 启动前先确认：任务会调用模型、消耗额度，得让用户看清楚用的是哪个后端
+  const confirmGenerateGptDict = () => {
+    setShowGenerateConfirm(false);
+    void handleGenerateGptDict();
   };
 
   useEffect(() => {
-    if (!selectedFile && activeFiles.length > 0) {
-      const first = activeFiles[0];
-      setSelectedFile(first);
-      const next = data?.dict_contents[first]?.lines.join('\n') ?? '';
-      setDraftText(next);
-      setDirty(false);
-    }
-  }, [activeFiles, selectedFile, data]);
+    if (selectedFile) return;
+    const first = getDefaultFile(data);
+    if (!first) return;
+    setSelectedFile(first);
+    setCreateCategory(getFileCategory(data, first));
+    const next = data?.dict_contents[first]?.lines.join('\n') ?? '';
+    setDraftText(next);
+    setRowsOverride(null);
+    setDirty(false);
+  }, [selectedFile, data]);
 
   useEffect(() => {
     if (!selectedFile || !selectedContent || dirty) return;
     const next = selectedContent.lines.join('\n');
     if (draftText !== next) {
       setDraftText(next);
+      setRowsOverride(null);
     }
   }, [selectedFile, selectedContent, dirty, draftText]);
 
   const handleSelectFile = (file: string) => {
-    if (dirty && !confirm('当前文件有未保存改动，切换会丢失改动，是否继续？')) {
+    if (dirty && !confirm(translate("projects:dictionaryManager.handleSelectFile_confirm_currentFileNotSave"))) {
       return;
     }
     setSelectedFile(file);
+    setCreateCategory(getFileCategory(data, file));
+    setSectionFilter('');
     const next = data?.dict_contents[file]?.lines.join('\n') ?? '';
     setDraftText(next);
+    setRowsOverride(null);
     setDirty(false);
     setInfo(null);
     setLocalError(null);
   };
 
-  const handleTabChange = (tab: DictTab) => {
-    if (dirty && !confirm('当前文件有未保存改动，切换分类会丢失改动，是否继续？')) {
-      return;
-    }
-    setActiveTab(tab);
-    setSearchTerm('');
-    const files = getFilesByTab(data, tab);
-    ensureSelection(files);
-    if (files.length > 0 && data) {
-      setDraftText((data.dict_contents[files[0]]?.lines ?? []).join('\n'));
-    }
-    setDirty(false);
+  const toggleGroup = (category: DictTab) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(category)) next.delete(category);
+      else next.add(category);
+      return next;
+    });
   };
 
-  const updateRowCell = (rowIndex: number, cellIndex: number, value: string) => {
-    const next = [...parsedRows];
+  /** 跳到或新建某类文件时展开它所在的树，否则选中项藏在折叠的树里看不见 */
+  const expandGroup = (category: DictTab) => {
+    setCollapsedGroups((prev) => {
+      if (!prev.has(category)) return prev;
+      const next = new Set(prev);
+      next.delete(category);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    const target = props.focusTarget;
+    if (!pageActive || loading || !data || !target || appliedPreviewTargetRef.current === target) return;
+    appliedPreviewTargetRef.current = target;
+    highlightedPreviewRowRef.current?.classList.remove('dict-card__table-row--highlight');
+    setPreviewNotice(null);
+    const tab = DICT_CATEGORIES.find(category => getFilesByTab(data, category).includes(target.fileKey));
+    if (!tab) {
+      setPreviewNotice(uiMessage('projects:projectPreview.fileMissing'));
+      return;
+    }
+    if (selectedFile !== target.fileKey && dirty && !confirm(translate('projects:dictionaryManager.handleSelectFile_confirm_currentFileNotSave'))) return;
+    const text = selectedFile === target.fileKey && dirty ? rowsToText(parsedRows) : data.dict_contents[target.fileKey]?.lines.join('\n') ?? '';
+    const rows = parseRows(text, tab);
+    setCreateCategory(tab);
+    expandGroup(tab);
+    setSelectedFile(target.fileKey);
+    setDraftText(text);
+    setRowsOverride(null);
+    if (selectedFile !== target.fileKey) setDirty(false);
+    setSearchTerm('');
+    setSectionFilter('');
+    setInfo(null);
+    if (target.line === undefined) return;
+    const exact = rows.findIndex(row => row.raw === target.line);
+    const wanted = parseRows(target.line, tab)[0];
+    const keyLength = wanted?.type === 'conditional' ? 3 : wanted?.type === 'situation' ? 2 : 1;
+    const matched = exact >= 0 ? exact : rows.findIndex(row => wanted && row.type === wanted.type
+      && row.type !== 'comment' && row.type !== 'blank'
+      && row.values.slice(0, keyLength).join('\t') === wanted.values.slice(0, keyLength).join('\t'));
+    if (matched < 0) {
+      setPreviewNotice(uiMessage('projects:projectPreview.entryMissing'));
+      setPendingPreviewRow(null);
+      return;
+    }
+    const row = rows[matched];
+    setMode(row.type === 'comment' || row.type === 'blank' || !row.raw.includes('\t') ? 'text' : 'card');
+    setPendingPreviewRow(matched);
+  }, [props.focusTarget, data, loading, pageActive]);
+
+  useLayoutEffect(() => {
+    if (!pageActive || pendingPreviewRow === null) return;
+    if (mode === 'text') {
+      const editor = textEditorRef.current;
+      if (!editor) return;
+      const start = draftText.split('\n').slice(0, pendingPreviewRow).reduce((length, line) => length + line.length + 1, 0);
+      editor.focus({ preventScroll: true });
+      editor.setSelectionRange(start, start + (draftText.split('\n')[pendingPreviewRow]?.length ?? 0));
+      const lineHeight = Number.parseFloat(getComputedStyle(editor).lineHeight) || 20;
+      editor.scrollTop = Math.max(0, pendingPreviewRow * lineHeight - editor.clientHeight / 2);
+      setPendingPreviewRow(null);
+      return;
+    }
+    const container = cardListRef.current;
+    const row = container?.querySelector<HTMLElement>(`[data-dict-row-index="${pendingPreviewRow}"]`);
+    if (!container || !row) return;
+    // 竖向滚动条在表格自己身上（单分组时列表是 overflow: hidden，滚它没有任何效果）；
+    // 多分组时列表也滚，所以先滚表格、再滚列表，两层都把这一行带到中间。
+    const table = row.closest<HTMLElement>('.dict-card__table');
+    if (table) scrollWithinContainer(table, row);
+    scrollWithinContainer(container, row);
+    // 再次定位到同一行时也要重新闪一次：先摘掉类并强制回流，动画才会从头播
+    row.classList.remove('dict-card__table-row--highlight');
+    void row.offsetWidth;
+    row.classList.add('dict-card__table-row--highlight');
+    highlightedPreviewRowRef.current = row;
+    row.querySelector<HTMLInputElement>('input')?.focus({ preventScroll: true });
+    setPendingPreviewRow(null);
+  }, [pendingPreviewRow, pageActive, mode, filteredRows, draftText]);
+
+  const updateRowCell = useCallback((rowIndex: number, cellIndex: number, value: string) => {
+    const next = [...parsedRowsRef.current];
     const row = next[rowIndex];
     if (!row || row.type === 'blank') return;
     if (row.type === 'comment' && cellIndex > 0) return;
     const nextValues = [...row.values];
     nextValues[cellIndex] = value;
-    next[rowIndex] = { ...row, values: nextValues };
-    setDraftText(rowsToText(next));
+    // 只有被改的这一行换成新对象，其余行保留引用：memo 行组件据此跳过重渲染
+    // Keep raw/type consistent with the edited values, without reparsing the
+    // rest of the dictionary (e.g. changing diag to mono or adding a comment).
+    next[rowIndex] = parseRows(rowsToText([{ ...row, values: nextValues }]), activeTab)[0];
+    // 不再整文件序列化再重解析：行数组就是真源，保存/切文本模式时才落地成文本
+    setRowsOverride(next);
     setDirty(true);
     setInfo(null);
-  };
+  }, [activeTab]);
 
-  const deleteRow = (rowIndex: number) => {
-    const next = parsedRows.filter((_, i) => i !== rowIndex);
-    setDraftText(rowsToText(next));
+  const deleteRow = useCallback((rowIndex: number) => {
+    setRowsOverride(parsedRowsRef.current.filter((_, i) => i !== rowIndex));
     setDirty(true);
     setInfo(null);
-  };
+  }, []);
 
   const buildRowByType = (rowType: DictRowType): DictRow => {
-    if (rowType === 'gpt') return { type: 'gpt', values: ['', '', ''], raw: '' };
-    if (rowType === 'conditional') return { type: 'conditional', values: ['pre_src', '', '', '', ''], raw: '' };
-    if (rowType === 'situation') return { type: 'situation', values: ['diag', '', ''], raw: '' };
-    if (rowType === 'comment') return { type: 'comment', values: [''], raw: '' };
-    return { type: 'normal', values: ['', '', ''], raw: '' };
+    // raw 要与 values 一致（旧流程走一遍文本往返，raw 就是 join('\t') 的结果）。
+    // 列表按「raw 是否含 tab」判断这行该不该显示，raw 留空新行会被直接过滤掉。
+    const make = (type: DictRowType, values: string[]): DictRow => ({
+      type,
+      values,
+      raw: type === 'comment' ? '' : values.join('\t'),
+    });
+    if (rowType === 'gpt') return make('gpt', ['', '', '']);
+    if (rowType === 'conditional') return make('conditional', ['pre_src', '', '', '', '']);
+    if (rowType === 'situation') return make('situation', ['diag', '', '']);
+    if (rowType === 'comment') return make('comment', ['']);
+    return make('normal', ['', '', '']);
   };
 
-  const addRow = (rowType?: DictRowType, insertAfterRowIndex?: number) => {
+  const addRow = useCallback((rowType?: DictRowType, insertAfterRowIndex?: number) => {
+    const rows = parsedRowsRef.current;
+    const rowSections = rowSectionsRef.current;
     const targetType = rowType ?? (activeTab === 'gpt' ? 'gpt' : 'normal');
     const base = buildRowByType(targetType);
-    const insertIndex = typeof insertAfterRowIndex === 'number' ? Math.max(0, insertAfterRowIndex + 1) : parsedRows.length;
-    const next = [...parsedRows.slice(0, insertIndex), base, ...parsedRows.slice(insertIndex)];
-    setDraftText(rowsToText(next));
+    let insertIndex = typeof insertAfterRowIndex === 'number' ? Math.max(0, insertAfterRowIndex + 1) : rows.length;
+    if (typeof insertAfterRowIndex !== 'number' && activeSection) {
+      // 正在看某个类目：新条目加到该分区末尾（跳过分区末尾的空行），否则加到文件末尾就看不到了
+      let last = rowSections.lastIndexOf(activeSection);
+      while (last > 0 && rows[last].type === 'blank' && rowSections[last - 1] === activeSection) last -= 1;
+      insertIndex = last + 1;
+    }
+    const next = [...rows.slice(0, insertIndex), base, ...rows.slice(insertIndex)];
+    addedRowRef.current = insertIndex;
+    // An empty new row cannot match a text search. Keep its section selected,
+    // but clear the search so the row can be shown and edited immediately.
+    setSearchTerm('');
+    setRowsOverride(next);
     setDirty(true);
     setInfo(null);
-  };
+  }, [activeSection, activeTab]);
 
   const handleTextEditorKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key !== 'Tab') return;
@@ -445,6 +788,7 @@ export function DictionaryManager(props: DictionaryManagerProps) {
     const end = target.selectionEnd;
     const nextValue = `${draftText.slice(0, start)}\t${draftText.slice(end)}`;
     setDraftText(nextValue);
+    setRowsOverride(null);
     setDirty(true);
     setInfo(null);
     window.requestAnimationFrame(() => {
@@ -454,7 +798,7 @@ export function DictionaryManager(props: DictionaryManagerProps) {
   };
 
   const handleSave = async () => {
-    if (!selectedFile) return;
+    if (!selectedFile || !dirty || saveInFlightRef.current) return;
     if (activeTab === 'gpt') {
       const invalidRow = parsedRows
         .map((row, index) => ({ row, index }))
@@ -465,30 +809,58 @@ export function DictionaryManager(props: DictionaryManagerProps) {
           return !src || !dst;
         });
       if (invalidRow) {
-        setLocalError(`GPT字典第 ${invalidRow.index + 1} 行的原文和译文不能为空`);
+        setLocalError(uiMessage("projects:dictionaryManager.handleSave_setLocalError_gPTDictionarySourceTranslationTextRequired", { value: invalidRow.index + 1 }));
         setInfo(null);
         return;
       }
     }
+    saveInFlightRef.current = true;
     setSaving(true);
     setLocalError(null);
     setInfo(null);
     try {
-      await onSaveFile(selectedFile, draftText);
-      setDirty(false);
-      setInfo('已保存');
+      // 卡片模式下行数组是真源：保存时才序列化一次
+      const overrideAtSave = rowsOverride;
+      const textToSave = overrideAtSave ? rowsToText(overrideAtSave) : draftText;
+      await onSaveFile(selectedFile, textToSave);
+      const current = draftSnapshotRef.current;
+      if (current.selectedFile === selectedFile
+        && current.draftText === draftText
+        && current.rowsOverride === overrideAtSave) {
+        if (overrideAtSave) {
+          setRowsOverride(null);
+          setDraftText(textToSave);
+        }
+        setDirty(false);
+      }
+      setInfo(uiMessage("projects:dictionaryManager.handleSave_setInfo_doneSave"));
       await onReload();
     } catch (e) {
-      setLocalError(e instanceof Error ? e.message : '保存失败');
+      setLocalError(e instanceof Error ? e.message : uiMessage("projects:dictionaryManager.handleSave_setLocalError_saveFailed"));
     } finally {
+      saveInFlightRef.current = false;
       setSaving(false);
     }
   };
 
+  useSaveShortcut(() => { void handleSave(); });
+
+  /** 切模式时把待落地的行编辑序列化进文本（或反向），保证两种视图看到同一份内容 */
+  const handleToggleMode = useCallback(() => {
+    if (mode === 'card') {
+      const rows = rowsOverrideRef.current;
+      if (rows) setDraftText(rowsToText(rows));
+      setRowsOverride(null);
+      setMode('text');
+      return;
+    }
+    setMode('card');
+  }, [mode]);
+
   const handleCreate = async () => {
     const raw = newFilename.trim();
     if (!raw) {
-      setLocalError('文件名不能为空');
+      setLocalError(uiMessage("projects:dictionaryManager.handleCreate_setLocalError_fileRequired"));
       return;
     }
     const name = /\.txt$/i.test(raw) ? raw : `${raw}.txt`;
@@ -496,13 +868,14 @@ export function DictionaryManager(props: DictionaryManagerProps) {
     setLocalError(null);
     setInfo(null);
     try {
-      const createdFileKey = await onCreateFile(activeTab, name);
+      const createdFileKey = await onCreateFile(createCategory, name);
       setNewFilename('');
       setSelectedFile(createdFileKey);
+      expandGroup(createCategory);
       await onReload();
-      setInfo('已创建字典文件');
+      setInfo(uiMessage("projects:dictionaryManager.handleCreate_setInfo_doneCreateDictionaryFile"));
     } catch (e) {
-      setLocalError(e instanceof Error ? e.message : '创建失败');
+      setLocalError(e instanceof Error ? e.message : uiMessage("projects:dictionaryManager.handleCreate_setLocalError_createFailed"));
     } finally {
       setCreating(false);
     }
@@ -510,85 +883,118 @@ export function DictionaryManager(props: DictionaryManagerProps) {
 
   const handleDelete = async () => {
     if (!selectedFile) return;
-    if (!confirm(`确定删除字典文件「${stripProjectDirMarker(selectedFile)}」？`)) return;
+    if (!confirm(translate("projects:dictionaryManager.handleDelete_confirm_deleteDictionaryFile", { value: stripProjectDirMarker(selectedFile) }))) return;
     setDeleting(true);
     setLocalError(null);
     setInfo(null);
     try {
       await onDeleteFile(selectedFile);
+      setRowsOverride(null);
       setDirty(false);
       await onReload();
-      setInfo('已删除字典文件');
+      setInfo(uiMessage("projects:dictionaryManager.handleDelete_setInfo_doneDeleteDictionaryFile"));
     } catch (e) {
-      setLocalError(e instanceof Error ? e.message : '删除失败');
+      setLocalError(e instanceof Error ? e.message : uiMessage("projects:dictionaryManager.handleDelete_setLocalError_deleteFailed"));
     } finally {
       setDeleting(false);
     }
   };
 
-  if (loading) {
+  // 只在首次加载时整页换成加载态：保存/刷新后的重新读取若也卸掉列表，滚动位置会被重置
+  if (loading && !data) {
     return (
       <div className="project-dictionary-page">
         <div className="project-dictionary-page__header"><h1>{title}</h1></div>
-        <LoadingState title="加载字典中…" description="正在读取当前字典目录与文件内容。" />
+        <LoadingState title={translate("projects:dictionaryManager.projectDictionaryPage_title_loadDictionary")} description={translate("projects:dictionaryManager.projectDictionaryPage_description_pendingReadCurrentDictionaryDirectoryFile")} />
       </div>
     );
   }
 
-  if (error) {
+  // 同上：已有内容时重新读取失败不整页换成错误页（编辑器和刷新按钮都会被藏起来），改为页内提示
+  if (error && !data) {
     return (
       <div className="project-dictionary-page">
         <div className="project-dictionary-page__header"><h1>{title}</h1></div>
-        <ErrorState title="加载字典失败" description={error} />
+        <ErrorState title={translate("projects:dictionaryManager.projectDictionaryPage_title_loadDictionaryFailed")} description={error} />
       </div>
     );
   }
+
+  // 二次确认里写清楚用的是哪个后端：项目没单独指定就是全局默认，跟开始翻译同一口径
+  const gendicBackendText = formatBackendUsage(
+    gendicBackend ?? { backend: translate("projects:dictionaryManager.backend_backend_currentProjectBackendConfig"), model: '', profile: '' },
+  );
+  const gendicBackendMissing = gendicBackend?.missing === true;
+
+  const renderFileItem = (file: string) => {
+    const content = data?.dict_contents?.[file];
+    const isActive = selectedFile === file;
+    return (
+      <button
+        key={file}
+        className={`dict-file-item ${isActive ? 'dict-file-item--active' : ''}`}
+        type="button"
+        onClick={() => handleSelectFile(file)}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setContextMenu({ x: e.clientX, y: e.clientY, file });
+        }}
+      >
+        <span className="dict-file-item__label">
+          {isActive && dirty && (
+            <span
+              className="dict-file-item__dot"
+              role="img"
+              title={translate("projects:dictionaryManager.unsavedChanges")}
+              aria-label={translate("projects:dictionaryManager.unsavedChanges")}
+            />
+          )}
+          <span className="dict-file-item__name">{stripProjectDirMarker(file)}</span>
+        </span>
+        {content && <span className="dict-file-item__count">{translate("projects:dictionaryManager.dictFileList_message_entry", { count: content.count })}</span>}
+      </button>
+    );
+  };
 
   return (
     <div className="project-dictionary-page">
-      <div className="project-dictionary-page__header">
-        <h1>{title}</h1>
-        <p>{description}</p>
-      </div>
+      <PageHeader
+        className="project-dictionary-page__header"
+        title={title}
+        description={description}
+        actions={onGenerateGptDict ? (
+          <Button
+            variant="secondary"
+            onClick={() => setShowGenerateConfirm(true)}
+            disabled={generatingGptDict}
+            title={translate("projects:dictionaryManager.dictTabs_title_aIGenDicSourceExtractGPTDictionary")}
+          >
+            <Icon name="bot" />
+            {generatingGptDict ? translate("projects:dictionaryManager.dictTabs_message_text") : translate("projects:dictionaryManager.dictTabs_message_aIGPTDictionary")}
+          </Button>
+        ) : null}
+      />
 
-      {localError && <InlineFeedback tone="error" title="操作失败" description={localError} />}
-      {info && <InlineFeedback className="inline-alert--floating" tone="success" title="操作成功" description={info} />}
+      {(localError || error) && <InlineFeedback tone="error" title={translate("projects:dictionaryManager.projectDictionaryPage_title_failed")} description={localError || error || ''} />}
+      {info && <InlineFeedback className="inline-alert--floating" tone="success" title={translate("projects:dictionaryManager.projectDictionaryPage_title_success")} description={info} />}
+      {previewNotice && <p className="inline-feedback" role="status">{previewNotice}</p>}
 
       <div className="project-dictionary-page__content">
-        <div className="dict-tabs">
-          {(['gpt', 'pre', 'post'] as DictTab[]).map((tab) => (
-            <button
-              key={tab}
-              className={`dict-tab ${activeTab === tab ? 'dict-tab--active' : ''}`}
-              type="button"
-              onClick={() => handleTabChange(tab)}
-            >
-              {tab === 'pre' ? '译前字典' : tab === 'gpt' ? 'GPT字典' : '译后字典'}
-              <span className="dict-tab__count">{getFilesByTab(data, tab).length}</span>
-            </button>
-          ))}
-          {activeTab === 'gpt' && onGenerateGptDict ? (
-            <Button
-              variant="secondary"
-              onClick={() => void handleGenerateGptDict()}
-              disabled={generatingGptDict}
-            >
-              {generatingGptDict ? '启动中…' : 'AI生成GPT字典'}
-            </Button>
-          ) : null}
-        </div>
-
-        <div className="dict-layout">
+        <div
+          className={`dict-layout${resizing ? ' dict-layout--resizing' : ''}`}
+          ref={layoutRef}
+          style={{ '--dict-sidebar-width': `${sidebarWidth}px` } as CSSProperties}
+        >
           <aside className="dict-layout__sidebar">
             <div className="dict-layout__sidebar-header">
-              <h3>字典文件</h3>
+              <h3>{translate("projects:dictionaryManager.dictLayoutSidebarHeader_message_dictionaryFile")}</h3>
               <button
                 type="button"
                 className={`icon-btn icon-btn--refresh${refreshing ? ' icon-btn--spinning' : ''}`}
                 onClick={() => void handleReload()}
                 disabled={refreshing}
-                title="刷新字典文件列表"
-                aria-label="刷新字典文件列表"
+                title={translate("projects:dictionaryManager.dictLayoutSidebarHeader_title_dictionaryFile")}
+                aria-label={translate("projects:dictionaryManager.dictLayoutSidebarHeader_ariaLabel_dictionaryFile")}
               >
                 <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
                   <path d="M13.5 8a5.5 5.5 0 11-1.4-3.6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
@@ -599,74 +1005,100 @@ export function DictionaryManager(props: DictionaryManagerProps) {
             <div className="dict-create-file">
               <input
                 type="text"
-                placeholder="新文件名，如 custom_pre.txt"
+                placeholder={translate("projects:dictionaryManager.dictCreateFile_placeholder_fileCustomPreTxt")}
                 value={newFilename}
                 onChange={(e) => setNewFilename(e.target.value)}
               />
-              <Button onClick={() => void handleCreate()} disabled={creating}>新建</Button>
+              <Button onClick={() => void handleCreate()} disabled={creating}>{translate("projects:dictionaryManager.dictCreateFile_message_new")}</Button>
+            </div>
+            <div
+              className="dict-create-target"
+              role="radiogroup"
+              aria-label={translate("projects:dictionaryManager.dictCreateTarget_ariaLabel_createIn")}
+            >
+              <span className="dict-create-target__label">{translate("projects:dictionaryManager.dictCreateTarget_message_createIn")}</span>
+              {DICT_CATEGORIES.map((category) => (
+                <button
+                  key={category}
+                  type="button"
+                  role="radio"
+                  aria-checked={createCategory === category}
+                  className={`dict-create-target__option${createCategory === category ? ' dict-create-target__option--active' : ''}`}
+                  onClick={() => setCreateCategory(category)}
+                >
+                  {getCategoryShortLabel(category)}
+                </button>
+              ))}
             </div>
             <div className="dict-file-list">
-              {activeFiles.map((file) => {
-                const content = data?.dict_contents?.[file];
-                const isActive = selectedFile === file;
+              {DICT_CATEGORIES.map((category) => {
+                const files = getFilesByTab(data, category);
+                const collapsed = collapsedGroups.has(category);
+                const label = getCategoryLabel(category);
                 return (
-                  <button
-                    key={file}
-                    className={`dict-file-item ${isActive ? 'dict-file-item--active' : ''}`}
-                    type="button"
-                    onClick={() => handleSelectFile(file)}
-                    onContextMenu={(e) => {
-                      e.preventDefault();
-                      setContextMenu({ x: e.clientX, y: e.clientY, file });
-                    }}
-                  >
-                    <span className="dict-file-item__name">{stripProjectDirMarker(file)}</span>
-                    {content && <span className="dict-file-item__count">{content.count}条</span>}
-                  </button>
+                  <div key={category} className="dict-file-tree" role="group" aria-label={label}>
+                    <button
+                      type="button"
+                      className="dict-file-tree__header"
+                      aria-expanded={!collapsed}
+                      onClick={() => toggleGroup(category)}
+                    >
+                      <Icon name={collapsed ? 'chevron-right' : 'chevron-down'} />
+                      <span className="dict-file-tree__title">{label}</span>
+                      <span className="dict-file-tree__count">{files.length}</span>
+                    </button>
+                    {collapsed ? null : (
+                      <div className="dict-file-tree__children">
+                        {files.map(renderFileItem)}
+                        {files.length === 0 && (
+                          <p className="dict-file-tree__empty">{translate("projects:dictionaryManager.dictFileTree_message_empty")}</p>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 );
               })}
-              {activeFiles.length === 0 && (
-                <EmptyState title="当前分类无字典文件" description="请先创建一个字典文件。" />
-              )}
             </div>
           </aside>
+
+          <div
+            className={`dict-layout__resizer${resizing ? ' dict-layout__resizer--dragging' : ''}`}
+            onPointerDown={onResizerPointerDown}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label={translate("projects:dictionaryManager.dictLayoutResizer_ariaLabel_sidebarWidth")}
+          />
 
           <div className="dict-layout__main">
             {selectedFile ? (
               <Panel
                 title={stripProjectDirMarker(selectedFile)}
-                description={`${selectedContent?.count ?? 0} 条有效条目 · ${selectedContent?.path ?? ''}`}
+                description={translate("projects:dictionaryManager.dictLayoutMain_description_entryEntry", { value: selectedContent?.count ?? 0, value2: selectedContent?.path ?? '' })}
                 actions={(
                   <div className="dict-panel-actions">
-                    <Button variant="secondary" onClick={() => setMode(mode === 'card' ? 'text' : 'card')}>
-                      {mode === 'card' ? '切换纯文本' : '切换卡片'}
+                    <Button variant="secondary" onClick={handleToggleMode}>
+                      {mode === 'card' ? translate("projects:dictionaryManager.dictPanelActions_message_text") : translate("projects:dictionaryManager.dictPanelActions_message_textVariant2")}
                     </Button>
-                    <Button variant="secondary" onClick={() => void handleDelete()} disabled={deleting}>删除文件</Button>
-                    <Button onClick={() => void handleSave()} disabled={saving || !dirty}>保存</Button>
+                    <Button variant="secondary" onClick={() => void handleDelete()} disabled={deleting}>{translate("projects:dictionaryManager.dictPanelActions_message_deleteFile")}</Button>
+                    <Button onClick={() => void handleSave()} disabled={saving || !dirty}>{translate("common:actions.save")}</Button>
                   </div>
                 )}
               >
                 <div className="dict-toolbar">
                   <input
                     type="text"
-                    placeholder="搜索字典条目…"
+                    placeholder={translate("projects:dictionaryManager.dictToolbar_placeholder_searchDictionaryEntry")}
                     value={searchTerm}
                     onChange={(e) => setSearchTerm(e.target.value)}
                     className="dict-search"
                   />
                   {mode === 'card' && (
                     activeTab === 'gpt' ? (
-                      <Button variant="secondary" onClick={() => addRow('gpt')}>
-                        + 新增条目
-                      </Button>
+                      <Button variant="secondary" onClick={() => addRow('gpt')}>{translate("projects:dictionaryManager.dictToolbar_message_entry")}</Button>
                     ) : (
                       <>
-                        <Button variant="secondary" onClick={() => addRow('normal')}>
-                          + 普通条目
-                        </Button>
-                        <Button variant="secondary" onClick={() => addRow('conditional')}>
-                          + 条件条目
-                        </Button>
+                        <Button variant="secondary" onClick={() => addRow('normal')}>{translate("projects:dictionaryManager.dictToolbar_message_entryVariant2")}</Button>
+                        <Button variant="secondary" onClick={() => addRow('conditional')}>{translate("projects:dictionaryManager.dictToolbar_message_entryEntry")}</Button>
                       </>
                     )
                   )}
@@ -674,10 +1106,12 @@ export function DictionaryManager(props: DictionaryManagerProps) {
 
                 {mode === 'text' ? (
                   <textarea
+                    ref={textEditorRef}
                     className="dict-text-editor"
                     value={draftText}
                     onChange={(e) => {
                       setDraftText(e.target.value);
+                      setRowsOverride(null);
                       setDirty(true);
                       setInfo(null);
                     }}
@@ -686,28 +1120,36 @@ export function DictionaryManager(props: DictionaryManagerProps) {
                   />
                 ) : (
                   <div className="dict-card-mode">
-                    <div className="dict-card-list">
+                    {/* 一条都没筛出来时卡片不渲染，胶囊单独占一行——否则筛选没法取消 */}
+                    {groupedRows.length === 0 && sectionPills ? (
+                      <div className="dict-card dict-card--filters">
+                        <div className="dict-card__header">{sectionPills}</div>
+                      </div>
+                    ) : null}
+                    <div className={`dict-card-list${groupedRows.length > 1 ? ' dict-card-list--multi' : ''}`} ref={cardListRef}>
                       {groupedRows.map((group, groupIndex) => (
                         <DictEntryGroupCard
                           key={`${groupIndex}-${group.type}-${group.items[0]?.rowIndex ?? 0}`}
                           group={group}
                           tab={activeTab}
+                          headerExtra={groupIndex === 0 ? sectionPills : undefined}
                           onCellChange={updateRowCell}
                           onDelete={deleteRow}
                           onAddRow={addRow}
+                          onOpenInCache={showOpenInCache ? handleOpenInCache : undefined}
                         />
                       ))}
                       {groupedRows.length === 0 && (
                         <EmptyState
-                          title={searchTerm.trim() ? '无匹配条目' : '字典为空'}
-                          description={searchTerm.trim() ? '尝试更换搜索关键词或新增条目。' : '点击下方按钮添加第一条字典条目。'}
+                          title={searchTerm.trim() || activeSection ? translate("projects:dictionaryManager.dictCardList_title_matchEntry") : translate("projects:dictionaryManager.dictCardList_title_dictionary")}
+                          description={searchTerm.trim() || activeSection ? translate("projects:dictionaryManager.dictCardList_description_searchEntry") : translate("projects:dictionaryManager.dictCardList_description_buttonAddEntryDictionaryEntry")}
                           action={(
                             activeTab === 'gpt' ? (
-                              <Button variant="secondary" onClick={() => addRow('gpt')}>+ 新增条目</Button>
+                              <Button variant="secondary" onClick={() => addRow('gpt')}>{translate("projects:dictionaryManager.dictCardList_action_entry")}</Button>
                             ) : (
                               <div className="dict-empty-actions">
-                                <Button variant="secondary" onClick={() => addRow('normal')}>+ 普通条目</Button>
-                                <Button variant="secondary" onClick={() => addRow('conditional')}>+ 条件条目</Button>
+                                <Button variant="secondary" onClick={() => addRow('normal')}>{translate("projects:dictionaryManager.dictEmptyActions_message_entry")}</Button>
+                                <Button variant="secondary" onClick={() => addRow('conditional')}>{translate("projects:dictionaryManager.dictEmptyActions_message_entryEntry")}</Button>
                               </div>
                             )
                           )}
@@ -718,12 +1160,43 @@ export function DictionaryManager(props: DictionaryManagerProps) {
                 )}
               </Panel>
             ) : (
-              <EmptyState title="选择一个字典文件" description="从左侧选择字典文件开始编辑。" />
+              <EmptyState title={translate("projects:dictionaryManager.dictLayoutMain_title_selectCountDictionaryFile")} description={translate("projects:dictionaryManager.dictLayoutMain_description_selectDictionaryFileStartEdit")} />
             )}
           </div>
         </div>
       </div>
-      {contextMenu && createPortal(
+      {showGenerateConfirm ? (
+        <div
+          className="dict-dialog-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="gendic-confirm-title"
+          onClick={() => setShowGenerateConfirm(false)}
+        >
+          <div className="dict-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="dict-dialog__header">
+              <h3 className="dict-dialog__title" id="gendic-confirm-title">
+                <Icon name="bot" />{translate("projects:dictionaryManager.dictDialogTitle_h3_aIGPTDictionary")}</h3>
+              <p className="dict-dialog__subtitle"><UiTrans k="projects:dictionaryManager.dictDialogHeader_message_00GenDicGPTDictionary" values={{ gendicBackendText: gendicBackendText }} components={[<strong />]} /></p>
+            </div>
+            <div className="dict-dialog__body">
+              <p>{translate("projects:dictionaryManager.dictDialogBody_message_backendCurrentProjectBackendConfigProjectEmpty")}</p>
+              <p>{translate("projects:dictionaryManager.dictDialogBody_message_genDicNameTableExtractProjectDirectoryProjectGPT")}</p>
+              {gendicBackendMissing ? (
+                <p className="dict-dialog__warning">
+                  <Icon name="warning" />{translate("projects:dictionaryManager.dictDialogWarning_p_currentEmptyModelConfigFailedModelSettings")}</p>
+              ) : null}
+            </div>
+            <div className="dict-dialog__actions">
+              <Button variant="secondary" onClick={() => setShowGenerateConfirm(false)}>{translate("common:actions.cancel")}</Button>
+              <Button onClick={confirmGenerateGptDict} disabled={generatingGptDict}>
+                <Icon name="play" />{translate("projects:dictionaryManager.dictDialogActions_button_confirm")}</Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {pageActive && contextMenu && createPortal(
         <div
           ref={contextMenuRef}
           className="cache-context-menu"
@@ -739,8 +1212,8 @@ export function DictionaryManager(props: DictionaryManagerProps) {
               void handleRevealFile(file);
             }}
           >
-            <span className="cache-context-menu__icon" aria-hidden="true">📂</span>
-            <span className="cache-context-menu__label">在文件管理器中浏览</span>
+            <span className="cache-context-menu__icon" aria-hidden="true"><Icon name="folder-open" /></span>
+            <span className="cache-context-menu__label">{translate("projects:dictionaryManager.cacheContextMenuItem_message_file")}</span>
           </button>
         </div>,
         document.body,

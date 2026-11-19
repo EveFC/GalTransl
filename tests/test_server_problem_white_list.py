@@ -1,0 +1,237 @@
+"""白名单在服务端各出口的表现：/problems、/progress、/problem_filter_stats、缓存重建。
+
+/problems、/progress 与 /problem_filter_stats 都是只读统计，必须即时排除白名单条目
+（过滤统计里白名单条目也不参与计数）；缓存重建那支由 _cache_entries_to_trans_list 把
+白名单合流成 skip_check，这里直接测该函数（避开起完整 find_problems 配置的成本）。
+"""
+
+import json
+import os
+import tempfile
+import threading
+import unittest
+from unittest.mock import patch
+import urllib.request
+from http.server import ThreadingHTTPServer
+
+import orjson
+
+try:
+    from GalTransl import CACHE_FOLDERNAME
+    from GalTransl.server import (
+        JobRegistry,
+        RuntimeProgressCache,
+        _cache_entries_to_trans_list,
+        build_handler,
+    )
+    from GalTransl.server_runtime import encode_project_dir
+except ModuleNotFoundError:  # 精简环境（如系统 python）没有 yaml/orjson，跳过
+    raise unittest.SkipTest("server 依赖不可用")
+
+from GalTransl.ProblemWhiteList import build_problem_white_list_index
+
+
+def _entry(index, problem):
+    return {
+        "index": index,
+        "name": "少女",
+        "pre_src": f"原文{index}",
+        "post_src": f"原文{index}",
+        "pre_dst": f"译文{index}",
+        "proofread_dst": "",
+        "problem": problem,
+    }
+
+
+class CacheEntriesToTransListTests(unittest.TestCase):
+    """缓存重建时白名单与条目自身的 skip_check 在同一个入口合流。"""
+
+    def _entries(self):
+        return [
+            {"index": 1, "name": "少女", "post_src": "a", "pre_dst": "A"},
+            {"index": 2, "name": "", "post_src": "b", "pre_dst": "B", "skip_check": True},
+            {"index": 3, "name": "", "post_src": "c", "pre_dst": "C"},
+        ]
+
+    def test_white_list_marks_skip_check(self):
+        white = build_problem_white_list_index(["a.json:3"])
+        trans = _cache_entries_to_trans_list(self._entries(), "a.json", white)
+        self.assertEqual([t.skip_check for t in trans], [False, True, True])
+
+    def test_append_file_name_matches_snapshot_spec(self):
+        white = build_problem_white_list_index(["a.json:1"])
+        trans = _cache_entries_to_trans_list(self._entries(), "a.json.append.jsonl", white)
+        self.assertTrue(trans[0].skip_check)
+
+
+class ProgressWhiteListTests(unittest.TestCase):
+    def test_whitelisted_entry_is_not_counted_as_problem(self):
+        entries = [_entry(1, "残留日文"), _entry(2, "残留日文")]
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = os.path.join(tmp, CACHE_FOLDERNAME)
+            os.makedirs(cache_dir)
+            with open(os.path.join(cache_dir, "a.json"), "wb") as f:
+                f.write(orjson.dumps(entries))
+
+            result = RuntimeProgressCache().get_progress(
+                tmp,
+                file_totals={"a.json": 2},
+                cache_file_display_map={"a.json": "a.json"},
+                problem_white_list=["a.json:1"],
+            )
+
+        files = {f["filename"]: f for f in result["files"]}
+        self.assertEqual(files["a.json"]["problems"], 1)
+
+
+class HttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.root = tempfile.mkdtemp(prefix="galtransl-white-list-http-")
+        cls.project = os.path.join(cls.root, "proj")
+        os.makedirs(os.path.join(cls.project, CACHE_FOLDERNAME), exist_ok=True)
+        with open(os.path.join(cls.project, "config.yaml"), "w", encoding="utf-8") as f:
+            f.write(
+                'common:\n  language: ja\n  problemFilterKey:\n    - "^残留日文："\n    - "位置错乱"\n'
+                '  problemWhiteList:\n    - "a.json:1"\n'
+            )
+        with open(os.path.join(cls.project, CACHE_FOLDERNAME, "a.json"), "wb") as f:
+            # index1 在白名单里（不计），index2 带两个问题项：一个被过滤、一个留在清单里
+            f.write(orjson.dumps([_entry(1, "残留日文"), _entry(2, "残留日文, 位置错乱")]))
+
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(JobRegistry()))
+        cls.base = (
+            f"http://127.0.0.1:{cls.httpd.server_address[1]}/api/projects/"
+            f"{encode_project_dir(cls.project)}"
+        )
+        threading.Thread(target=cls.httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+
+    def _get(self, path):
+        with urllib.request.urlopen(f"{self.base}{path}", timeout=30) as resp:
+            return json.load(resp)
+
+    def test_problems_endpoint_hides_whitelisted_entry(self):
+        out = self._get("/problems?config=config.yaml")
+        self.assertEqual([p["index"] for p in out["problems"]], [2])
+
+    def test_progress_endpoint_excludes_whitelisted_problem(self):
+        out = self._get("/progress?config=config.yaml")
+        self.assertEqual(out["problems"], 1)
+
+    def test_problem_filter_stats_counts_hits_per_key(self):
+        # 每条过滤项各挡住了多少条问题：口径与 /problems 一致（白名单条目先排除）
+        out = self._get("/problem_filter_stats?config=config.yaml")
+
+        self.assertEqual(out["filter_keys"], ["^残留日文：", "位置错乱"])
+        self.assertEqual(
+            out["filters"],
+            [
+                {"key": "^残留日文：", "problems": 0},  # 条目里的问题是「残留日文」，锚点带冒号不命中
+                {"key": "位置错乱", "problems": 1},
+            ],
+        )
+        # index1 在白名单里 → 不计入问题条目总数，也就不给任何过滤项计数
+        self.assertEqual(out["problem_entries"], 1)
+        self.assertEqual(out["visible_entries"], 1)
+
+    def test_unchanged_revision_skips_cache_scan(self):
+        first = self._get("/problems?config=config.yaml")
+        self.assertTrue(first["revision"])
+        with patch("GalTransl.server._iter_problem_cache_entries", side_effect=AssertionError("must not scan")):
+            checked = self._get(f"/problems?config=config.yaml&revision={first['revision']}")
+        self.assertEqual(checked, {"unchanged": True, "revision": first["revision"]})
+
+    def test_change_during_scan_does_not_cache_a_partial_snapshot(self):
+        with patch("GalTransl.server._problem_revision", side_effect=["before", "after"]):
+            response = self._get("/problems?config=config.yaml")
+        self.assertIsNone(response["revision"])
+        self.assertIn("problems", response)
+
+    def test_revision_tracks_cache_writes_additions_deletions_and_config(self):
+        with tempfile.TemporaryDirectory() as project:
+            cache_dir = os.path.join(project, CACHE_FOLDERNAME)
+            os.makedirs(cache_dir)
+            config_path = os.path.join(project, "config.yaml")
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write("common: {}\n")
+            cache_path = os.path.join(cache_dir, "a.json")
+            with open(cache_path, "wb") as f:
+                f.write(orjson.dumps([_entry(1, "问题A")]))
+            base = self.base.split("/api/projects/")[0] + "/api/projects/" + encode_project_dir(project)
+
+            def get(revision=None):
+                suffix = f"&revision={revision}" if revision else ""
+                with urllib.request.urlopen(f"{base}/problems?config=config.yaml{suffix}", timeout=30) as response:
+                    return json.load(response)
+
+            previous = get()
+            self.assertEqual(previous["problems"][0]["problem"], "问题A")
+            # 相同大小的改写也必须检测到。
+            with open(cache_path, "wb") as f:
+                f.write(orjson.dumps([_entry(1, "问题B")]))
+            current = get(previous["revision"])
+            self.assertNotEqual(current["revision"], previous["revision"])
+            self.assertEqual(current["problems"][0]["problem"], "问题B")
+            previous = current
+            with open(os.path.join(cache_dir, "b.json"), "wb") as f:
+                f.write(orjson.dumps([_entry(2, "问题C")]))
+            current = get(previous["revision"])
+            self.assertEqual(current["total"], 2)
+            self.assertNotEqual(current["revision"], previous["revision"])
+            previous = current
+            os.remove(cache_path)
+            current = get(previous["revision"])
+            self.assertEqual(current["total"], 1)
+            self.assertNotEqual(current["revision"], previous["revision"])
+            previous = current
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write('common:\n  problemFilterKey: ["问题C"]\n')
+            current = get(previous["revision"])
+            self.assertEqual(current["total"], 0)
+            self.assertEqual(current["filter_keys"], ["问题C"])
+            self.assertNotEqual(current["revision"], previous["revision"])
+            # 临时文件不参与清单或版本签名。
+            with open(os.path.join(cache_dir, "b.json.tmp"), "w", encoding="utf-8") as f:
+                f.write("[]")
+            self.assertTrue(get(current["revision"])["unchanged"])
+
+    def test_revision_detects_same_size_rewrite_with_identical_metadata(self):
+        from GalTransl.server import _problem_revision
+
+        with tempfile.TemporaryDirectory() as project:
+            cache_dir = os.path.join(project, CACHE_FOLDERNAME)
+            os.makedirs(cache_dir)
+            config_path = os.path.join(project, "config.yaml")
+            cache_path = os.path.join(cache_dir, "a.json")
+            with open(config_path, "wb") as stream:
+                stream.write(b"common: {}\n")
+            with open(cache_path, "wb") as stream:
+                stream.write(orjson.dumps([_entry(1, "问题A")]))
+            original_stat = os.stat
+            cache_stat = original_stat(cache_path)
+
+            def same_cache_metadata(path, *args, **kwargs):
+                if os.fspath(path) == cache_path:
+                    return cache_stat
+                return original_stat(path, *args, **kwargs)
+
+            # Simulate a filesystem whose timestamps do not advance on this write.
+            with patch("GalTransl.server.os.stat", side_effect=same_cache_metadata):
+                before = _problem_revision(project, "config.yaml")
+                with open(cache_path, "wb") as stream:
+                    stream.write(orjson.dumps([_entry(1, "问题B")]))
+                after = _problem_revision(project, "config.yaml")
+                unchanged = _problem_revision(project, "config.yaml")
+            self.assertEqual(original_stat(cache_path).st_size, cache_stat.st_size)
+            self.assertIsNotNone(before)
+            self.assertIsNotNone(after)
+            self.assertNotEqual(before, after)
+            self.assertEqual(after, unchanged)
+
+
+if __name__ == "__main__":
+    unittest.main()

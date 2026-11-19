@@ -36,8 +36,6 @@
     radial-gradient(circle at 92% -18%, rgba(47, 111, 235, 0.16), transparent 46%),
     linear-gradient(90deg, #ffffff 0%, #ffffff 45%, rgba(247, 251, 255, 0.96) 100%),
     var(--color-surface);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.9),
     inset 0 -1px 0 rgba(191, 208, 226, 0.45);
@@ -67,17 +65,14 @@
   -webkit-mask-image: linear-gradient(90deg, transparent 0%, transparent 45%, rgba(0, 0, 0, 0.9) 85%, rgba(0, 0, 0, 0.5) 100%);
 }
 
-/* Decorative floating orbs */
+/* Keep large decorative surfaces still, including while translating. Activity
+   is already shown by the small status badge and per-file LEDs. */
 .ptv2-cockpit__orb {
   position: absolute;
   border-radius: 50%;
-  filter: blur(40px);
   pointer-events: none;
   z-index: 0;
   opacity: 0.7;
-  animation-duration: 12s;
-  animation-timing-function: ease-in-out;
-  animation-iteration-count: infinite;
 }
 
 .ptv2-cockpit__orb--a {
@@ -85,8 +80,7 @@
   height: 280px;
   top: -120px;
   right: -70px;
-  background: radial-gradient(circle, #5b8df6 0%, rgba(91, 141, 246, 0) 65%);
-  animation-name: ptv2OrbFloatA;
+  background: radial-gradient(circle, rgba(91, 141, 246, 0.75) 0%, rgba(91, 141, 246, 0.35) 40%, rgba(91, 141, 246, 0) 70%);
 }
 
 .ptv2-cockpit__orb--b {
@@ -95,19 +89,15 @@
   height: 200px;
   bottom: -100px;
   right: 22%;
-  background: radial-gradient(circle, #67c6ff 0%, rgba(103, 198, 255, 0) 65%);
-  animation-name: ptv2OrbFloatB;
-  animation-duration: 14s;
+  background: radial-gradient(circle, rgba(103, 198, 255, 0.65) 0%, rgba(103, 198, 255, 0.25) 45%, rgba(103, 198, 255, 0) 70%);
   opacity: 0.45;
 }
 
 .ptv2-cockpit--live .ptv2-cockpit__orb--a {
-  animation-duration: 6s;
   opacity: 0.85;
 }
 
 .ptv2-cockpit--live .ptv2-cockpit__orb--b {
-  animation-duration: 7s;
   opacity: 0.7;
 }
 
@@ -118,16 +108,6 @@
 
 .ptv2-cockpit--done .ptv2-cockpit__orb--b {
   opacity: 0.35;
-}
-
-@keyframes ptv2OrbFloatA {
-  0%, 100% { transform: translate(0, 0) scale(1); }
-  50% { transform: translate(-22px, 18px) scale(1.08); }
-}
-
-@keyframes ptv2OrbFloatB {
-  0%, 100% { transform: translate(0, 0) scale(1); }
-  50% { transform: translate(16px, -18px) scale(1.1); }
 }
 
 /* ── Arming: coherent hero initialization (no directional wipe) ── */
@@ -196,7 +176,7 @@
   100% { opacity: 1; transform: translateY(0); }
 }
 
-@media (prefers-reduced-motion: no-preference) and (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) {
   .ptv2-cockpit--arming,
   .ptv2-cockpit--arming .ptv2-cockpit__orb,
   .ptv2-cockpit--arming .ptv2-gauge__percent,
@@ -257,8 +237,10 @@
   color: var(--color-text);
   display: flex;
   align-items: baseline;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 0 2px;
+  min-width: 0;
+  white-space: nowrap;
 }
 
 .ptv2-cockpit__title-sep {
@@ -268,9 +250,28 @@
   font-size: 18px;
 }
 
+.ptv2-cockpit__title-sep {
+  flex-shrink: 0;
+}
+
+/* 项目名：单行、限宽，放不下的部分在右端淡出（不折行、不把标题区撑高）。 */
 .ptv2-cockpit__title-project {
   color: var(--color-primary);
   font-weight: 800;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 20em;
+  overflow: hidden;
+  white-space: nowrap;
+  /* overflow: hidden 配 1.1 行高会削掉字形上下缘，用内边距留出余量 */
+  padding-block: 0.15em;
+  margin-block: -0.15em;
+}
+
+/* 只有真被裁掉时才淡出，短名字保持完整实色 */
+.ptv2-cockpit__title-project.is-truncated {
+  -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 3em), transparent);
+  mask-image: linear-gradient(90deg, #000 calc(100% - 3em), transparent);
 }
 
 .ptv2-cockpit__statusline {
@@ -293,23 +294,45 @@
   text-overflow: ellipsis;
 }
 
-.ptv2-cockpit__tick-dot {
-  width: 7px;
-  height: 7px;
+/* 阶段内进度（GenDic 的「已完成 3/10」「审校 0/8」这类计数），跟在阶段徽章后面 */
+.ptv2-cockpit__stage-detail {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.42);
+  background: rgba(148, 163, 184, 0.12);
+  color: var(--color-text-muted);
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 「自动持续重翻」常驻胶囊：开关在「重翻词条」tab 里，切走后靠它提示仍然生效 */
+.ptv2-cockpit__auto-retransl {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px 3px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--color-primary) 38%, transparent);
+  background: color-mix(in srgb, var(--color-primary) 12%, transparent);
+  color: var(--color-primary);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.ptv2-cockpit__auto-retransl-dot {
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  background: rgba(148, 163, 184, 0.6);
-  box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.14);
-}
-
-.ptv2-cockpit--live .ptv2-cockpit__tick-dot {
-  background: #22c55e;
-  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.18);
-  animation: ptv2TickPulse 1.3s ease-in-out infinite;
-}
-
-@keyframes ptv2TickPulse {
-  0%, 100% { box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.18); }
-  50% { box-shadow: 0 0 0 6px rgba(34, 197, 94, 0.04); }
+  background: currentColor;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-primary) 16%, transparent);
 }
 
 /* ── Gauge row: big number + progress runway + action cluster ── */
@@ -490,26 +513,6 @@
   animation: ptv2BarCompleteGlow 0.9s ease-out 1;
 }
 
-.ptv2-gauge__bar-shine {
-  position: absolute;
-  inset: 0;
-  z-index: 3;
-  background: linear-gradient(
-    90deg,
-    transparent 0%,
-    rgba(255, 255, 255, 0) 30%,
-    rgba(255, 255, 255, 0.32) 50%,
-    rgba(255, 255, 255, 0) 70%,
-    transparent 100%
-  );
-  opacity: 0;
-  pointer-events: none;
-}
-
-.ptv2-cockpit--live .ptv2-gauge__bar-shine {
-  animation: ptv2BarShine 6s ease-in-out infinite;
-}
-
 .ptv2-gauge__bar-ticks {
   position: absolute;
   inset: 0;
@@ -530,18 +533,6 @@
 :root[data-theme='dark'] .ptv2-gauge__bar-tick {
   background: rgba(255, 255, 255, 0.32);
   box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.22);
-}
-
-@keyframes ptv2BarFlow {
-  0% { background-position: 220% 0; }
-  100% { background-position: -220% 0; }
-}
-
-@keyframes ptv2BarShine {
-  0% { transform: translateX(-110%); opacity: 0; }
-  20% { opacity: 0.9; }
-  80% { opacity: 0.9; }
-  100% { transform: translateX(110%); opacity: 0; }
 }
 
 @keyframes ptv2BarCompleteGlow {
@@ -688,22 +679,6 @@
   white-space: nowrap;
 }
 
-/* Pulse ring around button when stopping available (running) */
-.ptv2-cockpit--live .button.ptv2-launch-btn--stop::after {
-  content: "";
-  position: absolute;
-  inset: -4px;
-  border-radius: 18px;
-  border: 2px solid rgba(239, 68, 68, 0.45);
-  pointer-events: none;
-  animation: ptv2LaunchPulse 1.8s ease-out infinite;
-}
-
-@keyframes ptv2LaunchPulse {
-  0% { transform: scale(1); opacity: 0.8; }
-  100% { transform: scale(1.12); opacity: 0; }
-}
-
 /* ── Ribbon: stats + folder menu ── */
 
 .ptv2-cockpit__ribbon {
@@ -743,16 +718,6 @@
   color: var(--color-primary);
 }
 
-.ptv2-cockpit--live .ptv2-stat--primary .ptv2-stat__value {
-  text-shadow: 0 0 12px rgba(47, 111, 235, 0.28);
-  animation: ptv2StatPulse 2s ease-in-out infinite;
-}
-
-@keyframes ptv2StatPulse {
-  0%, 100% { text-shadow: 0 0 10px rgba(47, 111, 235, 0.2); }
-  50% { text-shadow: 0 0 18px rgba(47, 111, 235, 0.45); }
-}
-
 .ptv2-stat__label {
   font-size: 10px;
   font-weight: 700;
@@ -773,6 +738,277 @@
   font-size: 16px;
 }
 
+/* 当前后端：纯文字按钮，不画下划线；靠 hover 变主色 + 可点光标示意可点击，锁定时去掉可点击外观 */
+.ptv2-stat__backend-btn {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  max-width: 100%;
+  font: inherit;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: -0.005em;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.ptv2-stat__backend-text {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+  /* 不画下划线：line-height(1.15em) 比字体内容高度（Segoe UI ≈1.33em）矮，
+     行盒装不下 baseline + underline-offset，配上这里的 overflow:hidden 还会被裁掉。
+     仍留 2px padding + 等量负 margin：让 g/y 这类降部不被裁，统计块高度/基线不变。 */
+  padding-bottom: 2px;
+  margin-bottom: -2px;
+}
+
+.ptv2-stat--backend-clickable .ptv2-stat__backend-btn:hover {
+  color: var(--color-primary);
+}
+
+.ptv2-stat--backend-clickable .ptv2-stat__backend-btn:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.ptv2-stat--backend-locked .ptv2-stat__backend-btn {
+  cursor: not-allowed;
+  color: var(--color-text-muted);
+}
+
+/* 「当前后端」标签左侧加一个小圆点，提示它对应的上一行文字就是后端切换入口 */
+.ptv2-stat--backend .ptv2-stat__label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ptv2-stat--backend .ptv2-stat__label::before {
+  content: "";
+  flex: none;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--color-primary) 40%, transparent);
+}
+
+.ptv2-stat--backend-locked .ptv2-stat__label::before {
+  background: color-mix(in srgb, var(--color-text-muted) 35%, transparent);
+}
+
+/* 后端切换菜单：复用文件夹菜单的悬停展开机制（纯文字行，不用下拉框） */
+.ptv2-backend-menu {
+  align-items: flex-start;
+}
+
+.ptv2-backend-menu__dropdown {
+  left: 0;
+  right: auto;
+  top: 100%;
+  width: max-content;
+  min-width: 260px;
+  max-width: min(360px, 80vw);
+  margin-top: 10px;
+  padding: 6px;
+  gap: 2px;
+  border-radius: 12px;
+  border: 1px solid rgba(47, 111, 235, 0.22);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(244, 248, 255, 0.96));
+  box-shadow:
+    0 20px 40px -12px rgba(47, 111, 235, 0.28),
+    0 8px 16px -8px rgba(16, 24, 40, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  transform-origin: top left;
+}
+
+/* Token 用量：数值本身是个无外观的按钮，只为键盘能聚焦到它、从而展开明细 */
+.ptv2-stat__usage-btn {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font-family: inherit;
+  text-align: left;
+  cursor: default;
+  border-radius: 4px;
+}
+
+.ptv2-stat__usage-btn:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.ptv2-usage-menu__dropdown {
+  min-width: 240px;
+  padding: 12px 14px;
+  gap: 10px;
+  cursor: default;
+}
+
+.ptv2-usage-menu__rows {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  /* 列间距放在 dd 的内边距里：合计那一行的分隔线要连续跨过两列 */
+  gap: 6px 0;
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.ptv2-usage-menu__rows dt {
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+.ptv2-usage-menu__rows dd {
+  margin: 0;
+  padding-left: 20px;
+  text-align: right;
+  font-weight: 600;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 缓存命中 / 思考是上一行的子项 */
+.ptv2-usage-menu__rows dt.ptv2-usage-menu__sub {
+  padding-left: 12px;
+}
+
+.ptv2-usage-menu__rows dd.ptv2-usage-menu__missing {
+  font-weight: 400;
+  color: var(--color-text-muted);
+}
+
+.ptv2-usage-menu__rows .ptv2-usage-menu__total {
+  padding-top: 6px;
+  border-top: 1px dashed color-mix(in srgb, var(--color-text-muted) 35%, transparent);
+}
+
+.ptv2-usage-menu__note {
+  margin: 0;
+  max-width: 260px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--color-text-muted);
+}
+
+/* 点击后固定展开（触屏/单击用户）：与 hover 展开同态 */
+.ptv2-backend-menu--open .ptv2-backend-menu__dropdown {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: auto;
+}
+
+.ptv2-backend-menu__dropdown::before {
+  content: "";
+  position: absolute;
+  top: -5px;
+  left: 24px;
+  width: 10px;
+  height: 10px;
+  background: #fff;
+  border-top: 1px solid rgba(47, 111, 235, 0.22);
+  border-left: 1px solid rgba(47, 111, 235, 0.22);
+  border-radius: 2px 0 0 0;
+  transform: rotate(45deg);
+  pointer-events: none;
+}
+
+/* 选项区限高 + 滚动：行高约 32px + 2px 间距，6 行后出纵向滚动条；横向直接裁掉，只留省略号 */
+.ptv2-backend-menu__list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 204px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.ptv2-backend-menu__item {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--color-text);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    color 140ms ease,
+    transform 140ms ease,
+    border-color 140ms ease;
+}
+
+.ptv2-backend-menu__item:hover {
+  background: linear-gradient(90deg, rgba(47, 111, 235, 0.14), rgba(47, 111, 235, 0.04));
+  border-color: rgba(47, 111, 235, 0.22);
+  color: var(--color-primary);
+  transform: translateX(2px);
+}
+
+.ptv2-backend-menu__item:active {
+  transform: translateX(2px) scale(0.98);
+}
+
+.ptv2-backend-menu__item:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 1px;
+}
+
+.ptv2-backend-menu__item .icon {
+  flex-shrink: 0;
+}
+
+.ptv2-backend-menu__item-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ptv2-backend-menu__item-model {
+  font-weight: 500;
+  color: var(--color-text-muted);
+}
+
+.ptv2-backend-menu__item--active {
+  background: rgba(47, 111, 235, 0.1);
+  border-color: rgba(47, 111, 235, 0.25);
+  color: var(--color-primary);
+}
+
+.ptv2-backend-menu__divider {
+  height: 1px;
+  margin: 4px 6px;
+  background: rgba(47, 111, 235, 0.16);
+}
+
 .ptv2-cockpit__ribbon-spacer {
   flex: 1;
 }
@@ -786,7 +1022,7 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   min-width: 0;
 }
 
@@ -902,6 +1138,8 @@
 /* Dropdown items: consistent blue-tinted ghost buttons */
 .ptv2-cockpit__folder-inline .project-translate-page__folder-menu-item {
   justify-content: flex-start;
+  /* 比全局 .button 的 6px 再宽一档：菜单行读起来更松 */
+  gap: 8px;
   width: 100%;
   padding: 8px 10px;
   min-height: 32px;
@@ -961,6 +1199,9 @@
   flex-direction: column;
   min-height: 0;
   min-width: 0;
+  /* Custom backgrounds restore one blur per panel in custom-background.css. */
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 .ptv2-main__success > .panel > .panel__body,
@@ -1101,23 +1342,20 @@
   display: flex;
   flex-direction: column;
   animation: ptv2-tabpane-in 280ms cubic-bezier(0.22, 1, 0.36, 1);
-  will-change: transform, opacity;
 }
 
 @keyframes ptv2-tabpane-in {
   0% {
     transform: translateY(6px);
     opacity: 0;
-    filter: blur(1px);
   }
   100% {
     transform: translateY(0);
     opacity: 1;
-    filter: blur(0);
   }
 }
 
-@media (prefers-reduced-motion: no-preference) and (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) {
   .ptv2-tab--active::after,
   .ptv2-tab--active .ptv2-tab__label,
   .ptv2-tabpanel__pane {
@@ -1129,23 +1367,262 @@
 .ptv2-filelist {
   flex: 1;
   min-height: 0;
-  display: grid;
-  gap: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   overflow-y: auto;
-  padding-right: 4px;
+  /* 上下留 2px：卡片 hover 时的阴影别被滚动容器裁掉 */
+  padding: 2px 4px 2px 0;
 }
 
+/* 每个文件一张浅色小卡，与「重翻词条」列表、顶部驾驶舱同一套语言：淡蓝描边、白→浅蓝渐变、
+   hover 时描边加深。有请求在跑的行在左缘亮一条蓝色细条（与驾驶舱进度条同色），
+   已完成的行整体退一档，让视线落在还在动的行上。 */
 .ptv2-filelist .file-progress-row {
-  padding: 4px 0;
-  border-bottom: 1px solid rgba(191, 208, 226, 0.5);
+  position: relative;
+  flex-shrink: 0;
+  padding: 7px 4px 7px 10px;
+  border: 1px solid rgba(191, 208, 226, 0.55);
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(247, 251, 255, 0.8));
+  transition: border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
 }
 
-.ptv2-filelist .file-progress-row:last-child {
-  border-bottom: none;
+.ptv2-filelist .file-progress-row:hover {
+  border-color: rgba(47, 111, 235, 0.32);
+  background: linear-gradient(180deg, #ffffff, rgba(238, 244, 255, 0.92));
+  box-shadow: 0 4px 12px -8px rgba(47, 111, 235, 0.35);
 }
 
-.ptv2-filelist .progress-bar {
-  height: 5px;
+.ptv2-filelist .file-progress-row::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: linear-gradient(180deg, #2f6feb, #38bdf8);
+  opacity: 0;
+  transform: scaleY(0.4);
+  transition: opacity 240ms ease, transform 240ms cubic-bezier(0.22, 0.85, 0.35, 1);
+}
+
+.ptv2-filelist .file-progress-row--live {
+  border-color: rgba(47, 111, 235, 0.3);
+  background:
+    radial-gradient(circle at 100% 0%, rgba(47, 111, 235, 0.08), transparent 60%),
+    linear-gradient(180deg, #ffffff, rgba(244, 248, 255, 0.95));
+}
+
+.ptv2-filelist .file-progress-row--live::before {
+  opacity: 1;
+  transform: scaleY(1);
+}
+
+.ptv2-filelist .file-progress-row--done .file-progress-row__name {
+  color: var(--color-text-muted);
+}
+
+.ptv2-filelist .file-progress-row__info {
+  margin-bottom: 2px;
+}
+
+.ptv2-filelist .file-progress-row__name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 状态文字对齐驾驶舱的小标签：10px 粗体大字距 */
+.ptv2-filelist .file-progress-row__state {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
+
+.ptv2-filelist .file-progress-row--live .file-progress-row__state {
+  color: var(--color-primary);
+}
+
+/* 计数与驾驶舱大数字同一套等宽数字 */
+.ptv2-filelist .file-progress-row__count {
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ptv2-filelist .file-progress-row__meter {
+  padding-right: 6px;
+}
+
+/* 筛选按钮：原样式是深色底＋青色，放在浅色页面里很突兀；改成与标题旁文件夹按钮一致的浅蓝幽灵按钮 */
+.ptv2-filelist .file-progress-row__filter-toggle {
+  border-color: rgba(47, 111, 235, 0.22);
+  background: rgba(255, 255, 255, 0.8);
+  color: rgba(47, 111, 235, 0.7);
+}
+
+.ptv2-filelist .file-progress-row__filter-toggle:hover,
+.ptv2-filelist .file-progress-row__filter-toggle:focus-visible {
+  border-color: rgba(47, 111, 235, 0.42);
+  background: rgba(47, 111, 235, 0.12);
+  color: var(--color-primary);
+}
+
+.ptv2-filelist .file-progress-row__filter-toggle--active {
+  border-color: rgba(47, 111, 235, 0.5);
+  background: rgba(47, 111, 235, 0.14);
+  color: var(--color-primary);
+}
+
+.ptv2-filelist .file-progress-row__filter-check {
+  border-color: #ffffff;
+  background: var(--color-primary);
+  color: #ffffff;
+}
+
+.ptv2-filelist .file-progress-row__filter-tooltip {
+  background: rgba(255, 255, 255, 0.98);
+  border-color: rgba(47, 111, 235, 0.22);
+  color: var(--color-text);
+  box-shadow: 0 8px 20px -10px rgba(47, 111, 235, 0.35);
+}
+
+:root[data-theme='dark'] .ptv2-filelist .file-progress-row__filter-tooltip {
+  background: rgba(15, 23, 42, 0.96);
+  border-color: rgba(111, 160, 255, 0.28);
+  color: #e2e8f0;
+}
+
+:root[data-theme='dark'] .ptv2-filelist .file-progress-row {
+  border-color: rgba(65, 83, 111, 0.68);
+  background: rgba(23, 33, 48, 0.8);
+}
+
+:root[data-theme='dark'] .ptv2-filelist .file-progress-row:hover {
+  border-color: rgba(111, 160, 255, 0.45);
+  background: rgba(29, 43, 63, 0.9);
+  box-shadow: none;
+}
+
+:root[data-theme='dark'] .ptv2-filelist .file-progress-row--live {
+  border-color: rgba(111, 160, 255, 0.4);
+  background:
+    radial-gradient(circle at 100% 0%, rgba(67, 129, 255, 0.16), transparent 60%),
+    rgba(26, 38, 56, 0.9);
+}
+
+:root[data-theme='dark'] .ptv2-filelist .file-progress-row__filter-toggle {
+  border-color: rgba(111, 160, 255, 0.34);
+  background: rgba(28, 40, 58, 0.78);
+  color: #8fb6ff;
+}
+
+:root[data-theme='dark'] .ptv2-filelist .file-progress-row__filter-toggle:hover,
+:root[data-theme='dark'] .ptv2-filelist .file-progress-row__filter-toggle:focus-visible,
+:root[data-theme='dark'] .ptv2-filelist .file-progress-row__filter-toggle--active {
+  border-color: rgba(111, 160, 255, 0.6);
+  background: rgba(111, 160, 255, 0.18);
+  color: #a8c3ff;
+}
+
+:root[data-theme='dark'] .ptv2-filelist .file-progress-row__filter-check {
+  border-color: rgba(18, 27, 40, 0.96);
+}
+
+/* ── 「文件进度」里的状态灯：这一行此刻有请求在跑，跟在状态文字前面 ──
+   请求中=琥珀、思考中=蓝、翻译中=绿、重试中=红。以「亮度＋光晕」一起呼吸来表现速度：点最亮时
+   满色＋一圈收拢的光晕，最暗时压到 0.55＋光晕铺开变淡；呼吸快慢由脚本经 Web Animations 的
+   playbackRate 调（改 animation-duration 会让正在跑的动画跳一下）。
+   幅度必须给足：之前只有 1px→4px、峰值透明度 0.06，白底上等于没有，点又是常亮的，
+   整盏灯看着就是个静止的圆点，快慢完全看不出来。
+   点的明暗只做温和变化（1→0.55，再暗颜色就发灰、认不出阶段了），落差主要交给光晕。注意 opacity
+   是整盏灯一起生效的，光晕最终的浓淡 = 这里写的 alpha × 该帧的 opacity，所以把点调亮/调暗时
+   要顺手把光晕的 alpha 反向补一下，否则一改整盏灯的动静就没了。
+   颜色不用 --color-*-soft：那几个是给底色用的浅色，浅色主题下光晕几乎看不见。
+   与本页其它动效一样不跟随系统的「减少动态效果」（见 lib/motion.ts）。 */
+
+/* 状态灯与状态文字。以前这里钉了 5.5em 最小宽度，是为了灯一亮一灭时别把右边那条横杠
+   推来推去；横杠已经换成文件名行的圆环，不再有「谁被推开」的问题，就不钉了 */
+.file-progress-row__state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.file-progress-row__led {
+  position: relative;
+  --led-rgb: 245 158 11;
+  width: 7px;
+  height: 7px;
+  /* 给光晕留位置：文件列表是滚动容器、左边没有内边距，贴边的光晕会被裁掉一半 */
+  margin-left: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: rgb(var(--led-rgb));
+  box-shadow: 0 0 0 2px rgb(var(--led-rgb) / 0.3);
+  animation: file-progress-led-halo 1.2s ease-in-out infinite;
+  transition: background-color 240ms ease, box-shadow 240ms ease;
+}
+
+/* 状态灯的阶段色：请求中=琥珀（基础色）／思考中=蓝／翻译中=绿／重试中=红 */
+.file-progress-row__led--thinking {
+  --led-rgb: 59 130 246;
+}
+
+.file-progress-row__led--writing {
+  --led-rgb: 34 197 94;
+}
+
+.file-progress-row__led--retrying {
+  --led-rgb: 239 68 68;
+}
+
+/* ── 圆环进度：这一行文件的完成度，跟在计数后面（代替原来铺满一行的横杠）──
+   环走的是「进度」语义，不跟阶段换色：在跑=蓝（请求中/思考中/翻译中都算「正在翻这一行」）、
+   重试中=红、已完成=绿、没在跑=灰。阶段语义交给旁边那颗会呼吸的状态灯；环要是也跟阶段换色，
+   批与批之间就会在琥珀/蓝/绿之间闪。
+   ⚠️ 修饰类必须写在基础类**之后**：两者特异性相同（都是单个类），写在前面会被基础类统统盖掉。
+   已完成压暗一档：一屏里完成的行一大片，不压暗整列都在发光，反而看不出哪一行在跑。 */
+.file-progress-row__ring {
+  --led-rgb: 148 163 184;
+  flex-shrink: 0;
+}
+
+.file-progress-row__ring--active {
+  --led-rgb: 59 130 246;
+}
+
+.file-progress-row__ring--retrying {
+  --led-rgb: 239 68 68;
+}
+
+.file-progress-row__ring--done {
+  --led-rgb: 34 197 94;
+  opacity: 0.6;
+}
+
+.file-progress-row__ring-track {
+  stroke: rgba(148, 163, 184, 0.3);
+}
+
+.file-progress-row__ring-arc {
+  stroke: rgb(var(--led-rgb));
+  /* 过渡弧长与颜色：每秒轮询的百分比变化跟得上，也不跳 */
+  transition: stroke-dashoffset 320ms ease, stroke 240ms ease;
+}
+
+/* 呼吸只动 opacity（走 GPU 合成线程），避免并发多文件时每帧对 box-shadow 进行光栅化重绘 */
+@keyframes file-progress-led-halo {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.42;
+  }
 }
 
 .ptv2-eventlist {
@@ -1345,6 +1822,9 @@
     flex-direction: column;
     align-items: stretch;
   }
+  .ptv2-cockpit__statusline {
+    flex-wrap: wrap;
+  }
   .ptv2-cockpit__gauge {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
@@ -1362,13 +1842,9 @@
   }
 }
 
-@media (prefers-reduced-motion: no-preference) and (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) {
   .ptv2-cockpit__orb,
-  .ptv2-cockpit--live .ptv2-gauge__bar-fill,
-  .ptv2-cockpit--live .ptv2-gauge__bar-shine,
-  .ptv2-cockpit--live .ptv2-cockpit__tick-dot,
-  .ptv2-cockpit--live .button.ptv2-launch-btn--stop::after,
-  .ptv2-cockpit--live .ptv2-stat--primary .ptv2-stat__value {
+  .ptv2-cockpit--live .ptv2-gauge__bar-fill {
     animation: none;
   }
 }
@@ -1403,6 +1879,21 @@
 }
 
 :root[data-theme='dark'] .ptv2-cockpit__folder-inline .project-translate-page__folder-menu-dropdown::before {
+  border-top-color: rgba(111, 160, 255, 0.28);
+  border-left-color: rgba(111, 160, 255, 0.28);
+}
+
+:root[data-theme='dark'] .ptv2-backend-menu__dropdown {
+  border-color: rgba(111, 160, 255, 0.28);
+  background: linear-gradient(180deg, rgba(28, 40, 58, 0.98), rgba(18, 27, 40, 0.96));
+  box-shadow:
+    0 20px 40px -12px rgba(12, 18, 28, 0.62),
+    0 8px 16px -8px rgba(4, 8, 14, 0.44),
+    inset 0 1px 0 rgba(141, 170, 212, 0.16);
+}
+
+:root[data-theme='dark'] .ptv2-backend-menu__dropdown::before {
+  background: #1c283a;
   border-top-color: rgba(111, 160, 255, 0.28);
   border-left-color: rgba(111, 160, 255, 0.28);
 }

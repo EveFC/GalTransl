@@ -1,8 +1,9 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from GalTransl.Backend.BaseTranslate import BaseTranslate
+from GalTransl.Backend.BaseTranslate import BaseTranslate, _CHATBOT_STATE
 from GalTransl.Backend.ForGalJsonTranslate import ForGalJsonTranslate
 from GalTransl.Backend.Prompts import FORGAL_JSON_TRANS_PROMPT
 from GalTransl.CSentense import CSentense
@@ -17,6 +18,26 @@ class DummyBar:
 
 
 class TranslateRefactorRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chatbot_state_isolated_between_concurrent_workers(self) -> None:
+        dummy = SimpleNamespace(
+            _last_chatbot_was_stream=False,
+            _last_chatbot_model_name="fallback-model",
+        )
+
+        async def read_state(state):
+            BaseTranslate._clear_chatbot_state()
+            _CHATBOT_STATE.set(state)
+            await asyncio.sleep(0)
+            return BaseTranslate._get_chatbot_state(dummy)
+
+        first, second = await asyncio.gather(
+            read_state((True, "stream-model")),
+            read_state((False, "batch-model")),
+        )
+
+        self.assertEqual(first, (True, "stream-model"))
+        self.assertEqual(second, (False, "batch-model"))
+
     async def test_ask_chatbot_honours_max_retry_count(self) -> None:
         class DummyToken:
             model_name = "demo-model"
@@ -41,6 +62,8 @@ class TranslateRefactorRegressionTests(unittest.IsolatedAsyncioTestCase):
             tokenStrategy="random",
             api_timeout=1,
             apiErrorWait=0,
+            # 替身只挂几个属性的老做法：ask_chatbot 会用到它们，缺一个就 AttributeError
+            _coerce_positive_int=BaseTranslate._coerce_positive_int,
             pj_config=SimpleNamespace(
                 bar=DummyBar(),
                 active_workers=1,
@@ -62,6 +85,101 @@ class TranslateRefactorRegressionTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(dummy_completions.calls, 2)
+
+    async def test_ask_chatbot_uses_instance_default_without_consuming_budget_from_base_offset(self) -> None:
+        class DummyToken:
+            model_name = "demo-model"
+            domain = "https://example.com"
+            stream = False
+
+            def maskToken(self) -> str:
+                return "sk-***"
+
+        class DummyCompletions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def create(self, **kwargs):
+                self.calls += 1
+                raise TimeoutError("request timed out")
+
+        dummy_completions = DummyCompletions()
+        dummy_client = SimpleNamespace(chat=SimpleNamespace(completions=dummy_completions))
+        dummy = SimpleNamespace(
+            client_list=[(dummy_client, DummyToken())],
+            tokenStrategy="random",
+            api_timeout=1,
+            apiErrorWait=0,
+            max_api_retries=2,
+            _coerce_positive_int=BaseTranslate._coerce_positive_int,
+            pj_config=SimpleNamespace(
+                bar=DummyBar(),
+                active_workers=1,
+                stop_event=None,
+                getProjectDir=lambda: "",
+            ),
+            _is_stop_requested=lambda _: False,
+            _wait_for_global_rpm_slot=AsyncMock(return_value=None),
+            _interruptible_sleep=AsyncMock(return_value=None),
+            _record_request_health=lambda *args, **kwargs: None,
+        )
+
+        with self.assertRaises(RuntimeError):
+            await BaseTranslate.ask_chatbot(
+                dummy,
+                prompt="hello",
+                system="system",
+                base_try_count=9,
+            )
+
+        self.assertEqual(dummy_completions.calls, 2)
+
+    async def test_ask_chatbot_recycles_client_after_transport_failures(self) -> None:
+        class DummyToken:
+            model_name = "demo-model"
+            domain = "https://example.com"
+            stream = False
+
+            def maskToken(self) -> str:
+                return "sk-***"
+
+        class DummyCompletions:
+            async def create(self, **kwargs):
+                raise TimeoutError("request timed out")
+
+        dummy_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=DummyCompletions())
+        )
+        recycle = AsyncMock(return_value=None)
+        dummy = SimpleNamespace(
+            client_list=[(dummy_client, DummyToken())],
+            tokenStrategy="random",
+            api_timeout=1,
+            apiErrorWait=0,
+            _client_failure_counts={},
+            _recycle_failed_client=recycle,
+            _coerce_positive_int=BaseTranslate._coerce_positive_int,
+            pj_config=SimpleNamespace(
+                bar=DummyBar(),
+                active_workers=1,
+                stop_event=None,
+                getProjectDir=lambda: "",
+            ),
+            _is_stop_requested=lambda _: False,
+            _wait_for_global_rpm_slot=AsyncMock(return_value=None),
+            _interruptible_sleep=AsyncMock(return_value=None),
+            _record_request_health=lambda *args, **kwargs: None,
+        )
+
+        with self.assertRaises(RuntimeError):
+            await BaseTranslate.ask_chatbot(
+                dummy,
+                prompt="hello",
+                system="system",
+                max_retry_count=3,
+            )
+
+        recycle.assert_awaited_once_with(dummy_client, dummy.client_list[0][1])
 
     async def test_ask_chatbot_non_stream_none_content_retries_and_fails(self) -> None:
         class DummyToken:
@@ -90,6 +208,8 @@ class TranslateRefactorRegressionTests(unittest.IsolatedAsyncioTestCase):
             tokenStrategy="random",
             api_timeout=1,
             apiErrorWait=0,
+            # 替身只挂几个属性的老做法：ask_chatbot 会用到它们，缺一个就 AttributeError
+            _coerce_positive_int=BaseTranslate._coerce_positive_int,
             pj_config=SimpleNamespace(
                 bar=DummyBar(),
                 active_workers=1,
@@ -185,6 +305,7 @@ class TranslateRefactorRegressionTests(unittest.IsolatedAsyncioTestCase):
                 non_interactive=True,
                 getProjectDir=lambda: "",
             ),
+            _coerce_positive_int=staticmethod(BaseTranslate._coerce_positive_int),
             _is_stop_requested=lambda _: False,
             _wait_for_global_rpm_slot=AsyncMock(return_value=None),
             _interruptible_sleep=AsyncMock(return_value=None),
@@ -220,12 +341,16 @@ class TranslateRefactorRegressionTests(unittest.IsolatedAsyncioTestCase):
         translator.target_lang = "English"
         translator.source_lang = "Japanese"
         translator.smartRetry = False
+        # translate() 会把 self.max_api_retries 作为 max_retry_count 传下去；这里用 __new__
+        # 跳过了 __init__，属性得自己补（正常实例由 BaseTranslate.__init__ 赋，默认 6）
+        translator.max_api_retries = 6
         translator._SIGCHARS = "a"
         translator._last_chatbot_was_stream = False
         translator._last_chatbot_model_name = ""
         translator.restore_context = lambda trans_list, num_pre_request, filename="": None
         translator._check_stop_requested = lambda: None
         translator._record_runtime_success = lambda filename, trans: None
+        translator.max_api_retries = 6
 
         async def fake_ask_chatbot(**kwargs):
             translator._last_chatbot_model_name = "stream-model"
@@ -252,11 +377,20 @@ class TranslateRefactorRegressionTests(unittest.IsolatedAsyncioTestCase):
         class DummyTranslator:
             skipH = False
             save_steps = 999
+            dynamic_num_per_request = False
+            # _batch_translate_common 会按「动态句数」折算每批句数，失败兜底还要拼 problem 文案：
+            # 替身补齐它用到的这几个辅助方法（staticmethod 要重新包一层，直接取会绑成实例方法）
+            _coerce_positive_int = staticmethod(BaseTranslate._coerce_positive_int)
+            _merge_problem_message = staticmethod(BaseTranslate._merge_problem_message)
+            _get_effective_num_per_request = BaseTranslate._get_effective_num_per_request
 
             def __init__(self) -> None:
                 self.pj_config = SimpleNamespace(bar=DummyBar(), stop_event=None)
 
             def _check_stop_requested(self) -> None:
+                return None
+
+            def _update_dynamic_num_per_request(self, *args, **kwargs) -> None:
                 return None
 
             def _record_runtime_success(self, filename: str, trans: CSentense) -> None:
@@ -283,6 +417,49 @@ class TranslateRefactorRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(result), 1)
         self.assertEqual(recorded, [])
+
+    async def test_batch_translate_common_marks_api_exception_as_failed_batch(self) -> None:
+        class DummyTranslator:
+            skipH = False
+            save_steps = 999
+            dynamic_num_per_request = False
+            # _batch_translate_common 会按「动态句数」折算每批句数，失败兜底还要拼 problem 文案：
+            # 替身补齐它用到的这几个辅助方法（staticmethod 要重新包一层，直接取会绑成实例方法）
+            _coerce_positive_int = staticmethod(BaseTranslate._coerce_positive_int)
+            _merge_problem_message = staticmethod(BaseTranslate._merge_problem_message)
+            _get_effective_num_per_request = BaseTranslate._get_effective_num_per_request
+
+            def __init__(self) -> None:
+                self.pj_config = SimpleNamespace(bar=DummyBar(), stop_event=None)
+
+            def _check_stop_requested(self) -> None:
+                return None
+
+            _build_idx_tip = staticmethod(BaseTranslate._build_idx_tip)
+            _append_parse_failure_fallback_results = BaseTranslate._append_parse_failure_fallback_results
+
+            def _update_dynamic_num_per_request(self, *args, **kwargs) -> None:
+                return None
+
+            def _record_runtime_success(self, filename: str, trans: CSentense) -> None:
+                return None
+
+            async def translate(self, trans_list_split, dic_prompt, proofread=False, filename=""):
+                raise RuntimeError("attempt limit reached")
+
+        trans = CSentense("line-1", index=1)
+        translator = DummyTranslator()
+        result = await BaseTranslate._batch_translate_common(
+            translator,
+            filename="demo.json",
+            cache_file_path="demo_cache.json",
+            translist_unhit=[trans],
+            num_pre_request=1,
+            proofread=False,
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0].pre_dst.startswith("(Failed)"))
 
     def test_forgal_json_prompt_does_not_contain_literal_output_recipe_backslash_n(self) -> None:
         self.assertNotIn(

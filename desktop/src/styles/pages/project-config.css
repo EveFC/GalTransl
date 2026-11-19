@@ -40,6 +40,17 @@
   overflow-y: auto;
 }
 
+/* 「配置有未保存的修改」的小圆点（原来是圆点字符） */
+.project-config-page__dirty-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: var(--color-danger, #e53e3e);
+  vertical-align: middle;
+}
+
 .project-config-page__section-btn {
   display: flex;
   align-items: center;
@@ -106,6 +117,25 @@
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  container: project-config / inline-size;
+}
+
+.project-config-page__main .panel {
+  padding: 20px 24px;
+  border-radius: 12px;
+}
+
+.project-config-page__main .panel__header {
+  margin-bottom: 20px;
+}
+
+.project-config-page__main .panel__header h2 {
+  font-size: 18px;
+  margin-bottom: 6px;
+}
+
+.project-config-page__main .panel__header p {
+  font-size: 13px;
 }
 
 .project-config-page__main > .section-fade-in {
@@ -166,18 +196,37 @@
 
 .config-field-row {
   display: grid;
-  grid-template-columns: 160px 1fr;
-  gap: var(--space-2) var(--space-4);
-  align-items: start;
-  padding: var(--space-2) 0;
+  grid-template-columns: minmax(0, 1fr) 240px;
+  gap: 24px;
+  align-items: center;
+  padding: 14px 0;
 }
 
-.config-field-row--advanced {
-  opacity: 0.85;
+.config-field-row__info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
 }
 
-.config-field-row--primary {
-  /* primary fields are full opacity by default */
+.config-field-row--switch .config-field-row__label {
+  cursor: pointer;
+}
+
+.config-field-row--switch .config-field-row__input {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-height: 38px;
+}
+
+/* 设置项之间的分割线：每行上方一条，组内第一行除外 */
+.config-field-group__fields > .config-field-row {
+  border-top: 1px solid var(--color-line);
+}
+
+.config-field-group__fields > .config-field-row:first-child {
+  border-top: none;
 }
 
 .config-field-row__label {
@@ -185,38 +234,38 @@
   font-weight: 500;
   color: var(--color-text);
   line-height: 1.5;
-  padding-top: 6px;
-  align-self: start;
 }
 
 .config-field-row__input {
   min-width: 0;
+  width: 100%;
 }
 
-.config-field-row__input input,
+.config-field-row__input > input,
 .config-field-row__input select,
 .config-field-row__input .custom-select {
   width: 100%;
-  max-width: 420px;
 }
 
-.config-field-row__input input,
-.config-field-row__input select {
-  min-height: 48px;
-  padding: 0 var(--space-4);
+.config-field-row__input > input,
+.config-field-row__input select,
+.config-field-row__input .custom-select__trigger {
+  height: 38px;
+  min-height: 38px;
+  padding: 0 12px;
   border: 1px solid var(--color-line);
-  border-radius: var(--radius-control);
+  border-radius: 8px;
   background-color: var(--color-surface-strong);
   color: var(--color-text);
+  font-size: 13px;
   transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
 }
 
 .config-field-row__input textarea {
   width: 100%;
-  max-width: 420px;
   padding: 11px 14px;
   border: 1px solid rgba(191, 208, 226, 0.92);
-  border-radius: calc(var(--radius-control) + 2px);
+  border-radius: 8px;
   background: var(--color-surface-strong);
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
   color: var(--color-text);
@@ -275,12 +324,10 @@
 }
 
 .config-field-row__hint {
-  grid-column: 1 / -1;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--color-text-muted);
-  margin-top: 2px;
-  font-family: "Cascadia Code", "Consolas", monospace;
-  line-height: 1.4;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
 }
 
 /* ── Config Field Group ── */
@@ -296,12 +343,9 @@
 .config-field-group__title {
   font-size: 12px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
   color: var(--color-text-muted);
-  margin-bottom: var(--space-3);
-  padding-bottom: var(--space-2);
-  border-bottom: 1px solid var(--color-line);
+  margin-bottom: 2px;
 }
 
 .config-field-group--advanced .config-field-group__title {
@@ -312,20 +356,18 @@
 .config-field-group__fields {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
+  gap: 0;
 }
 
 /* ── Advanced Details (collapsible) ── */
 
 .config-advanced-details {
-  margin-top: var(--space-5);
-  border: 1px solid var(--color-line);
-  border-radius: var(--radius-card);
-  background: var(--color-surface);
+  margin-top: 8px;
+  border-top: 1px solid var(--color-line);
 }
 
 .config-advanced-details__summary {
-  padding: var(--space-3) var(--space-4);
+  padding: 14px 0;
   cursor: pointer;
   font-size: 13px;
   font-weight: 500;
@@ -343,17 +385,52 @@
 }
 
 .config-advanced-details__summary::before {
-  content: '▸';
-  font-size: 11px;
+  /* 折角用 Icon 集的图形（mask）而不是三角字符；展开时照样转 90° */
+  content: '';
+  flex: none;
+  width: 11px;
+  height: 11px;
+  background-color: currentColor;
+  -webkit-mask-image: var(--icon-chevron-right);
+  mask-image: var(--icon-chevron-right);
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
   transition: transform var(--transition-fast);
 }
 
-.config-advanced-details[open] .config-advanced-details__summary::before {
+.config-advanced-details[data-open='true'] .config-advanced-details__summary::before {
   transform: rotate(90deg);
 }
 
 .config-advanced-details .config-field-group {
-  padding: 0 var(--space-4) var(--space-4);
+  padding: 0 0 8px;
+}
+
+@container project-config (max-width: 560px) {
+  .config-field-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .config-field-row--switch {
+    grid-template-columns: minmax(0, 1fr) 40px;
+    gap: 16px;
+  }
+
+  .project-config-page__main .panel {
+    padding: 16px;
+  }
+}
+
+@media (max-width: 1100px) {
+  .project-config-page__content {
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: 16px;
+  }
 }
 
 /* ── Problem Analyze Section ── */
@@ -386,6 +463,7 @@
 
 .problem-analyze-section__toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-3);
@@ -401,6 +479,7 @@
 
 .problem-analyze-section__toolbar-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-2);
 }
 
@@ -431,7 +510,7 @@
   padding: 0;
   margin: 0;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
   gap: var(--space-2);
 }
 
@@ -465,6 +544,15 @@
   border-color: rgba(234, 179, 8, 0.55);
   background: rgba(234, 179, 8, 0.05);
   box-shadow: 0 0 0 1px rgba(234, 179, 8, 0.16) inset;
+}
+
+.problem-analyze-section__item--disabled {
+  opacity: 0.55;
+}
+
+.problem-analyze-section__item--disabled .problem-analyze-section__label,
+.problem-analyze-section__checkbox:disabled {
+  cursor: not-allowed;
 }
 
 .problem-analyze-section__label {
@@ -551,6 +639,91 @@
 
 .problem-analyze-section__desc--warn {
   color: #a16207;
+}
+
+.plugin-check-item__problems {
+  margin-top: var(--space-3);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-line);
+  column-gap: var(--space-5);
+}
+
+.problem-analyze-section .plugin-check-item__problems .problem-analyze-section__item {
+  min-width: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.plugin-check-item__problems .problem-analyze-section__label {
+  padding: var(--space-2) 0;
+  align-items: flex-start;
+}
+
+.plugin-check-item__problems .problem-analyze-section__checkbox {
+  margin-top: 1px;
+}
+
+.problem-analyze-section .plugin-check-item__name,
+.problem-analyze-section .plugin-check-item__module,
+.problem-analyze-section__item-body {
+  overflow-wrap: anywhere;
+}
+
+.problem-analyze-section .plugin-check-item__header {
+  flex-wrap: wrap;
+}
+
+.problem-analyze-section__threshold {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-line);
+}
+
+.problem-analyze-section__threshold-label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.problem-analyze-section__threshold-label > span {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.problem-analyze-section__threshold-input {
+  width: 72px;
+  min-height: 32px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-control);
+  font-size: 13px;
+  color: var(--color-text);
+  background: var(--color-neutral-soft, transparent);
+}
+
+.problem-analyze-section__threshold-input:focus {
+  outline: none;
+  border-color: var(--color-primary, var(--color-line));
+}
+
+.problem-analyze-section__threshold-input--error {
+  border-color: #c53030;
+}
+
+.problem-analyze-section__threshold-desc {
+  font-size: 11.5px;
+  color: var(--color-text-muted);
+  line-height: 1.5;
+}
+
+.problem-analyze-section__threshold-error {
+  font-size: 11.5px;
+  color: #c53030;
 }
 
 /* ── Retransl Key Section ── */
@@ -718,6 +891,178 @@
   font-size: 12px;
 }
 
+/* 编辑态：输入框 + 校验错误占同一列（错误另起一行，不挤乱右侧按钮） */
+.retransl-key-section__edit {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.retransl-key-section__hint {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  line-height: 1.6;
+}
+
+.retransl-key-section__error {
+  font-size: 12px;
+  color: #c53030;
+  line-height: 1.5;
+}
+
+/* ── 问题过滤（过滤关键字 / 白名单两个 tab） ── */
+
+.problem-filter-tabs {
+  display: flex;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+  flex-shrink: 0;
+}
+
+.problem-filter-tab {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--color-line);
+  background: var(--color-surface-strong);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--color-text-muted);
+  transition: all var(--transition-fast);
+}
+
+.problem-filter-tab:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.problem-filter-tab--active {
+  background: var(--color-primary-soft);
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+.problem-filter-tab__count {
+  font-size: 12px;
+  background: var(--color-neutral-soft);
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.problem-filter-tab--active .problem-filter-tab__count {
+  background: var(--color-primary);
+  color: white;
+}
+
+.problem-filter-section__group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.problem-filter-section__desc {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--color-text-muted);
+}
+
+/* ── 项目翻译规范（配置编辑页的独立区块） ──
+   它是项目目录里的一个文件、不是配置项，所以自带保存按钮，也不参与
+   「保存配置」那条 YAML 的 dirty 状态。 */
+
+.project-guideline-section__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.project-guideline-section__hint {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12.5px;
+  color: var(--color-text-muted);
+}
+
+.project-guideline-section__hint code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--color-neutral-soft);
+  color: var(--color-text);
+  font-size: 12px;
+}
+
+/* 「文件还没建」的提示条 */
+.project-guideline-section__badge {
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(234, 179, 8, 0.16);
+  color: var(--color-warning, #b45309);
+  font-size: 11px;
+}
+
+.project-guideline-section__editor {
+  width: 100%;
+  min-height: 420px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-control);
+  background: var(--color-surface-strong);
+  color: var(--color-text);
+  /* 规范是 markdown 手写文本，等宽字体对齐缩进/列表更好读 */
+  font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 1.7;
+  resize: vertical;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.project-guideline-section__editor:hover {
+  border-color: rgba(47, 111, 235, 0.28);
+}
+
+.project-guideline-section__editor:focus {
+  outline: none;
+  border-color: rgba(47, 111, 235, 0.65);
+  box-shadow: 0 0 0 4px rgba(47, 111, 235, 0.12);
+}
+
+.project-guideline-section__editor::placeholder {
+  color: rgba(100, 116, 139, 0.88);
+}
+
+.project-guideline-section__foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.project-guideline-section__status {
+  color: var(--color-success, #16a34a);
+}
+
+.project-guideline-section__status.is-dirty {
+  color: var(--color-warning, #b45309);
+}
+
+.project-guideline-section__count {
+  font-variant-numeric: tabular-nums;
+}
+
+.project-guideline-section__tip {
+  margin-left: auto;
+  opacity: 0.8;
+}
+
 /* ── Section Fade-in ── */
 
 .section-fade-in {
@@ -729,6 +1074,12 @@
   to   { opacity: 1; transform: translateY(0); }
 }
 
-@media (prefers-reduced-motion: no-preference) and (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) {
   .section-fade-in { animation: none; }
+}
+.project-config-fields {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
 }

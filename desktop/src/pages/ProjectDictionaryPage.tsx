@@ -1,17 +1,24 @@
+import { UiError, message as uiMessage, t as translate, useMessageState, useUiLanguage } from "../i18n";
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { ProjectPageContext } from '../components/ProjectLayout';
 import { DictionaryManager } from '../components/DictionaryManager';
+import type { DictionaryPreviewTarget } from '../components/ProjectPreviewContext';
 import {
   type ProjectDictionaryManagerResponse,
   createProjectDictionaryFile,
   deleteProjectDictionaryFile,
   fetchProjectDictionaryManager,
+  fetchProjectConfig,
   getSelectedBackendProfileJobPayload,
   saveProjectDictionaryFile,
   submitJob,
-  type DictionaryCategory
+  type DictionaryCategory,
+  BACKEND_PROFILES_CHANGE_EVENT,
+  DEFAULT_BACKEND_PROFILE_CHANGE_EVENT,
+  GENDIC_DEFAULT_BACKEND_PROFILE_CHANGE_EVENT,
 } from '../lib/api';
+import { summarizeGenDicBackendUsage } from '../lib/backendUsage';
 import { normalizeError } from '../lib/errors';
 
 const DICT_POLL_INTERVAL_MS = 3000;
@@ -32,18 +39,62 @@ function buildDictionarySnapshot(data: ProjectDictionaryManagerResponse | null):
 export function ProjectDictionaryPage({
   ctx,
   active = true,
+  focusTarget,
+  onOpenInCache,
 }: {
   ctx: ProjectPageContext;
   active?: boolean;
+  focusTarget?: DictionaryPreviewTarget;
+  onOpenInCache?: (query: string) => void;
 }) {
+  const uiLanguage = useUiLanguage();
   const { projectId, projectDir, configFileName } = ctx;
   const navigate = useNavigate();
 
   const [data, setData] = useState<ProjectDictionaryManagerResponse | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useMessageState<string | null>(null);
   const [isDocumentVisible, setIsDocumentVisible] = useState(() => document.visibilityState === 'visible');
+  const [projectBackendConfig, setProjectBackendConfig] = useState<Record<string, unknown> | null>(null);
   const currentSnapshot = useMemo(() => buildDictionarySnapshot(data), [data]);
+
+  // GenDic 优先使用专属默认；未单独指定时跟随项目翻译器后端。
+  useEffect(() => {
+    if (!active) return;
+    if (!projectId) {
+      setProjectBackendConfig(null);
+      return;
+    }
+    let cancelled = false;
+    fetchProjectConfig(projectId, configFileName || 'config.yaml')
+      .then((res) => {
+        if (cancelled) return;
+        const backendSpecific = res.config?.backendSpecific;
+        setProjectBackendConfig(
+          backendSpecific && typeof backendSpecific === 'object'
+            ? backendSpecific as Record<string, unknown>
+            : null,
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setProjectBackendConfig(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, configFileName, active]);
+
+  const [backendRevision, setBackendRevision] = useState(0);
+  useEffect(() => {
+    const refresh = () => setBackendRevision((revision) => revision + 1);
+    const events = [BACKEND_PROFILES_CHANGE_EVENT, DEFAULT_BACKEND_PROFILE_CHANGE_EVENT, GENDIC_DEFAULT_BACKEND_PROFILE_CHANGE_EVENT, 'storage'];
+    events.forEach((event) => window.addEventListener(event, refresh));
+    return () => events.forEach((event) => window.removeEventListener(event, refresh));
+  }, []);
+  const gendicBackend = useMemo(
+    () => (projectDir ? summarizeGenDicBackendUsage(projectDir, projectBackendConfig) : null),
+    [uiLanguage, projectDir, projectBackendConfig, backendRevision, active],
+  );
 
   const loadData = useCallback(async (options?: { silent?: boolean }) => {
     if (!projectId) return;
@@ -64,7 +115,7 @@ export function ProjectDictionaryPage({
       }
     } catch (err) {
       if (!silent) {
-        setError(normalizeError(err, '加载项目字典失败'));
+        setError(normalizeError(err, uiMessage("projects:projectDictionaryPage.loadData_normalizeError_loadProjectDictionaryFailed")));
       }
     } finally {
       if (!silent) {
@@ -135,15 +186,16 @@ export function ProjectDictionaryPage({
 
   return (
     <DictionaryManager
-      title="项目字典"
-      description="仅管理项目目录下的字典文件，支持卡片编辑与纯文本编辑。"
+      title={translate("projects:projectDictionaryPage.projectDictionaryPage_title_projectDictionary")}
+      description={translate("projects:projectDictionaryPage.projectDictionaryPage_description_projectDirectoryDictionaryFileGPTDictionaryModel")}
       data={data}
+      focusTarget={focusTarget}
       loading={loading}
       error={error}
       onReload={loadData}
       onCreateFile={async (category: DictionaryCategory, filename: string) => {
         if (!projectId) {
-          throw new Error('projectId is required');
+          throw new UiError(uiMessage('errors:projects.projectRequired'));
         }
         const result = await createProjectDictionaryFile(projectId, {
           config_file_name: configFileName,
@@ -165,9 +217,20 @@ export function ProjectDictionaryPage({
           file_key: fileKey,
           delete_file: true });
       }}
+      gendicBackend={gendicBackend}
+      // 条目行的「→」：拿着这个原文词去「浏览文本」搜它出现在哪。
+      // 带一个 nonce（n）：同一个词连点两次时 URL 不变，缓存页拿不到新事件（那边按 n 去重）
+      onOpenInCache={(sourceWord) => {
+        if (!projectId || !sourceWord) return;
+        if (onOpenInCache) {
+          onOpenInCache(sourceWord);
+          return;
+        }
+        navigate(`/project/${projectId}/cache?q=${encodeURIComponent(sourceWord)}&n=${Date.now()}`);
+      }}
       onGenerateGptDict={async () => {
         if (!projectId || !projectDir) {
-          throw new Error('项目信息缺失，无法启动任务');
+          throw new UiError(uiMessage("projects:projectDictionaryPage.projectDictionaryPage_message_projectUnableJob"));
         }
         await submitJob({
           config_file_name: configFileName || 'config.yaml',

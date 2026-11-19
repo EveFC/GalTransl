@@ -2,14 +2,23 @@
 缓存机制
 """
 
-from GalTransl.CSentense import CTransList
+from GalTransl.CSentense import CSentense, CTransList
+from GalTransl.ProblemFilter import filter_problem_text, normalize_problem_filter_keys
+from GalTransl.ProblemWhiteList import build_problem_white_list_index, is_problem_whitelisted
 from GalTransl import LOGGER
-from typing import List
+from typing import Iterable, Iterator, List
 import orjson
-import os,shutil
+import os
+import re
 import asyncio
+import weakref
 from GalTransl.i18n import get_text,GT_LANG
 import aiofiles
+
+# 整文件重写的中间文件后缀：先写 <缓存>.json.tmp，再替换到 <缓存>.json
+# （见 save_transCache_to_json / _compact_cache_from_append）。正常情况下它活不过一次替换，
+# 缓存目录里见到它，就是上次中断或被占用留下的遗物——启动时扫掉（见 cleanup_stale_cache_temp_files）。
+CACHE_TEMP_SUFFIX = ".json.tmp"
 
 # 缓存JSON key映射：新key -> 旧key（用于兼容读取旧缓存）
 _CACHE_KEY_COMPAT = {
@@ -18,6 +27,8 @@ _CACHE_KEY_COMPAT = {
     "pre_dst": "pre_zh",
     "proofread_dst": "proofread_zh",
     "post_dst_preview": "post_zh_preview",
+    # 旧名「存疑内容」→ 新名「校对批注」：只读兼容，写回一律用新键
+    "proofread_comment": "doub_content",
 }
 
 def _cache_get(cache_obj: dict, key: str, default=None):
@@ -37,6 +48,62 @@ def _cache_has(cache_obj: dict, key: str) -> bool:
     if old_key and old_key in cache_obj:
         return True
     return False
+
+
+# 未命中缓存的原因码：查缓存时写在 tran.cache_miss_reason 上。
+# 重建（rebuilda/rebuildr）不翻译、只能按现有缓存重刷译文与结果，一旦有未命中就整个失败
+# （见 Backend/RebuildTranslate）；带上原因码，那里才能报出"哪几句、为什么"，而不是一句
+# 笼统的「缓存不完整」——最容易被误读成"这个文件还没翻"。
+MISS_KEY_NOT_FOUND = "key_not_found"
+MISS_POST_SRC_CHANGED = "post_src_changed"
+MISS_PRE_DST_EMPTY = "pre_dst_empty"
+MISS_TRANSLATE_FAILED = "translate_failed"
+MISS_RETRAN_KEY = "retran_key"
+MISS_RETRAN_PROBLEM = "retran_problem"
+MISS_PROOFREAD_MISSING = "proofread_missing"
+
+
+def _mark_cache_miss(tran: CSentense, reason: str) -> None:
+    """记下这句没命中缓存的原因（只记第一个：后面的检查都是在前一个没过之后才跑的）。"""
+    if not tran.cache_miss_reason:
+        tran.cache_miss_reason = reason
+
+
+def _replace_cache_file(temp_file_path: str, cache_file_path: str) -> None:
+    """把写好的临时文件换到正式位置（原子替换）。
+
+    用 os.replace 而不是 shutil.move：Windows 上 os.rename 覆盖已存在文件必然抛
+    FileExistsError，shutil.move 于是退化成 copy2 + unlink——那是**原地截断重写**，
+    写到一半崩了就把正式缓存毁成半截 JSON，没写完时临时文件还留在原地（缓存目录里那些
+    .json.tmp 就是这么来的）。os.replace 两边都是原子替换：读到的要么是旧的完整文件、
+    要么是新的完整文件；失败时正式文件一字不动。
+    """
+    os.replace(temp_file_path, cache_file_path)
+
+
+def cleanup_stale_cache_temp_files(cache_dir: str) -> int:
+    """删掉缓存目录里残留的 <缓存>.json.tmp，返回删掉几个。
+
+    只在任务启动时调用：那一刻本项目没有写入者（server 保证一个项目同时只有一个任务，
+    桌面端改缓存是直接写文件、不走临时文件），所以这里看到的 .json.tmp 一定是上次中断或
+    被占用留下的，删掉安全。只认 .json.tmp——同一个目录里别的东西（缓存本身、.append.jsonl）
+    一概不碰。
+    """
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return 0
+    removed = 0
+    for name in os.listdir(cache_dir):
+        if not name.endswith(CACHE_TEMP_SUFFIX):
+            continue
+        path = os.path.join(cache_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError as exc:  # 被占用等：留着，下次再说
+            LOGGER.warning(f"[cache]清理残留临时文件失败：{path}: {exc}")
+    return removed
 
 
 _CACHE_APPEND_SUFFIX = ".append.jsonl"
@@ -72,10 +139,24 @@ def _record_runtime_cache_error(project_dir: str, *, message: str, filename: str
         return
 
 
+# 同一份增量日志的追加写入串行化：收尾拆分（splitTailChunks）时同一分片的两段会同时写它。
+# 按事件循环区分：asyncio.Lock 不能跨事件循环用（测试里每个 asyncio.run 都是新循环）。
+_APPEND_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]]" = weakref.WeakKeyDictionary()
+
+
+def _append_lock(append_file_path: str) -> asyncio.Lock:
+    locks = _APPEND_LOCKS.setdefault(asyncio.get_running_loop(), {})
+    return locks.setdefault(os.path.abspath(append_file_path), asyncio.Lock())
+
+
 async def _write_append_entries_with_retry(append_file_path: str, append_entries: list[dict]) -> None:
     if not append_entries:
         return
+    async with _append_lock(append_file_path):
+        await _write_append_entries_locked(append_file_path, append_entries)
 
+
+async def _write_append_entries_locked(append_file_path: str, append_entries: list[dict]) -> None:
     last_error = None
     for attempt in range(_CACHE_APPEND_WRITE_RETRY_TIMES):
         try:
@@ -117,9 +198,10 @@ def _build_cache_key_for_tran(tran) -> str:
 
 
 def _build_cache_obj(tran, post_save: bool = False):
-    if tran.post_src == "":
+    translation_skipped = tran.post_src == "" and bool(tran.pre_src.strip())
+    if tran.post_src == "" and not translation_skipped:
         return None
-    if tran.pre_dst == "":
+    if tran.pre_dst == "" and not translation_skipped:
         return None
 
     cache_obj = {
@@ -130,17 +212,22 @@ def _build_cache_obj(tran, post_save: bool = False):
         "pre_dst": tran.pre_dst,
     }
     cache_obj["proofread_dst"] = tran.proofread_zh
+    if translation_skipped:
+        cache_obj["translation_skipped"] = True
 
     if post_save and tran.problem != "":
         cache_obj["problem"] = tran.problem
+
+    if getattr(tran, "skip_check", False):
+        cache_obj["skip_check"] = True
 
     cache_obj["trans_by"] = tran.trans_by
     cache_obj["proofread_by"] = tran.proofread_by
 
     if tran.trans_conf != 0:
         cache_obj["trans_conf"] = tran.trans_conf
-    if tran.doub_content != "":
-        cache_obj["doub_content"] = tran.doub_content
+    if tran.proofread_comment != "":
+        cache_obj["proofread_comment"] = tran.proofread_comment
     if tran.unknown_proper_noun != "":
         cache_obj["unknown_proper_noun"] = tran.unknown_proper_noun
     if post_save:
@@ -155,13 +242,19 @@ def _build_cache_dict_from_snapshot(cache_list: list) -> tuple[dict, list[str]]:
     for i, cache in enumerate(cache_list):
         line_now, line_priv, line_next = "", "None", "None"
         line_now = f'{cache.get("name", "")}{_cache_get(cache, "pre_src", "")}'
-        if i > 0:
-            line_priv = f'{cache_list[i-1].get("name", "")}{_cache_get(cache_list[i-1], "pre_src", "")}'
-        if i < len(cache_list) - 1:
-            line_next = f'{cache_list[i+1].get("name", "")}{_cache_get(cache_list[i+1], "pre_src", "")}'
+        prev_index = i - 1
+        while prev_index >= 0 and cache_list[prev_index].get("translation_skipped"):
+            prev_index -= 1
+        next_index = i + 1
+        while next_index < len(cache_list) and cache_list[next_index].get("translation_skipped"):
+            next_index += 1
+        if prev_index >= 0:
+            line_priv = f'{cache_list[prev_index].get("name", "")}{_cache_get(cache_list[prev_index], "pre_src", "")}'
+        if next_index < len(cache_list):
+            line_next = f'{cache_list[next_index].get("name", "")}{_cache_get(cache_list[next_index], "pre_src", "")}'
         line_priv = "None" if line_priv == "" else line_priv
         line_next = "None" if line_next == "" else line_next
-        cache_key = line_priv + line_now + line_next
+        cache_key = cache.get("__cache_key") or line_priv + line_now + line_next
         if cache_key not in cache_dict:
             cache_order.append(cache_key)
         cache_dict[cache_key] = cache
@@ -188,7 +281,7 @@ async def _compact_cache_from_append(cache_file_path: str, append_file_path: str
                 cache_obj = orjson.loads(line)
             except Exception:
                 continue
-            cache_key = str(cache_obj.pop("__cache_key", ""))
+            cache_key = str(cache_obj.get("__cache_key", ""))
             if not cache_key:
                 continue
             if cache_key not in cache_dict:
@@ -208,7 +301,7 @@ async def _compact_cache_from_append(cache_file_path: str, append_file_path: str
     temp_file_path = cache_file_path + ".tmp"
     async with aiofiles.open(temp_file_path, mode="wb") as f:
         await f.write(orjson.dumps(merged_cache, option=orjson.OPT_INDENT_2))
-    shutil.move(temp_file_path, cache_file_path)
+    _replace_cache_file(temp_file_path, cache_file_path)
 
     if os.path.exists(append_file_path):
         os.remove(append_file_path)
@@ -260,8 +353,11 @@ async def save_transCache_to_json(trans_list: CTransList, cache_file_path, post_
         cache_obj = _build_cache_obj(tran, post_save=post_save)
         if cache_obj is None:
             continue
-        cache_json.append(cache_obj)
         cache_key = _build_cache_key_for_tran(tran)
+        if post_save and cache_key:
+            # 部分翻译的快照缺少未译行，必须保留真实邻句构成的 key，才能供后续全量命中。
+            cache_obj["__cache_key"] = cache_key
+        cache_json.append(cache_obj)
         if cache_key:
             append_obj = dict(cache_obj)
             append_obj["__cache_key"] = cache_key
@@ -273,7 +369,7 @@ async def save_transCache_to_json(trans_list: CTransList, cache_file_path, post_
             async with aiofiles.open(temp_file_path, mode="wb") as f:
                 json_data = orjson.dumps(cache_json, option=orjson.OPT_INDENT_2)
                 await f.write(json_data)
-            shutil.move(temp_file_path, cache_file_path)
+            _replace_cache_file(temp_file_path, cache_file_path)
             if os.path.exists(append_file_path):
                 try:
                     os.remove(append_file_path)
@@ -318,53 +414,54 @@ async def save_transCache_to_json(trans_list: CTransList, cache_file_path, post_
         raise e
 
 
-async def get_transCache_from_json(
-    trans_list: CTransList,
-    cache_file_path,
-    retry_failed=False,
-    proofread=False,
-    retran_key="",
-    load_post_src=False,
-    ignr_post_src=False,
-    eng_type="",
-):
+def chunk_cache_name(cache_name: str, chunk_index: int, total_chunks: int) -> str:
+    """分片的缓存文件名：多分片的追加 _{分片号}，最后补 .json（已以 .json 结尾的单分片不再补）。
+
+    cache_name 是输入文件相对路径把分隔符换成 "-}" 之后的名字，如 foo.ks → foo.ks.json / foo.ks_0.json。
     """
-    此函数从 JSON 文件中检索翻译缓存，并相应地更新翻译列表。
+    name = f"{cache_name}_{chunk_index}" if total_chunks > 1 else cache_name
+    return name if name.endswith(".json") else f"{name}.json"
 
-    Args:
-        trans_list (CTransList): 要检索的翻译列表。
-        cache_file_path (str): 包含翻译缓存的 JSON 文件的路径。
-        retry_failed (bool, optional): 是否重试失败的翻译。默认为 False。
-        proofread (bool, optional): 是否是校对模式。默认为 False。
-        retran_key (str or list, optional): 重译关键字，可以是字符串或字符串列表。默认为空字符串。
-        load_post_src (bool, optional): 不检查post_src是否被改变, 且直接使用cache的post_src。默认为 False。
-        ignr_post_src (bool, optional): 仅不检查post_src是否被改变。默认为 False。
 
-    Returns:
-        Tuple[List[CTrans], List[CTrans]]: 包含两个列表的元组：击中缓存的翻译列表和未击中缓存的翻译列表。
+def list_file_cache_names(cache_dir: str, cache_name: str, exclude: Iterable[str] = ()) -> list[str]:
+    """缓存目录里属于同一输入文件的全部缓存文件名（.json，只有增量日志的也算），不管当初按什么分片设置切的。
+
+    排序：不分片的那份在前，其余按分片号。exclude 里的名字跳过——输入文件本身就可能叫 foo_1
+    这种「看着像分片」的名字，它的缓存不能算到 foo 头上。
     """
-    if not cache_file_path.endswith(".json"):
-        if not os.path.exists(cache_file_path):
-            cache_file_path += ".json"
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return []
+    single = chunk_cache_name(cache_name, 0, 1)
+    chunk_re = re.compile(rf"^{re.escape(cache_name)}_(\d+)\.json$")
+    excluded = set(exclude)
+    found: dict[str, int] = {}
+    for name in os.listdir(cache_dir):
+        if name.endswith(_CACHE_APPEND_SUFFIX):
+            name = name[: -len(_CACHE_APPEND_SUFFIX)]
+        if name in excluded or name in found:
+            continue
+        if name == single:
+            found[name] = -1
+        elif match := chunk_re.match(name):
+            found[name] = int(match.group(1))
+    return sorted(found, key=found.__getitem__)
 
-    translist_hit = []
-    translist_unhit = []
+
+async def _load_cache_dict(cache_file_path: str, strict: bool = True) -> dict:
+    """读一份缓存（快照 + 增量日志合并）成 {cache_key: 缓存条目}。
+
+    strict=False 时快照读坏只告警、按空处理（给 SplitCachePool 兜底用：别的分片坏了不该拖垮本分片）。
+    """
     cache_dict = {}
     if os.path.exists(cache_file_path):
         async with aiofiles.open(cache_file_path, encoding="utf8") as f:
             try:
                 cache_dictList = orjson.loads(await f.read())
-                for i, cache in enumerate(cache_dictList):
-                    line_now, line_priv, line_next = "", "None", "None"
-                    line_now = f'{cache["name"]}{_cache_get(cache, "pre_src")}'
-                    if i > 0:
-                        line_priv = f'{cache_dictList[i-1]["name"]}{_cache_get(cache_dictList[i-1], "pre_src")}'
-                    if i < len(cache_dictList) - 1:
-                        line_next = f'{cache_dictList[i+1]["name"]}{_cache_get(cache_dictList[i+1], "pre_src")}'
-                    line_priv = "None" if line_priv == "" else line_priv
-                    line_next = "None" if line_next == "" else line_next
-                    cache_dict[line_priv + line_now + line_next] = cache
+                cache_dict, _ = _build_cache_dict_from_snapshot(cache_dictList)
             except Exception as e:
+                if not strict:
+                    LOGGER.warning(f"[cache]读取缓存失败，已跳过：{cache_file_path}: {e}")
+                    return {}
                 LOGGER.error(str(e))
                 LOGGER.error(get_text("cache_read_error", GT_LANG, cache_file_path))
                 custom_msg = get_text("cache_read_error", GT_LANG, cache_file_path) + f": {str(e)}"
@@ -397,9 +494,116 @@ async def get_transCache_from_json(
                     cache_dict[cache_key] = cache_obj
         except Exception as e:
             LOGGER.warning(f"[cache]读取append缓存失败：{append_file_path}: {e}")
+    return cache_dict
 
+
+def _split_cache_key(cache_key: str, line_now: str) -> Iterator[tuple[str, str]]:
+    """把 key（前句 + 本句 + 后句）拆回 (前句, 后句)。本句也可能出现在前后句里，逐个位置都试。"""
+    start = cache_key.find(line_now)
+    while start != -1:
+        line_priv, line_next = cache_key[:start], cache_key[start + len(line_now):]
+        if line_priv and line_next:  # 两侧至少是 "None"
+            yield line_priv, line_next
+        start = cache_key.find(line_now, start + 1)
+
+
+def _context_score(stored: str, wanted: str) -> int | None:
+    """一侧上下文的匹配程度：一致 2；有一边是 "None"（处在分片开头/结尾，看不到这一侧）1；对不上 None。"""
+    if stored == wanted:
+        return 2
+    if stored == "None" or wanted == "None":
+        return 1
+    return None
+
+
+class SplitCachePool:
+    """同一输入文件的全部缓存（含改分片设置前留下的旧分片），在分片自己的缓存没命中时兜底。
+
+    缓存 key 是「前句 + 本句 + 后句」，与分片号无关：改了分片设置后，绝大多数句子仍能在别的
+    分片缓存里按原 key 找到。落在新旧分片边界上的句子，有一侧上下文是 "None"（当时或现在处在
+    分片开头/结尾，看不到那一侧），这一侧放宽为通配。两侧都对得上的优先，同分按文件顺序。
+
+    第一次用到时才读文件；读到的内容不随之后的写入刷新——兜底找的是旧译文，本次新翻的句子
+    已经在分片自己的缓存里了。
+    """
+
+    def __init__(self, cache_file_paths: Iterable[str]) -> None:
+        self.cache_file_paths = list(cache_file_paths)
+        self._by_line: dict[str, list[tuple[str, dict, str]]] | None = None
+
+    async def load(self) -> None:
+        if self._by_line is not None:
+            return
+        by_line: dict[str, list[tuple[str, dict, str]]] = {}
+        for path in self.cache_file_paths:
+            for cache_key, cache_obj in (await _load_cache_dict(path, strict=False)).items():
+                line_now = f'{cache_obj.get("name", "")}{_cache_get(cache_obj, "pre_src", "")}'
+                by_line.setdefault(line_now, []).append((cache_key, cache_obj, path))
+        self._by_line = by_line
+
+    def match(self, line_priv: str, line_now: str, line_next: str) -> tuple[dict, str] | None:
+        """返回 (缓存条目, 所在缓存文件路径)；找不到返回 None。须先 await load()。"""
+        best, best_score = None, 0
+        for cache_key, cache_obj, path in (self._by_line or {}).get(line_now, ()):
+            for stored_priv, stored_next in _split_cache_key(cache_key, line_now):
+                priv_score = _context_score(stored_priv, line_priv)
+                next_score = _context_score(stored_next, line_next)
+                if priv_score is None or next_score is None:
+                    continue
+                if priv_score + next_score > best_score:
+                    best, best_score = (cache_obj, path), priv_score + next_score
+                    if best_score == 4:
+                        return best
+        return best
+
+
+async def get_transCache_from_json(
+    trans_list: CTransList,
+    cache_file_path,
+    retry_failed=False,
+    proofread=False,
+    retran_key="",
+    load_post_src=False,
+    ignr_post_src=False,
+    eng_type="",
+    problem_filter_keys=None,
+    problem_white_list=None,
+    quiet=False,
+    fallback_pool: "SplitCachePool | None" = None,
+):
+    """
+    此函数从 JSON 文件中检索翻译缓存，并相应地更新翻译列表。
+
+    Args:
+        trans_list (CTransList): 要检索的翻译列表。
+        cache_file_path (str): 包含翻译缓存的 JSON 文件的路径。
+        retry_failed (bool, optional): 是否重试失败的翻译。默认为 False。
+        proofread (bool, optional): 是否是校对模式。默认为 False。
+        retran_key (str or list, optional): 重译关键字，可以是字符串或字符串列表。默认为空字符串。
+        load_post_src (bool, optional): 不检查post_src是否被改变, 且直接使用cache的post_src。默认为 False。
+        ignr_post_src (bool, optional): 仅不检查post_src是否被改变。默认为 False。
+        problem_white_list (list, optional): 问题白名单（problemWhiteList）。命中的条目等价于
+            勾了 skip_check，其 problem 不参与 retranslKey 匹配——与进度、问题列表同一口径。
+        quiet (bool, optional): 不输出 info 级的重翻命中日志。开翻前统计待翻句数时用，
+            免得同一批日志打两遍。
+        fallback_pool (SplitCachePool, optional): 本文件的其它分片缓存；本分片缓存里没有的 key
+            到这里找（改过分片设置后，旧译文都在这里）。
+
+    Returns:
+        Tuple[List[CTrans], List[CTrans]]: 包含两个列表的元组：击中缓存的翻译列表和未击中缓存的翻译列表。
+    """
+    if not cache_file_path.endswith(".json"):
+        if not os.path.exists(cache_file_path):
+            cache_file_path += ".json"
+
+    translist_hit = []
+    problem_filter_keys = normalize_problem_filter_keys(problem_filter_keys)
+    white_index = build_problem_white_list_index(problem_white_list)
+    translist_unhit = []
+    cache_dict = await _load_cache_dict(cache_file_path)
 
     for tran in trans_list:
+        tran.cache_miss_reason = ""  # 每句只记本次查询的结果，别留着上一轮的
         # 忽略jp为空的句子
         if tran.pre_src == "" or tran.post_src == "":
             tran.pre_dst, tran.post_dst = "", ""
@@ -430,77 +634,107 @@ async def get_transCache_from_json(
         line_next = "None" if line_next == "" else line_next
         cache_key = line_priv + line_now + line_next
 
+        cache_obj = cache_dict.get(cache_key)
+        cache_source_path = cache_file_path
+        if cache_obj is None and fallback_pool is not None:
+            await fallback_pool.load()
+            if found := fallback_pool.match(line_priv, line_now, line_next):
+                cache_obj, cache_source_path = found
+
         # cache_key不在缓存
-        if cache_key not in cache_dict:
+        if cache_obj is None:
+            _mark_cache_miss(tran, MISS_KEY_NOT_FOUND)
             translist_unhit.append(tran)
             LOGGER.debug(f"[cache]message未命中缓存: {line_now}")
             if "rebuild" in eng_type:
                 LOGGER.error(f"[cache]message未命中缓存: {line_now}")
             continue
 
-        no_proofread = _cache_get(cache_dict[cache_key], "proofread_dst") == ""
+        # 有校对稿就等于有最终稿：既然校对过，原文后来改没改都不再影响这条的译文，
+        # 下面那几项检查（post_src / pre_dst / 翻译失败）整段跳过。
+        # 取默认 "" 而不是 None：字段整个缺失（很老的缓存、手改过的缓存）应当作"没校对过"，
+        # 该走的检查一步都不能少——否则 `None == ""` 是 False，会把这类缓存当成有校对稿，
+        # 原文早已改过的旧缓存也照样算命中。
+        no_proofread = _cache_get(cache_obj, "proofread_dst", "") == ""
 
         if no_proofread:
             # post_src被改变
             if load_post_src == ignr_post_src == False:
-                if tran.post_src != _cache_get(cache_dict[cache_key], "post_src"):
+                if tran.post_src != _cache_get(cache_obj, "post_src"):
+                    _mark_cache_miss(tran, MISS_POST_SRC_CHANGED)
                     translist_unhit.append(tran)
-                    LOGGER.debug(f"[cache]post_src被改变: \npost_src_before{_cache_get(cache_dict[cache_key], 'post_src')}\npost_src_now{tran.post_src}")
+                    LOGGER.debug(f"[cache]post_src被改变: \npost_src_before{_cache_get(cache_obj, 'post_src')}\npost_src_now{tran.post_src}")
                     if "rebuild" in eng_type:
-                        LOGGER.error(f"[cache]post_src被改变: \npost_src_before: {_cache_get(cache_dict[cache_key], 'post_src')}\npost_src_now: {tran.post_src}")
+                        LOGGER.error(f"[cache]post_src被改变: \npost_src_before: {_cache_get(cache_obj, 'post_src')}\npost_src_now: {tran.post_src}")
                     continue
             # pre_dst为空
             if tran.post_src != "":
                 if (
-                    not _cache_has(cache_dict[cache_key], "pre_dst")
-                    or _cache_get(cache_dict[cache_key], "pre_dst") == ""
+                    not _cache_has(cache_obj, "pre_dst")
+                    or _cache_get(cache_obj, "pre_dst") == ""
                 ):
+                    _mark_cache_miss(tran, MISS_PRE_DST_EMPTY)
                     translist_unhit.append(tran)
                     LOGGER.debug(f"[cache]pre_dst为空: {line_now}")
                     if "rebuild" in eng_type:
                         LOGGER.error(f"[cache]pre_dst为空: {line_now}")
                     continue
-            # 重试失败的
-            if retry_failed and "(Failed)" in _cache_get(cache_dict[cache_key], "pre_dst"):
-                if (
-                    no_proofread or "Fail" in cache_dict[cache_key]["proofread_by"]
-                ):  # 且未校对
-                    translist_unhit.append(tran)
-                    LOGGER.debug(f"[cache]Failed translation: {line_now}")
-                    if "rebuild" in eng_type:
-                        LOGGER.error(f"[cache]Failed translation: {line_now}")
-                    continue
+            # 重试失败的（走到这里的本来就已经是"没校对稿"的了）
+            if (
+                retry_failed
+                and filter_problem_text("翻译失败", problem_filter_keys)
+                and "(Failed)" in _cache_get(cache_obj, "pre_dst")
+            ):
+                _mark_cache_miss(tran, MISS_TRANSLATE_FAILED)
+                translist_unhit.append(tran)
+                LOGGER.debug(f"[cache]Failed translation: {line_now}")
+                if "rebuild" in eng_type:
+                    LOGGER.error(f"[cache]Failed translation: {line_now}")
+                continue
 
             # retran_key在pre_src中
             if retran_key and check_retran_key(
-                retran_key, _cache_get(cache_dict[cache_key], "pre_src")
+                retran_key, _cache_get(cache_obj, "pre_src")
             ):
                 if "rebuild" not in eng_type:
+                    _mark_cache_miss(tran, MISS_RETRAN_KEY)
                     translist_unhit.append(tran)
-                    LOGGER.info(f"[cache]retran_key in 'pre_src' message: {line_now}")
+                    if not quiet:
+                        LOGGER.info(f"[cache]retran_key in 'pre_src' message: {line_now}")
                     continue
             # retran_key在problem中
-            if retran_key and "problem" in cache_dict[cache_key]:
-                if check_retran_key(retran_key, cache_dict[cache_key]["problem"]):
+            if (
+                retran_key
+                and "problem" in cache_obj
+                and not is_problem_whitelisted(
+                    white_index, os.path.basename(cache_source_path), cache_obj.get("index", "")
+                )
+            ):
+                if check_retran_key(retran_key, filter_problem_text(cache_obj["problem"], problem_filter_keys)):
                     if "rebuild" not in eng_type:
+                        _mark_cache_miss(tran, MISS_RETRAN_PROBLEM)
                         translist_unhit.append(tran)
-                        LOGGER.info(f"[cache]retran_key in 'problem' message: {line_now}")
+                        if not quiet:
+                            LOGGER.info(f"[cache]retran_key in 'problem' message: {line_now}")
                         continue
 
         # 击中缓存的,post_dst初始值赋pre_dst
-        tran.pre_dst = _cache_get(cache_dict[cache_key], "pre_dst")
-        if "trans_by" in cache_dict[cache_key]:
-            tran.trans_by = cache_dict[cache_key]["trans_by"]
-        if _cache_has(cache_dict[cache_key], "proofread_dst"):
-            tran.proofread_zh = _cache_get(cache_dict[cache_key], "proofread_dst")
-        if "proofread_by" in cache_dict[cache_key]:
-            tran.proofread_by = cache_dict[cache_key]["proofread_by"]
-        if "trans_conf" in cache_dict[cache_key]:
-            tran.trans_conf = cache_dict[cache_key]["trans_conf"]
-        if "doub_content" in cache_dict[cache_key]:
-            tran.doub_content = cache_dict[cache_key]["doub_content"]
-        if "unknown_proper_noun" in cache_dict[cache_key]:
-            tran.unknown_proper_noun = cache_dict[cache_key]["unknown_proper_noun"]
+        tran.pre_dst = _cache_get(cache_obj, "pre_dst")
+        if "trans_by" in cache_obj:
+            tran.trans_by = cache_obj["trans_by"]
+        if _cache_has(cache_obj, "proofread_dst"):
+            tran.proofread_zh = _cache_get(cache_obj, "proofread_dst")
+        if "proofread_by" in cache_obj:
+            tran.proofread_by = cache_obj["proofread_by"]
+        if "trans_conf" in cache_obj:
+            tran.trans_conf = cache_obj["trans_conf"]
+        # 校对批注：新键 proofread_comment，旧缓存里是 doub_content（见 _CACHE_KEY_COMPAT）
+        if _cache_has(cache_obj, "proofread_comment"):
+            tran.proofread_comment = _cache_get(cache_obj, "proofread_comment") or ""
+        if "unknown_proper_noun" in cache_obj:
+            tran.unknown_proper_noun = cache_obj["unknown_proper_noun"]
+        if "skip_check" in cache_obj:
+            tran.skip_check = bool(cache_obj["skip_check"])
 
         if tran.proofread_zh != "":
             tran.post_dst = tran.proofread_zh
@@ -509,12 +743,13 @@ async def get_transCache_from_json(
 
         # 校对模式下，未校对的
         if proofread and tran.proofread_zh == "":
+            _mark_cache_miss(tran, MISS_PROOFREAD_MISSING)
             translist_unhit.append(tran)
             continue
 
         # 不检查post_src是否被改变, 且直接使用cache的post_src
         if load_post_src:
-            tran.post_src = _cache_get(cache_dict[cache_key], "post_src")
+            tran.post_src = _cache_get(cache_obj, "post_src")
 
         translist_hit.append(tran)
 
