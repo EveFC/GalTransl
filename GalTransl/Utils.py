@@ -10,7 +10,6 @@ from re import compile
 import requests
 import re
 from GalTransl.RuntimePaths import get_active_translation_guidelines_dir
-from zhon import cedict
 
 PATTERN_CODE_BLOCK = compile(r"```([\w]*)\n([\s\S]*?)\n```")
 whitespace = " \t\n\r\v\f"
@@ -24,8 +23,6 @@ punctuation = r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"""
 punctuation_zh = "。？！…（）；：《》「」『』【】"
 printable = digits + ascii_letters + punctuation + whitespace
 
-simplified_only_chars = set(cedict.simplified) - set(cedict.traditional)
-SIMPLIFIED_ONLY_PATTERN = re.compile(f'[{"".join(simplified_only_chars)}]')
 
 def _resolve_guideline_path(file_path: str) -> Path:
     candidate = Path(file_path).expanduser()
@@ -104,11 +101,7 @@ def is_all_chinese(text: str) -> bool:
     # 如果循环正常结束，说明所有字符都是中文字符
     return True
 
-def is_simplified(text):
-    """
-    Check if a string's Chinese characters are Simplified.
-    """
-    return bool(SIMPLIFIED_ONLY_PATTERN.search(text))
+
 def extract_code_blocks(content: str) -> Tuple[List[str], List[str]]:
     # 匹配带语言标签的代码块
     matches_with_lang = PATTERN_CODE_BLOCK.findall(content)

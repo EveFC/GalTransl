@@ -112,7 +112,7 @@ class CProxy:
         pass
 
 
-    LLM輸出簡體 = 13
+
 class CProjectConfig:
     def __init__(self, projectPath: str, config_name=CONFIG_FILENAME) -> None:
         self.projectConfig = loadConfigFile(path.join(projectPath, config_name))

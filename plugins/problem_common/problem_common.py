@@ -14,8 +14,13 @@ from GalTransl.ConfigHelper import CProjectConfig
 from GalTransl.GTPlugin import GProblemPlugin
 from GalTransl.Dictionary import CGptDict
 
+from zhon import cedict
+
 
 _DECIMAL_LITERAL_RE = re.compile(r"^[+-]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?$")
+
+simplified_only_chars = set(cedict.simplified) - set(cedict.traditional)
+SIMPLIFIED_ONLY_PATTERN = re.compile(f'[{"".join(simplified_only_chars)}]')
 
 
 def normalize_sentence_length_threshold(raw) -> int:
@@ -192,6 +197,13 @@ def contains_english(text: str) -> str:
     return eng_chars
 
 
+def is_simplified(text):
+    """
+    Check if a string's Chinese characters are Simplified.
+    """
+    return bool(SIMPLIFIED_ONLY_PATTERN.search(text))
+
+
 class CProblemType(Enum):
     """Common checks and their display metadata, owned by this plugin."""
 
@@ -217,6 +229,7 @@ class CProblemType(Enum):
     缺控制符 = 11, "译文缺少原文中的控制符（如 \\n、变量标记等）。", True
     独白男他 = 12, "独白（无name）译文出现'他'。", True
     单句过长 = 13, "译文单句过长，平均分句长度超过阈值（avgSentenceLengthThreshold）。", False
+    LLM輸出簡體 = 14, "LLM輸出簡體", True
 
 MONOLOGUE_MALE_HE_EXCLUDES = (
     "其他",
@@ -366,6 +379,9 @@ def _check_problems(
         if tran.speaker == "" and "他" in post_dst:
             if not any(exclude in post_dst for exclude in MONOLOGUE_MALE_HE_EXCLUDES):
                 problem_list.append("独白男他")
+    if CProblemType.LLM輸出簡體 in find_type:
+        if is_simplified(pre_dst):
+            problem_list.append(f"LLM輸出簡體")
 
     if arinashi_dict != {}:
         for key, value in arinashi_dict.items():
